@@ -124,11 +124,16 @@
           <span id="file-path-label" class="file-path-label"></span>
           <span id="file-dirty" class="file-dirty hidden" title="Unsaved">•</span>
           <div class="file-toolbar-actions">
+            <div id="file-md-modes" class="file-md-modes hidden" role="tablist" aria-label="Markdown view">
+              <button type="button" role="tab" id="btn-file-edit" class="btn btn-ghost btn-sm" aria-selected="true">Edit</button>
+              <button type="button" role="tab" id="btn-file-preview" class="btn btn-ghost btn-sm" aria-selected="false">Preview</button>
+            </div>
             <button type="button" id="btn-file-insert" class="btn btn-ghost btn-sm">Insert path</button>
             <button type="button" id="btn-file-save" class="btn btn-accent btn-sm" disabled>Save</button>
           </div>
         </div>
         <textarea id="file-editor" class="file-editor" spellcheck="false" disabled></textarea>
+        <div id="file-preview" class="file-preview markdown-body hidden" tabindex="0" aria-label="Markdown preview"></div>
         <p id="file-status" class="file-status muted"></p>
       </div>
     </main>
@@ -154,6 +159,8 @@
 
   <div id="toast-host" class="toast-host" aria-live="assertive"></div>
 
+  <script src="/vendor/marked.min.js"></script>
+  <script src="/vendor/purify.min.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>
