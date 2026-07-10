@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0e1116" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0c10" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <title>Grok Remote Hub</title>
@@ -14,7 +14,7 @@
 </head>
 <body>
   <div id="app">
-    <aside id="rail" class="rail" aria-label="Sessions">
+    <aside id="rail" class="rail" aria-label="Sidebar">
       <div class="rail-header">
         <div class="brand">
           <span class="brand-mark" aria-hidden="true"></span>
@@ -22,12 +22,31 @@
         </div>
         <button type="button" id="btn-new" class="btn btn-accent btn-sm">New</button>
       </div>
-      <div class="search-wrap">
-        <input type="search" id="session-search" class="input" placeholder="Search sessions" autocomplete="off" />
+      <div class="rail-tabs" role="tablist" aria-label="Sidebar">
+        <button type="button" role="tab" id="tab-sessions" class="rail-tab" aria-selected="true" aria-controls="panel-sessions">Sessions</button>
+        <button type="button" role="tab" id="tab-files" class="rail-tab" aria-selected="false" aria-controls="panel-files">Files</button>
       </div>
-      <div id="session-list" class="session-list" role="list"></div>
-      <div id="session-empty" class="empty-rail hidden">
-        <p>No sessions yet. Tap New to start one in a project folder.</p>
+      <div id="panel-sessions" role="tabpanel" aria-labelledby="tab-sessions" class="rail-panel">
+        <div class="search-wrap">
+          <input type="search" id="session-search" class="input" placeholder="Search sessions" autocomplete="off" />
+        </div>
+        <div id="session-list" class="session-list" role="list"></div>
+        <div id="session-empty" class="empty-rail hidden">
+          <p>No sessions yet. Tap New to start one in a project folder.</p>
+        </div>
+      </div>
+      <div id="panel-files" role="tabpanel" aria-labelledby="tab-files" class="rail-panel hidden">
+        <div class="search-wrap">
+          <input type="search" id="file-filter" class="input" placeholder="Filter files" autocomplete="off" />
+        </div>
+        <div id="file-tree" class="file-tree" role="tree"></div>
+        <div id="file-empty" class="empty-rail">
+          <p>Open a session to browse its project.</p>
+        </div>
+      </div>
+      <div id="version-badge" class="version-badge" title="Hub and CLI compatibility">
+        <span id="compat-dot" class="compat-dot" data-state="unknown" aria-hidden="true"></span>
+        <span id="version-label" class="version-label">Hub · CLI</span>
       </div>
     </aside>
 
@@ -49,36 +68,68 @@
         </div>
       </header>
 
-      <div id="transcript" class="transcript" aria-live="polite">
-        <div id="empty-main" class="empty-main">
-          <div class="empty-card">
-            <h2>Ops control for Grok Build</h2>
-            <p>Open a session from the rail, or start a new one in a project folder.</p>
-            <div class="empty-actions">
-              <button type="button" id="btn-empty-sessions" class="btn btn-ghost">Browse sessions</button>
-              <button type="button" id="btn-empty-new" class="btn btn-accent">New session</button>
+      <div id="chat-panel" class="chat-panel">
+        <div id="turn-strip" class="turn-strip" data-state="idle" aria-live="polite">
+          <span id="turn-strip-text">idle</span>
+          <span id="turn-strip-cursor" class="term-cursor hidden" aria-hidden="true">▋</span>
+        </div>
+
+        <div id="session-banner" class="session-banner hidden" data-mode="none" aria-live="polite">
+          <span id="session-banner-text"></span>
+        </div>
+
+        <div class="transcript-wrap">
+          <div id="transcript" class="transcript" aria-live="polite">
+            <div id="empty-main" class="empty-main">
+              <div class="empty-card">
+                <h2>$ attach stream</h2>
+                <p class="empty-sub">Remote agent stream over Tailscale</p>
+                <p>Open a session to attach the stream, or start a new one in a project folder.</p>
+                <div class="empty-actions">
+                  <button type="button" id="btn-empty-sessions" class="btn btn-ghost">Browse sessions</button>
+                  <button type="button" id="btn-empty-new" class="btn btn-accent">New session</button>
+                </div>
+              </div>
             </div>
           </div>
+          <button type="button" id="btn-jump-latest" class="jump-latest hidden" aria-label="Jump to latest">
+            <span aria-hidden="true">↓</span> Latest
+          </button>
+        </div>
+
+        <div class="composer-shell">
+          <div id="slash-palette" class="slash-palette hidden" role="listbox" aria-label="Slash commands"></div>
+          <form id="composer-form" class="composer">
+            <span class="composer-prompt" aria-hidden="true">&gt;</span>
+            <textarea
+              id="composer-input"
+              class="composer-input"
+              rows="1"
+              placeholder="Message… (/ for commands)"
+              disabled
+              enterkeyhint="send"
+            ></textarea>
+            <div class="composer-actions">
+              <button type="button" id="btn-stop" class="btn btn-danger btn-sm hidden">Stop</button>
+              <button type="submit" id="btn-send" class="btn btn-accent" disabled>Send</button>
+            </div>
+          </form>
+          <p id="composer-hint" class="composer-hint muted">Remote agent stream. Load a session to chat; desktop TUI stays separate.</p>
         </div>
       </div>
 
-      <div class="composer-shell">
-        <div id="slash-palette" class="slash-palette hidden" role="listbox" aria-label="Slash commands"></div>
-        <form id="composer-form" class="composer">
-          <textarea
-            id="composer-input"
-            class="composer-input"
-            rows="1"
-            placeholder="Message Grok…  (/ for commands)"
-            disabled
-            enterkeyhint="send"
-          ></textarea>
-          <div class="composer-actions">
-            <button type="button" id="btn-stop" class="btn btn-danger btn-sm hidden">Stop</button>
-            <button type="submit" id="btn-send" class="btn btn-accent" disabled>Send</button>
+      <div id="file-panel" class="file-panel hidden">
+        <div class="file-toolbar">
+          <button type="button" id="btn-file-back" class="btn btn-ghost btn-sm">← Chat</button>
+          <span id="file-path-label" class="file-path-label"></span>
+          <span id="file-dirty" class="file-dirty hidden" title="Unsaved">•</span>
+          <div class="file-toolbar-actions">
+            <button type="button" id="btn-file-insert" class="btn btn-ghost btn-sm">Insert path</button>
+            <button type="button" id="btn-file-save" class="btn btn-accent btn-sm" disabled>Save</button>
           </div>
-        </form>
-        <p id="composer-hint" class="composer-hint muted">Load a session to chat. Slash commands appear after load.</p>
+        </div>
+        <textarea id="file-editor" class="file-editor" spellcheck="false" disabled></textarea>
+        <p id="file-status" class="file-status muted"></p>
       </div>
     </main>
   </div>
@@ -91,6 +142,10 @@
         <button type="button" class="btn btn-ghost btn-icon" data-close="modal-new" aria-label="Close">×</button>
       </header>
       <p class="muted modal-help">Pick a project working directory.</p>
+      <div class="project-create">
+        <input type="text" id="project-new-name" class="input" placeholder="New folder name" autocomplete="off" />
+        <button type="button" id="btn-create-project" class="btn btn-sm btn-accent">Create</button>
+      </div>
       <input type="search" id="project-search" class="input" placeholder="Filter projects" autocomplete="off" />
       <div id="project-list" class="project-list" role="list"></div>
       <p id="project-empty" class="muted hidden">No projects found under the configured root.</p>
