@@ -1,7 +1,7 @@
 # Grok Remote Hub — Design Spec
 
 **Date:** 2026-07-09  
-**Status:** Draft for user review  
+**Status:** Approved (adversarially revised)  
 **Goal:** Claude-like remote control for Grok Build: phone + desktop web UI, shared live session stream, resume any local project session, slash-command palette, always-on on the PC via Tailscale.
 
 ---
@@ -20,7 +20,8 @@ Spike (2026-07-09) proved:
 - `grok agent serve` + ACP over WebSocket works  
 - `session/load` / `session/new` / `session/prompt` work  
 - Dual native ACP clients do **not** both receive `session/update` (last load owns the stream)  
-- Therefore the hub must own **one** ACP connection and fan out to all UIs  
+- `session/load` barely replays history (setup notifications only)  
+- Therefore the hub must own **one** ACP connection, fan out to all UIs, and **hydrate transcripts from disk**
 
 ---
 
@@ -28,7 +29,7 @@ Spike (2026-07-09) proved:
 
 | Decision | Choice |
 |---|---|
-| Access | Tailscale only |
+| Access | Tailscale only (primary) |
 | Availability | Always-on on PC |
 | Architecture | Single hub process + local `grok agent serve` |
 | UI | Responsive web shell (desktop session rail, mobile sessions sheet) |
@@ -36,262 +37,298 @@ Spike (2026-07-09) proved:
 | Port | `8787` |
 | Install path | `D:\Projects\Grok Remote Hub` |
 | Desktop surface | Same web UI as phone (not stock Grok TUI mirror) |
+| Transcript history | Read `updates.jsonl` from disk on open; live ACP for new turns |
 
 ---
 
-## 3. Architecture
+## 3. Adversarial review fixes (applied)
+
+| Attack / failure | Design response |
+|---|---|
+| Dual ACP clients steal stream | Hub is sole ACP client; UI clients only talk to hub |
+| Load does not replay chat | `GET /api/sessions/{id}/history` parses `updates.jsonl` |
+| Two devices prompt same session | Per-session async lock; second prompt queues or 409 busy |
+| Switch session mid-turn | Block switch while turn running; show toast |
+| Junk temp sessions flood list | Filter: valid UUID id, exclude `Temp\oracle-grok`, require summary or updates |
+| Tailscale down / IP changes | Resolve `tailscale ip -4` each start; if missing, bind `127.0.0.1` + UI banner “local only” |
+| Mobile keyboard covers composer | `visualViewport` resize; composer pinned above keyboard; `safe-area-inset` |
+| Backgrounded iOS kills WS | Auto-reconnect with backoff; resubscribe; banner “Reconnecting…” |
+| Empty slash list at open | Palette only after commands event; placeholder “Load a session for / commands” |
+| Agent crash | Supervisor restart; all clients get `status.agent=down/up` |
+| always-approve remote risk | README warning; optional `hub_token` |
+| Huge session dirs | Cap list at 80 by `updated_at`; search hits disk index |
+| Concurrent multi-session on one ACP | Single `loaded_session_id`; load-on-demand before prompt; cache UI transcripts |
+
+---
+
+## 4. Architecture
 
 ```
 Phone / Desktop browser
         │
-        │  http(s)://100.110.172.25:8787   (Tailscale IP only)
+        │  http://<tailscale-ip>:8787
         ▼
 ┌─────────────────────────────────────────────┐
 │              Grok Remote Hub                │
-│  Static UI  │  Hub WS/SSE  │  REST API      │
-│             │  fan-out     │  sessions      │
-│             └──────┬───────┘                │
-│                    │ single ACP client      │
-│                    ▼                        │
-│         grok agent serve (127.0.0.1:2419)   │
+│  static UI │ Hub WebSocket │ REST           │
+│  history   │ fan-out       │ session index  │
+│            └──────┬────────┘                │
+│                   │ sole ACP client         │
+│                   ▼                         │
+│        grok agent serve (127.0.0.1:2419)    │
 └─────────────────────────────────────────────┘
                     │
                     ▼
-         ~/.grok/sessions/<cwd>/<id>/
+         ~/.grok/sessions/<encoded-cwd>/<id>/
+              summary.json + updates.jsonl
 ```
 
 ### Processes
 
-1. **Hub** (long-lived): HTTP server + UI client WebSocket + ACP bridge  
-2. **Agent child**: spawned/managed by hub (`grok agent serve --bind 127.0.0.1:2419 --secret …`)  
-3. Restart agent if it dies; reconnect ACP; notify UIs  
+1. **Hub** (long-lived): HTTP + UI WebSocket + ACP bridge + session index  
+2. **Agent child**: hub-managed `grok agent serve --bind 127.0.0.1:2419 --secret …`  
+3. Agent death → restart with backoff → reconnect ACP → notify UIs  
 
 ### Network binding
 
-- Hub binds **only** to the machine’s Tailscale IPv4 (discover via `tailscale ip -4`, fallback config)  
-- Never bind `0.0.0.0` by default  
-- Agent binds `127.0.0.1` only  
-- Optional `HUB_TOKEN` for extra auth (header or query); default off for pure Tailscale trust in v1, documented to enable  
+- Prefer Tailscale IPv4 from `tailscale ip -4` (full path on Windows)  
+- Config override `bind_host` / `bind_port`  
+- Fallback `127.0.0.1` if Tailscale unavailable (local debug; banner)  
+- Agent always `127.0.0.1`  
+- Optional `hub_token`: require `Authorization: Bearer` or `?token=` on HTTP/WS  
 
-### Stack (implementation)
+### Stack
 
-- **Runtime:** Python 3.11+ (stdlib + `websockets` / `aiohttp` or similar already available on machine)  
-- **UI:** Single-page app (static HTML/CSS/JS) served by hub — no separate Node build required for MVP  
-- **Config:** `config.toml` or `.env` in install dir  
-
-Rationale: few dependencies, easy always-on on Windows, matches spike tooling.
+- Python 3.11+ / asyncio  
+- `aiohttp` (HTTP + WS server) + `websockets` or aiohttp WS client to agent  
+- Static SPA: `static/index.html`, `app.css`, `app.js` (no build step)  
+- Config: `config.toml`  
 
 ---
 
-## 4. UI / UX
+## 5. UI / UX (polished)
 
-### 4.1 Responsive shell
+### Visual direction
+
+**Not** generic “AI purple gradient.” Direction: **ops control room for a coding agent**.
+
+| Token | Value | Role |
+|---|---|---|
+| `--bg` | `#0e1116` | App background |
+| `--surface` | `#161b22` | Rail, cards, composer |
+| `--surface-2` | `#1c2330` | Elevated / hover |
+| `--border` | `#2a3341` | Hairlines |
+| `--text` | `#e7ecf3` | Primary text |
+| `--muted` | `#8b98a8` | Meta, timestamps |
+| `--accent` | `#f0a202` | Live pulse, primary actions (amber signal) |
+| `--accent-dim` | `#8a5a00` | Accent borders |
+| `--user` | `#1a3a4a` | User bubble |
+| `--assistant` | `#141a22` | Assistant bubble |
+| `--danger` | `#f07178` | Errors / stop |
+| `--ok` | `#3dd68c` | Connected |
+
+- **Type:** UI sans = `IBM Plex Sans` (Google fonts); mono meta/tools = `IBM Plex Mono`  
+- **Signature:** 2px amber “live” bar on the active session row + subtle pulse on connection pill  
+- Motion: 150–200ms ease; honor `prefers-reduced-motion`  
+- Focus: visible amber ring on keyboard focus  
+- Density: comfortable chat, compact session rows  
+
+### 5.1 Responsive shell
 
 **Desktop (≥900px)**
 
-- Left rail (~280px): session list, search, New Session  
-- Main: header (model/cwd/status) + transcript + composer  
-- Optional right drawer later (tools detail); not MVP  
+```
+┌──────── session rail ────────┬──────── main ─────────────────────┐
+│ Hub · search · New           │ header: title · model · cwd · ●  │
+│ [session rows…]              │ transcript (scroll)                │
+│                              │ composer + / palette               │
+└──────────────────────────────┴────────────────────────────────────┘
+```
 
 **Mobile (&lt;900px)**
 
-- Full-width chat  
-- Top bar: menu (☰) → Sessions sheet (full height, slide over)  
-- Same session list content as desktop rail  
-- Composer sticky bottom; safe-area insets for iPhone  
+- Full-width chat; top bar: ☰ Sessions · title · status  
+- Sessions = full-height sheet (slide from left), backdrop dismiss, focus trap  
+- Composer sticky bottom with `env(safe-area-inset-bottom)`  
+- Tap session → sheet closes, chat focuses  
 
-### 4.2 Session list
+### 5.2 Session list
 
-Each row shows:
+Row content:
 
-- Title (generated title or first-prompt fallback)  
-- Project path (shortened)  
-- Relative updated time  
-- Live badge if currently loaded in hub  
-- Model id (if known)  
+- Title (generated_title → session_summary → “Untitled session”)  
+- Project basename + truncated path  
+- Relative time (`2h ago`)  
+- Live amber dot if this is hub’s loaded session  
+- Optional model chip  
 
-Actions:
+Filters:
 
-- Tap/click → resume (`session/load` with stored cwd)  
-- New Session → pick cwd from recent project roots (seed: `D:\Projects\*` + sessions’ cwds)  
-- Search filters title/path/snippet  
+- Search box (title, path, id prefix)  
+- Hide: non-UUID folders, paths containing `oracle-grok`, empty dirs  
+- Sort: `updated_at` desc, max 80  
 
-Data sources:
+New session:
 
-1. Disk index: scan `~/.grok/sessions/**/summary.json`  
-2. Live: sessions opened through hub this process lifetime  
-3. Refresh on interval + on `_x.ai/sessions/changed` if agent emits it  
+- Modal: list recent project roots (`D:\Projects\*` dirs + distinct cwds from sessions)  
+- Confirm → `session/new`  
 
-### 4.3 Transcript
+### 5.3 Transcript
 
-Render ACP updates:
-
-| Update | UI |
+| Source | UI |
 |---|---|
-| `user_message_chunk` | User bubble |
-| `agent_message_chunk` | Assistant bubble (stream append) |
-| `agent_thought_chunk` | Collapsible “Thinking” block |
-| `tool_call` / `tool_call_update` | Expandable tool card (name, status, summary) |
-| queue / turn complete notifications | Status strip / subtle system line |
+| History from `updates.jsonl` | Hydrate on open before live events |
+| `user_message_chunk` | User bubble (right-aligned soft) |
+| `agent_message_chunk` | Assistant bubble, stream append |
+| `agent_thought_chunk` | Collapsed “Thinking” disclosure (open while streaming thought) |
+| `tool_call` / updates | Card: tool title, status pill, expandable detail |
+| errors | Inline danger toast + system line |
 
-Multiple browser clients share one hub subscription: every event is broadcast.
+Auto-scroll: stick to bottom if user was near bottom; break stick if they scroll up (Claude-like).
 
-### 4.4 Composer & slash commands
+### 5.4 Composer & slash
 
-- Textarea: Enter send (Shift+Enter newline) on desktop; mobile uses Send button primary  
-- **Slash palette:** typing `/` opens overlay list from last `available_commands_update` for the active session  
-- Filter by name/description  
-- Select command: insert `/name ` or execute if no args  
-- If command has argument hints (when provided by agent), show secondary field or chips  
-- Unknown `/foo` still sendable as plain text to the agent  
+- Textarea auto-grow (max ~8 lines)  
+- Desktop: Enter send, Shift+Enter newline  
+- Mobile: Send button always visible; Enter can newline  
+- Stop button visible while turn running (best-effort cancel; if unsupported, disables input until turn completes)  
+- `/` at line start → palette anchored above composer  
+- Arrow keys + Enter to select; Esc closes  
+- Commands from last `available_commands_update` for loaded session  
+- Selecting inserts `/name` or `/name ` and optional arg placeholder  
 
-Commands are **not** hardcoded TUI lists; they track what the agent advertises so the menu stays honest.
+### 5.5 Dual-device
 
-### 4.5 Dual-device behavior (Claude-like)
+- All UI clients subscribed to `sessionId` get the same live events  
+- Each browser has its own selected session  
+- Hub serializes ACP operations (load/prompt) on one connection  
+- If session A is mid-turn, prompts to A queue or reject with clear error; switching away is blocked until idle  
 
-- Phone and desktop open same hub URL  
-- Both receive live stream for the active session  
-- Prompt from either device appears as user message on both  
-- Session switch on one device updates active session for that client; optional “follow global active session” can be v2 — **v1:** each client has its own selected session id, but all clients subscribed to a session receive its events  
+### 5.6 Connection UX
 
-Clarification for v1:
-
-- Hub may keep **multiple** sessions loaded if ACP allows sequential load; if agent is single-active-session, hub switches load on demand and caches transcripts client-side / from disk replay  
-
-Spike showed one stream owner per session connection; hub is that owner and can multiplex many UI sessions by loading the needed session before prompt (with short switch cost).
+- Pill: Connected / Reconnecting / Agent down / Local only  
+- Offline: disable send, keep transcript readable  
+- On reconnect: resubscribe selected session; do not duplicate history (history load once per open)  
 
 ---
 
-## 5. API surface (hub ↔ browser)
+## 6. API surface
 
 ### HTTP
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/` | SPA |
-| GET | `/health` | liveness + agent up/down |
-| GET | `/api/sessions` | global session list |
-| POST | `/api/sessions` | create new `{ cwd }` |
-| POST | `/api/sessions/{id}/load` | load/resume |
-| GET | `/api/projects` | recent/known project roots |
+| GET | `/health` | hub + agent + bind mode |
+| GET | `/api/sessions` | filtered global list |
+| GET | `/api/sessions/{id}/history` | normalized messages from disk |
+| POST | `/api/sessions` | `{ "cwd": "..." }` → new session |
+| POST | `/api/sessions/{id}/load` | load/resume on ACP |
+| GET | `/api/projects` | project roots for New Session |
 
 ### WebSocket `/ws`
 
 Client → hub:
 
-- `{ "type": "subscribe", "sessionId": "..." }`  
-- `{ "type": "prompt", "sessionId": "...", "text": "..." }`  
-- `{ "type": "cancel", "sessionId": "..." }` if supported  
+```json
+{"type":"hello"}
+{"type":"subscribe","sessionId":"..."}
+{"type":"unsubscribe","sessionId":"..."}
+{"type":"prompt","sessionId":"...","text":"..."}
+{"type":"cancel","sessionId":"..."}
+```
 
 Hub → client:
 
-- `{ "type": "acp", "sessionId", "message": <raw acp json> }`  
-- `{ "type": "sessions", "items": [...] }`  
-- `{ "type": "status", "agent": "up"|"down", ... }`  
-- `{ "type": "error", "message": "..." }`  
+```json
+{"type":"status","agent":"up|down","bind":"tailscale|local","tailscaleIp":"..."}
+{"type":"sessions","items":[...]}
+{"type":"history","sessionId":"...","messages":[...]}
+{"type":"acp","sessionId":"...","message":{}}
+{"type":"commands","sessionId":"...","commands":[...]}
+{"type":"turn","sessionId":"...","state":"running|idle","error":null}
+{"type":"error","message":"..."}
+```
 
 ---
 
-## 6. ACP bridge (hub ↔ grok)
+## 7. ACP bridge
 
-On startup:
+Startup: spawn agent → connect WS → `initialize`.
 
-1. Ensure agent serve listening  
-2. Connect `ws://127.0.0.1:2419/ws?server-key=...`  
-3. `initialize`  
-4. Ready for `session/new` / `session/load` / `session/prompt`  
+**load(sessionId, cwd):**
 
-On UI prompt:
+1. Acquire global ACP lock  
+2. `session/load`  
+3. Cache commands from updates  
+4. Set `loaded_session_id`  
 
-1. Ensure target session loaded on ACP connection  
-2. `session/prompt` with text blocks  
-3. Forward all subsequent ACP messages with that `sessionId` to subscribed UI clients  
+**prompt(sessionId, text):**
 
-On UI session open:
+1. If another turn running on any session → error busy (v1 simple)  
+2. Ensure loaded  
+3. `session/prompt`  
+4. Fan out all ACP messages; mark turn idle on prompt result / `prompt_complete`  
 
-1. `session/load`  
-2. Forward setup notifications + any replay  
-3. Update commands from `available_commands_update`  
-
----
-
-## 7. Always-on packaging (Windows)
-
-- Repo: `D:\Projects\Grok Remote Hub`  
-- Scripts:  
-  - `start-hub.ps1` — start hub if not running, log to `logs/`  
-  - `stop-hub.ps1`  
-  - `install-startup.ps1` — Task Scheduler at user logon  
-- Logs: rotate simple daily files  
-- Config defaults committed as `config.example.toml`  
+**History:** never rely on ACP replay; always disk.
 
 ---
 
-## 8. Security
+## 8. History normalization
 
-- Tailscale mesh is primary authz  
-- Hub bind: Tailscale IP only  
-- Agent secret local-only  
-- No prompt content sent to third parties beyond normal Grok/xAI API path the CLI already uses  
-- Do not log full prompts by default (optional debug)  
-- User’s Grok permission mode remains as configured (`always-approve` today → remote is high privilege; document clearly)  
+Parse `updates.jsonl` lines; extract `session/update` payloads into:
 
----
+```json
+{"role":"user|assistant|thought|tool|system","text":"...","meta":{}}
+```
 
-## 9. MVP scope
-
-**In**
-
-- Always-on hub + managed agent serve  
-- Tailscale bind :8787  
-- Session list (disk + live), search, new, resume  
-- Responsive shell (rail / sheet)  
-- Live multi-client stream fan-out  
-- Composer + agent-driven slash palette  
-- Thought/tool expandable blocks  
-- Health endpoint + start/stop scripts  
-
-**Out (v2)**
-
-- Stock Grok TUI mirror  
-- Full `@` fuzzy file picker  
-- Permission approval UI  
-- Subagent dashboard  
-- HTTPS beyond Tailscale  
-- Multi-user ACLs  
+Merge consecutive same-role chunks. Cap hydrate at last ~200 messages for MVP performance.
 
 ---
 
-## 10. Success criteria
+## 9. Always-on packaging
 
-1. From iPhone on tailnet, open hub URL, resume an existing Circana session, send a prompt, see streaming reply.  
-2. Desktop browser on same session sees the same stream live.  
-3. `/` shows commands from the agent for that session.  
-4. Session list shows multiple projects’ sessions; switch works.  
-5. PC reboot + logon: hub comes back (with startup task).  
-6. Hub not reachable from non-tailnet LAN without Tailscale.  
+- `start-hub.ps1` / `stop-hub.ps1` / `install-startup.ps1`  
+- Logs under `logs/hub-YYYYMMDD.log`  
+- `config.example.toml` + local `config.toml` (gitignored)  
+- README: Tailscale URL, always-approve warning, phone home screen tip  
 
 ---
 
-## 11. Risks
+## 10. Security
 
-| Risk | Mitigation |
-|---|---|
-| ACP session switch loses context | Load before each prompt; test multi-session thrash |
-| `available_commands` incomplete | Still allow free-text `/cmd` |
-| Large transcript history | Virtualize list; paginate load from updates.jsonl later |
-| Agent serve crash | Supervisor restart + UI banner |
-| User expects stock TUI | Explicit product copy: “Remote Hub UI” |
+- Tailscale primary  
+- Optional hub token  
+- Agent secret file `data/agent.secret` mode user-only when possible  
+- No full prompt logging by default  
+- Document: remote = full machine agent power under current Grok permissions  
 
 ---
 
-## 12. Implementation order (preview)
+## 11. MVP scope
 
-1. Scaffold project + config + agent supervisor  
-2. ACP client bridge + fan-out WS  
-3. Session index API  
-4. SPA shell (rail/sheet + transcript + composer)  
-5. Slash palette wired to `available_commands_update`  
-6. Startup scripts + smoke test on Tailscale from phone  
+**In:** hub, agent supervisor, session list/search/new/resume, disk history, live fan-out, responsive UI, slash palette, start scripts, reconnect, busy locking  
 
-Detailed plan follows after spec approval.
+**Out (v2):** stock TUI mirror, @ file fuzzy picker, permission UI, subagent tree, multi-turn queue UI, HTTPS  
+
+---
+
+## 12. Success criteria
+
+1. iPhone on tailnet opens hub, resumes a real project session, streams a reply  
+2. Desktop browser on same session sees the same stream live  
+3. Opening a session shows prior transcript from disk, not empty  
+4. `/` shows agent commands after load  
+5. Session list spans multiple projects; junk temps hidden  
+6. Startup task brings hub back after login  
+7. Without Tailscale, local bind works with clear banner  
+
+---
+
+## 13. Implementation order
+
+1. Config + session index + history parser + tests  
+2. Agent supervisor + ACP client  
+3. aiohttp server (REST + WS fan-out)  
+4. SPA (shell, sessions, transcript, composer, slash, polish)  
+5. Scripts + README + smoke run on Tailscale IP  

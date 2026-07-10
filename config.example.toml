@@ -1,0 +1,21 @@
+# Copy to config.toml and adjust. config.toml is gitignored.
+
+[hub]
+# Leave empty to auto-detect: bind 127.0.0.1 AND Tailscale IPv4 when available.
+# Explicit Tailscale IP also dual-binds localhost. Never use 0.0.0.0.
+bind_host = ""
+bind_port = 8787
+
+# Optional shared secret for HTTP/WS (Authorization: Bearer or ?token=)
+hub_token = ""
+
+sessions_root = "~/.grok/sessions"
+projects_root = "D:\\Projects"
+# grok_bin = "C:\\Users\\YOU\\.grok\\bin\\grok.exe"
+# max_sessions = 80
+# max_history_messages = 200
+
+[agent]
+bind = "127.0.0.1"
+port = 2419
+# secret_path = "data/agent.secret"
