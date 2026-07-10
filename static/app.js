@@ -128,6 +128,7 @@
     stallWarned: false,
     railTab: "sessions", // sessions | files
     mainMode: "chat", // chat | file
+    fileViewMode: "edit", // edit | preview (meaningful for markdown only)
     fs: {
       root: "",
       filter: "",
@@ -161,8 +162,12 @@
     filePathLabel: $("#file-path-label"),
     fileDirty: $("#file-dirty"),
     fileEditor: $("#file-editor"),
+    filePreview: $("#file-preview"),
+    fileMdModes: $("#file-md-modes"),
     fileStatus: $("#file-status"),
     btnFileBack: $("#btn-file-back"),
+    btnFileEdit: $("#btn-file-edit"),
+    btnFilePreview: $("#btn-file-preview"),
     btnFileInsert: $("#btn-file-insert"),
     btnFileSave: $("#btn-file-save"),
     transcript: $("#transcript"),
@@ -1643,6 +1648,63 @@
     }
   }
 
+  function isMarkdownPath(path) {
+    if (!path) return false;
+    const lower = String(path).toLowerCase();
+    return lower.endsWith(".md") || lower.endsWith(".markdown");
+  }
+
+  function renderMarkdownPreview() {
+    if (!els.filePreview) return;
+    let source = els.fileEditor ? els.fileEditor.value : "";
+    if (!source && state.fs.content) source = state.fs.content;
+    if (typeof window.marked === "undefined" || typeof window.DOMPurify === "undefined") {
+      els.filePreview.textContent =
+        "Markdown library unavailable.\n\n" + (source || "");
+      return;
+    }
+    try {
+      if (window.marked && typeof window.marked.setOptions === "function") {
+        window.marked.setOptions({ gfm: true, breaks: false });
+      }
+      const rawHtml =
+        typeof window.marked.parse === "function"
+          ? window.marked.parse(source || "")
+          : window.marked(source || "");
+      els.filePreview.innerHTML = window.DOMPurify.sanitize(rawHtml);
+    } catch (err) {
+      els.filePreview.textContent = "Preview failed: " + err + "\n\n" + (source || "");
+    }
+  }
+
+  function setFileViewMode(mode) {
+    const next = mode === "preview" ? "preview" : "edit";
+    state.fileViewMode = next;
+    const showPreview = next === "preview";
+    if (els.fileEditor) els.fileEditor.classList.toggle("hidden", showPreview);
+    if (els.filePreview) els.filePreview.classList.toggle("hidden", !showPreview);
+    if (els.btnFileEdit) els.btnFileEdit.setAttribute("aria-selected", showPreview ? "false" : "true");
+    if (els.btnFilePreview) els.btnFilePreview.setAttribute("aria-selected", showPreview ? "true" : "false");
+    if (showPreview) {
+      renderMarkdownPreview();
+      if (els.filePreview) els.filePreview.focus();
+    } else if (els.fileEditor && !els.fileEditor.disabled) {
+      els.fileEditor.focus();
+    }
+  }
+
+  function updateMdModeUi(path) {
+    const isMd = isMarkdownPath(path);
+    if (els.fileMdModes) els.fileMdModes.classList.toggle("hidden", !isMd);
+    if (!isMd) {
+      setFileViewMode("edit");
+    }
+  }
+
+  function clearFilePreview() {
+    if (els.filePreview) els.filePreview.innerHTML = "";
+  }
+
   function resetFs(opts) {
     const forceClose = !opts || opts.closeFile !== false;
     state.fs.root = "";
@@ -1658,10 +1720,15 @@
       state.fs.content = "";
       state.fs.baseline = "";
       state.fs.dirty = false;
+      state.fileViewMode = "edit";
       if (els.fileEditor) {
         els.fileEditor.value = "";
         els.fileEditor.disabled = true;
+        els.fileEditor.classList.remove("hidden");
       }
+      clearFilePreview();
+      if (els.filePreview) els.filePreview.classList.add("hidden");
+      if (els.fileMdModes) els.fileMdModes.classList.add("hidden");
       updateFileDirtyUi();
       if (state.mainMode === "file") {
         setMainMode("chat");
@@ -1695,10 +1762,15 @@
     state.fs.baseline = "";
     state.fs.dirty = false;
     state.fs.error = null;
+    state.fileViewMode = "edit";
     if (els.fileEditor) {
       els.fileEditor.value = "";
       els.fileEditor.disabled = true;
+      els.fileEditor.classList.remove("hidden");
     }
+    clearFilePreview();
+    if (els.filePreview) els.filePreview.classList.add("hidden");
+    if (els.fileMdModes) els.fileMdModes.classList.add("hidden");
     if (els.filePathLabel) els.filePathLabel.textContent = "";
     if (els.fileStatus) els.fileStatus.textContent = "";
     updateFileDirtyUi();
@@ -1751,7 +1823,13 @@
       const res = await fetch(apiUrl(q));
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        state.fs.error = data.error || "Failed to list directory";
+        let errMsg =
+          data.error || `Failed to list directory (HTTP ${res.status})`;
+        if (res.status === 404) {
+          errMsg =
+            "File API missing (HTTP 404). Restart the hub to load new routes.";
+        }
+        state.fs.error = errMsg;
         if (path === "") {
           if (els.fileEmpty) {
             els.fileEmpty.classList.remove("hidden");
@@ -1917,7 +1995,11 @@
       const res = await fetch(apiUrl(q));
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const err = data.error || "Failed to read file";
+        let err = data.error || `Failed to read file (HTTP ${res.status})`;
+        if (res.status === 404) {
+          err =
+            "File API missing (HTTP 404). Restart the hub to load new routes.";
+        }
         toast(err, "danger");
         if (els.fileStatus) els.fileStatus.textContent = err;
         return;
@@ -1939,10 +2021,18 @@
         els.fileStatus.textContent = size ? `Loaded · ${size}` : "Loaded";
       }
       updateFileDirtyUi();
+      updateMdModeUi(rel);
+      if (isMarkdownPath(rel)) {
+        setFileViewMode("preview");
+      } else {
+        setFileViewMode("edit");
+      }
       setMainMode("file");
       renderFileTree();
       closeRail();
-      if (els.fileEditor) els.fileEditor.focus();
+      if (state.fileViewMode === "edit" && els.fileEditor) {
+        els.fileEditor.focus();
+      }
     } catch (err) {
       toast("Failed to read file: " + err, "danger");
       if (els.fileStatus) els.fileStatus.textContent = String(err);
@@ -1969,7 +2059,11 @@
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const err = data.error || "Save failed";
+        let err = data.error || `Save failed (HTTP ${res.status})`;
+        if (res.status === 404) {
+          err =
+            "File API missing (HTTP 404). Restart the hub to load new routes.";
+        }
         toast(err, "danger");
         if (els.fileStatus) els.fileStatus.textContent = err;
         return;
@@ -2322,6 +2416,16 @@
     if (els.btnFileInsert) {
       els.btnFileInsert.addEventListener("click", () => {
         insertOpenPath();
+      });
+    }
+    if (els.btnFileEdit) {
+      els.btnFileEdit.addEventListener("click", () => {
+        setFileViewMode("edit");
+      });
+    }
+    if (els.btnFilePreview) {
+      els.btnFilePreview.addEventListener("click", () => {
+        setFileViewMode("preview");
       });
     }
     if (els.fileEditor) {
