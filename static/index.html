@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0e1116" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Grok Remote Hub</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="rail" class="rail" aria-label="Sessions">
+      <div class="rail-header">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span class="brand-text">Grok Hub</span>
+        </div>
+        <button type="button" id="btn-new" class="btn btn-accent btn-sm">New</button>
+      </div>
+      <div class="search-wrap">
+        <input type="search" id="session-search" class="input" placeholder="Search sessions" autocomplete="off" />
+      </div>
+      <div id="session-list" class="session-list" role="list"></div>
+      <div id="session-empty" class="empty-rail hidden">
+        <p>No sessions yet. Tap New to start one in a project folder.</p>
+      </div>
+    </aside>
+
+    <div id="rail-backdrop" class="rail-backdrop" hidden></div>
+
+    <main class="main">
+      <header class="topbar">
+        <button type="button" id="btn-menu" class="btn btn-ghost btn-icon" aria-label="Open sessions">☰</button>
+        <div class="topbar-meta">
+          <h1 id="chat-title" class="chat-title">Select a session</h1>
+          <div class="chat-sub">
+            <span id="chat-model" class="chip hidden"></span>
+            <span id="chat-cwd" class="cwd muted"></span>
+          </div>
+        </div>
+        <div id="status-pill" class="status-pill" data-state="connecting" title="Connection status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="status-label">Connecting</span>
+        </div>
+      </header>
+
+      <div id="transcript" class="transcript" aria-live="polite">
+        <div id="empty-main" class="empty-main">
+          <div class="empty-card">
+            <h2>Ops control for Grok Build</h2>
+            <p>Open a session from the rail, or start a new one in a project folder.</p>
+            <div class="empty-actions">
+              <button type="button" id="btn-empty-sessions" class="btn btn-ghost">Browse sessions</button>
+              <button type="button" id="btn-empty-new" class="btn btn-accent">New session</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="composer-shell">
+        <div id="slash-palette" class="slash-palette hidden" role="listbox" aria-label="Slash commands"></div>
+        <form id="composer-form" class="composer">
+          <textarea
+            id="composer-input"
+            class="composer-input"
+            rows="1"
+            placeholder="Message Grok…  (/ for commands)"
+            disabled
+            enterkeyhint="send"
+          ></textarea>
+          <div class="composer-actions">
+            <button type="button" id="btn-stop" class="btn btn-danger btn-sm hidden">Stop</button>
+            <button type="submit" id="btn-send" class="btn btn-accent" disabled>Send</button>
+          </div>
+        </form>
+        <p id="composer-hint" class="composer-hint muted">Load a session to chat. Slash commands appear after load.</p>
+      </div>
+    </main>
+  </div>
+
+  <div id="modal-new" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-new-title">
+    <div class="modal-backdrop" data-close="modal-new"></div>
+    <div class="modal-card">
+      <header class="modal-header">
+        <h2 id="modal-new-title">New session</h2>
+        <button type="button" class="btn btn-ghost btn-icon" data-close="modal-new" aria-label="Close">×</button>
+      </header>
+      <p class="muted modal-help">Pick a project working directory.</p>
+      <input type="search" id="project-search" class="input" placeholder="Filter projects" autocomplete="off" />
+      <div id="project-list" class="project-list" role="list"></div>
+      <p id="project-empty" class="muted hidden">No projects found under the configured root.</p>
+    </div>
+  </div>
+
+  <div id="toast-host" class="toast-host" aria-live="assertive"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
