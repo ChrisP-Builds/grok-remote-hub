@@ -1027,7 +1027,7 @@ a {
   background: var(--muted);
 }
 
-/* Live turn status strip */
+/* Live turn status strip (display-only; never intercept composer clicks) */
 .turn-strip {
   display: flex;
   flex-wrap: wrap;
@@ -1043,6 +1043,8 @@ a {
   min-width: 0;
   max-width: 100%;
   overflow-x: hidden;
+  pointer-events: none;
+  flex-shrink: 0;
 }
 
 .turn-strip[data-state="stalled"] {
@@ -1549,7 +1551,7 @@ a {
   }
 }
 
-/* Composer = shell prompt */
+/* Composer = shell prompt (must stay clickable during turns / queue) */
 .composer-shell {
   position: relative;
   border-top: 1px solid var(--border);
@@ -1559,6 +1561,15 @@ a {
   min-width: 0;
   max-width: 100%;
   overflow: visible; /* was overflow-x: hidden — clips slash palette */
+  pointer-events: auto;
+  flex-shrink: 0;
+}
+
+.composer-shell .composer,
+.composer-shell .composer-input,
+.composer-shell .composer-actions,
+.composer-shell .btn {
+  pointer-events: auto;
 }
 
 .composer {

@@ -40,7 +40,7 @@
     // Keep non-empty agent lists; empty array would wipe a good cache.
     if (cmds.length === 0) return;
     state.commands = cmds;
-    setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+    setComposerEnabled(composerConnected());
   }
 
   function slashCommandSource() {
@@ -582,11 +582,44 @@
     }
   }
 
+  function composerConnected() {
+    return state.wsState === "open" && state.status.agent === "up";
+  }
+
+  function forceComposerUnlocked() {
+    // Hard unlock typing/send when a session is selected and hub is connected.
+    // Never gate on turnRunning — queue path requires Send during turns.
+    if (!state.selectedId || !composerConnected()) return;
+    if (els.input) {
+      els.input.disabled = false;
+      els.input.readOnly = false;
+      els.input.removeAttribute("disabled");
+      els.input.removeAttribute("readonly");
+    }
+    if (els.btnSend) {
+      els.btnSend.disabled = false;
+      els.btnSend.removeAttribute("disabled");
+    }
+  }
+
   function setComposerEnabled(on) {
-    // Keep input enabled during turn so user can queue the next message
-    els.input.disabled = !on || !state.selectedId;
-    els.btnSend.disabled = !on || !state.selectedId;
-    els.btnStop.classList.toggle("hidden", !state.turnRunning || !state.selectedId);
+    // `on` means hub/agent connectivity only — never use turnRunning to disable typing.
+    const allowType = !!on && !!state.selectedId;
+    if (els.input) {
+      els.input.disabled = !allowType;
+      els.input.readOnly = false;
+      if (allowType) {
+        els.input.removeAttribute("disabled");
+        els.input.removeAttribute("readonly");
+      }
+    }
+    if (els.btnSend) {
+      els.btnSend.disabled = !allowType;
+      if (allowType) els.btnSend.removeAttribute("disabled");
+    }
+    if (els.btnStop) {
+      els.btnStop.classList.toggle("hidden", !state.turnRunning || !state.selectedId);
+    }
     if (!state.selectedId) {
       els.composerHint.textContent =
         "Remote agent stream. Load a session to chat; desktop TUI stays separate.";
@@ -604,6 +637,7 @@
     } else {
       els.composerHint.textContent = `${state.commands.length} slash commands available. Type / to open palette.`;
     }
+    if (allowType) forceComposerUnlocked();
     updateTurnStrip();
   }
 
@@ -639,7 +673,7 @@
           "Still working (like desktop TUI). Use Stop to cancel.",
           ""
         );
-        setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+        setComposerEnabled(composerConnected());
       }
     }, 2000);
   }
@@ -652,7 +686,8 @@
       clearStallWatch();
       if (state.streamBuffers) state.streamBuffers.lastToolTitle = "";
     }
-    setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+    setComposerEnabled(composerConnected());
+    forceComposerUnlocked();
   }
 
   async function applySessionSwitch(fromId, toId, reason, message) {
@@ -702,7 +737,8 @@
     if (from && from !== toId) {
       sendWs({ type: "unsubscribe", sessionId: from });
     }
-    setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+    setComposerEnabled(composerConnected());
+    forceComposerUnlocked();
     updateTurnStrip();
   }
 
@@ -1285,9 +1321,16 @@
       return;
     }
 
-    if (!sessionId || sessionId !== state.selectedId) return;
-
+    // Queued user echoes may use view id while selection is live (or vice versa).
+    // Accept user_message_chunk when selected and session matches OR turn is running.
     if (kind === "user_message_chunk") {
+      const acceptUserEcho =
+        !!state.selectedId &&
+        (!sessionId ||
+          sessionId === state.selectedId ||
+          state.turnRunning ||
+          isHubCreatedSession(sessionId));
+      if (!acceptUserEcho) return;
       const text = extractText(update.content);
       if (!text) return;
       const last = els.transcript.lastElementChild;
@@ -1323,6 +1366,8 @@
       scrollIfSticky();
       return;
     }
+
+    if (!sessionId || sessionId !== state.selectedId) return;
 
     if (kind === "agent_message_chunk") {
       const text = extractText(update.content);
@@ -1464,7 +1509,8 @@
     renderSessions();
     syncFsForSession();
     closeRail();
-    setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+    setComposerEnabled(composerConnected());
+    forceComposerUnlocked();
     updateTurnStrip();
     refreshUsage();
 
@@ -1563,7 +1609,8 @@
       sendWs({ type: "unsubscribe", sessionId: viewId });
     }
 
-    setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+    setComposerEnabled(composerConnected());
+    forceComposerUnlocked();
     updateTurnStrip();
     refreshUsage();
     els.input.focus();
@@ -1658,36 +1705,44 @@
         }
       }
       // Server is source of truth for turnRunning (prevents client/server desync).
+      // Match view id, live hub id, or missing turnSessionId — never gate composer.
       if (msg.turnRunning != null) {
-        const running =
-          !!msg.turnRunning &&
-          (msg.turnSessionId === state.selectedId || !msg.turnSessionId);
-        if (running && !state.turnRunning) {
-          setTurnRunning(true);
-          toast("Turn still running on server…", "");
-        } else if (running !== state.turnRunning) {
-          setTurnRunning(running);
-        } else {
-          state.turnRunning = running;
-          updateTurnStrip();
+        const serverRunning = !!msg.turnRunning;
+        const forMe =
+          !msg.turnSessionId ||
+          msg.turnSessionId === state.selectedId ||
+          (state.selectedId && isHubCreatedSession(msg.turnSessionId));
+        if (forMe) {
+          if (serverRunning && !state.turnRunning) {
+            setTurnRunning(true);
+            toast("Turn still running on server…", "");
+          } else if (serverRunning !== state.turnRunning) {
+            setTurnRunning(serverRunning);
+          } else {
+            state.turnRunning = serverRunning;
+            updateTurnStrip();
+          }
         }
       }
       updateVersionBadge();
       updateStatusPill();
       renderSessions();
-      setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+      setComposerEnabled(composerConnected());
+      forceComposerUnlocked();
       return;
     }
     if (type === "queued") {
       state.promptQueueLength = msg.queueLength || msg.position || 0;
       toast(`Queued (#${msg.position || state.promptQueueLength})`, "");
-      setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+      setComposerEnabled(composerConnected());
+      forceComposerUnlocked();
       updateTurnStrip();
       return;
     }
     if (type === "queue") {
       state.promptQueueLength = msg.queueLength || 0;
-      setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+      setComposerEnabled(composerConnected());
+      forceComposerUnlocked();
       updateTurnStrip();
       return;
     }
@@ -1746,36 +1801,51 @@
       return;
     }
     if (type === "turn") {
-      if (msg.sessionId === state.selectedId) {
-        setTurnRunning(msg.state === "running");
-        if (msg.error && msg.state === "idle") {
-          toast(msg.error, "danger");
+      const turnForMe =
+        !msg.sessionId ||
+        msg.sessionId === state.selectedId ||
+        (state.selectedId && isHubCreatedSession(msg.sessionId));
+      if (turnForMe) {
+        const busyIdle =
+          msg.state === "idle" && msg.error && /busy/i.test(String(msg.error));
+        // Old hub "busy" idle+error: keep turnRunning (server still mid-turn) and unlock composer.
+        if (busyIdle) {
+          if (msg.error) toast(msg.error, "danger");
+        } else {
+          setTurnRunning(msg.state === "running");
+          if (msg.error && msg.state === "idle") {
+            toast(msg.error, "danger");
+          }
+          if (msg.state === "idle") {
+            refreshUsage();
+          }
         }
-        if (msg.state === "idle") {
-          refreshUsage();
-        }
-        setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
         updateStatusPill();
       }
+      // Always re-enable composer after turn events (never leave disabled).
+      setComposerEnabled(composerConnected());
+      forceComposerUnlocked();
       return;
     }
     if (type === "error") {
       const errText = msg.message || "Error";
       const queueFull = /queue full/i.test(errText);
-      // Queue-full is non-fatal while a turn still runs; do not unlock the turn.
-      if (!queueFull) {
+      const busy = /busy|stuck/i.test(errText);
+      // Queue-full / busy from old hub: keep turnRunning; do not unlock the turn.
+      if (!queueFull && !busy) {
         setTurnRunning(false);
       }
-      setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+      if (busy && !queueFull) {
+        toast(
+          "Message not queued — restart hub to enable queue, or wait for turn to finish.",
+          "danger"
+        );
+      } else {
+        toast(errText, "danger");
+      }
+      setComposerEnabled(composerConnected());
+      forceComposerUnlocked();
       updateStatusPill();
-      const busy = /busy|stuck/i.test(errText);
-      toast(busy && !queueFull ? "Agent busy or stuck; try again" : errText, "danger");
-      // Keep Send available when connected (queue path allows send while running)
-      els.btnSend.disabled = !(
-        state.wsState === "open" &&
-        state.status.agent === "up" &&
-        state.selectedId
-      );
       return;
     }
   }
@@ -2497,6 +2567,7 @@
       state.promptQueueLength = (state.promptQueueLength || 0) + 1;
     }
     setComposerEnabled(true);
+    forceComposerUnlocked();
     updateStatusPill();
   }
 
@@ -2624,6 +2695,7 @@
   }
 
   function onComposerInput() {
+    forceComposerUnlocked();
     autoGrow();
     maybeOpenSlashFromValue();
   }

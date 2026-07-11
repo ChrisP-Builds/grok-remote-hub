@@ -305,7 +305,15 @@ class Hub:
     async def broadcast(self, payload: dict[str, Any], session_id: str | None = None) -> None:
         data = json.dumps(payload, default=str)
         dead: list[web.WebSocketResponse] = []
-        always = ("status", "sessions", "error", "hello", "session_switch")
+        always = (
+            "status",
+            "sessions",
+            "error",
+            "hello",
+            "session_switch",
+            "queued",
+            "queue",
+        )
         scoped = ("acp", "history", "commands", "turn", "system")
         for ws in list(self.clients):
             if session_id:
@@ -1200,7 +1208,8 @@ class Hub:
                 "queueLength": queue_length,
             }
         )
-        # Echo so transcript shows the queued user message immediately
+        # Unscoped echo: view id may differ from live selection; all clients get it.
+        # Client accepts user_message_chunk when turnRunning or session matches.
         await self.broadcast(
             {
                 "type": "acp",
@@ -1215,8 +1224,7 @@ class Hub:
                         },
                     },
                 },
-            },
-            session_id=view_session_id,
+            }
         )
         await self.broadcast(self.status_payload())
 
