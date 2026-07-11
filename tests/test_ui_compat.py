@@ -15,8 +15,8 @@ def test_html_version_badge_and_banner() -> None:
     assert 'id="compat-dot"' in html
     assert 'id="session-banner"' in html
     assert 'id="session-banner-text"' in html
-    assert "Remote agent stream over Tailscale" in html
-    assert "desktop TUI stays separate" in html
+    assert "No session selected" in html
+    assert "Pick a chat from the sidebar" in html
     # Product positioning: not full CLI clone
     assert "full Grok CLI" not in html
 
@@ -34,9 +34,9 @@ def test_js_session_mode_and_version_state() -> None:
     assert "live-remote" in js
     assert "Viewing saved history" in js
     assert "Live remote session" in js
-    assert "Desktop TUI history is separate" in js
+    assert "Desktop TUI history is separate" in js or "TUI stays separate" in js
     assert "/attach" in js
-    assert "Remote agent stream over Tailscale" in js
+    assert "No session selected" in js
     assert "isHubCreatedSession" in js
     # TUI-aligned client: soft warn at 120s; never auto reset-turn / unlock
     assert "CLIENT_STALL_WARN_MS" in js
