@@ -31,3 +31,5 @@ a new ADR.
 | 004 | Detached hub process start via WMI | Accepted | 2026-07-11 |
 | 005 | Queue prompts while a turn is running | Accepted | 2026-07-11 |
 | 006 | Session-cwd sandboxed file browser over REST | Accepted | 2026-07-11 |
+| 007 | Classify subagent sessions via session_kind | Accepted | 2026-07-11 |
+| 008 | Persist hub renames as hub_title in summary.json | Accepted | 2026-07-11 |

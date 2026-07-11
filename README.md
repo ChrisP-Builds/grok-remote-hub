@@ -88,15 +88,16 @@ Copy `config.example.toml` to `config.toml` for local overrides.
 - **Dual-hub topology:** phone + desktop browsers share this process over Tailscale; stock Grok TUI is not multi-client
 - Session list from `~/.grok/sessions/**/summary.json`
 - Transcript hydrate from `updates.jsonl` (ACP load does not replay chat)
-- Detached start via WMI (`start-hub.ps1`); see [docs/adr/](docs/adr/) (ADR 001–006)
+- Detached start via WMI (`start-hub.ps1`); see [docs/adr/](docs/adr/) (ADR 001–008)
 - Sandboxed REST file browser for the session cwd (`/api/fs/list|read|write|raw`); skills index (`/api/skills`)
 - FIFO **prompt queue** while a turn runs (Stop clears the queue); see ADR-005
+- Session list classifies **subagents** from `summary.json` `session_kind` (legacy path fallback); user renames via `PATCH /api/sessions/{id}` → `hub_title` (ADR-007, ADR-008)
 
 ## UI capabilities (current)
 
-- **Sessions | Files** rail: list/search sessions; lazy file tree for session cwd; text edit/save; markdown Preview (+ Mermaid); image preview + lightbox
+- **Sessions | Files** rail: list/search sessions; **All | Standard | Subagent** filter; pin-to-top; hover tooltips (project, model, path); rename (✎ on row / topbar); lazy file tree for session cwd; text edit/save; markdown Preview (+ Mermaid); image preview + lightbox
 - **Composer:** multi-line grow, iOS ≥16px no-zoom, slash palette (agent commands + disk skills, name-first match), prompt queue while a turn runs
-- **Transcript:** tool rows collapsed by default (expand for detail); plan checklist auto-opens while tasks are active and highlights the running item
+- **Transcript:** tool rows collapsed by default to a **single compact line** (expand for detail; mobile ellipsis); plan checklist auto-opens while tasks are active and highlights the running item
 - **Chrome:** project name chip, dual usage bar (session context from `signals.json` + weekly Grok plan from local CLI auth via `/api/sessions/{id}/usage` and `/api/usage/plan`), collapsible desktop rail (Browse sessions only when rail is hidden)
 
 ### Privacy note (plan usage)

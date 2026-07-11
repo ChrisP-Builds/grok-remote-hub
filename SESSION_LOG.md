@@ -2,6 +2,26 @@
 
 Operational and session wrap-up notes. Newest first. Cross-project lessons live in the Brain; ADRs live in `docs/adr/`.
 
+### ✅ Session 2026-07-11 — Subagent classify, rename, tool density
+
+Session rail and transcript polish: fixed subagent detection (`session_kind`, not path nesting), row tooltips (project / model / path), kind filter + pin (prior commit), rename via pencil + `PATCH` / `hub_title`, and mobile tool rows compacted to single-line collapsed summaries. Live probe: **0** path-nested subagents vs **~86** `session_kind` matches. Rename **405** was a stale hub process (route not loaded). Captured ADR-007 and ADR-008.
+
+**Operational mutations (all authorized):**
+- Hub restart required for Python routes (`PATCH /api/sessions/{id}`, session_index); static JS/CSS hard-refresh only
+- No push; no cloud deploy
+
+**Lessons (project-local):**
+- Grok `session_kind` (`subagent` / `subagent_fork`) is authoritative for pills/filter; path `subagents/` may not exist; `agent_name` alone false-positives (`grok-build-plan` is main)
+- Rename writes `hub_title` (+ mirrors `generated_title`); title order hub_title → generated_title → session_summary — see ADR-008
+- Long-lived hub returns 405/404 on new routes until restart (also Brain: same-error-after-fix-suspect-stale-running-process)
+- Mobile tools: short label + single-line ellipsis summary; explicit `:not([open])` hide for details bodies
+
+**State at close / next session:**
+- Docs handoff: ADRs 007–008, this entry, README UI/architecture notes
+- Feature code still uncommitted on `master` (`session_index`, rename API, static UI, tests) unless committed separately
+- Untracked probe/scratch files under repo root: keep uncommitted
+- Resume: restart hub, hard-refresh phone, verify Subagent filter + rename + compact tools
+
 ### ✅ Session 2026-07-11 — File tree, mobile UX, slash/skills, queue, transcript density
 
 Large UX/API pass on the sole-writer stream: Sessions|Files rail with sandboxed list/read/write (+ markdown/Mermaid/image preview), project chip + context usage bar, slash palette (fixed mobile scroll, name-first match, skills from disk), agent command cache, FIFO prompt queue with unlocked composer, collapsible desktop rail, and high-signal transcript (tools collapsed; plan auto-expands active tasks). Captured ADR-005 (queue) and ADR-006 (session-cwd file browser).
