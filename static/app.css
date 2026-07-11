@@ -865,6 +865,7 @@ a {
   max-width: 100%;
   flex-shrink: 0;
   font-family: var(--font);
+  cursor: help;
 }
 
 .usage-bar.hidden {
@@ -874,11 +875,12 @@ a {
 .usage-bar-track {
   flex: 1 1 auto;
   min-width: 0;
-  height: 4px;
+  height: 6px;
   border-radius: 2px;
   background: var(--surface-2);
   border: 1px solid var(--border);
   overflow: hidden;
+  cursor: help;
 }
 
 .usage-bar-fill {
