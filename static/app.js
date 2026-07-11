@@ -106,6 +106,7 @@
     commands: [],
     turnRunning: false,
     stickToBottom: true,
+    _ignoreScroll: false,
     historyLoadedFor: null,
     historyFingerprint: null,
     historyPollTimer: null,
@@ -731,7 +732,32 @@
     return el.scrollHeight - el.scrollTop - el.clientHeight;
   }
 
+  function scrollTranscriptToBottom() {
+    const el = els.transcript;
+    if (!el) return;
+    state._ignoreScroll = true;
+    el.scrollTop = el.scrollHeight;
+    // release after layout so mid-scroll frames don't flip stickToBottom
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        state._ignoreScroll = false;
+        if (state.stickToBottom) el.scrollTop = el.scrollHeight;
+        updateJumpLatestUiOnly();
+      });
+    });
+  }
+
+  function updateJumpLatestUiOnly() {
+    if (!els.btnJumpLatest) return;
+    const nearBottom = distanceFromBottom() < 80;
+    els.btnJumpLatest.classList.toggle("hidden", nearBottom || !state.selectedId);
+  }
+
   function updateJumpLatest() {
+    if (state._ignoreScroll) {
+      updateJumpLatestUiOnly();
+      return;
+    }
     if (!els.btnJumpLatest) return;
     const nearBottom = distanceFromBottom() < 80;
     state.stickToBottom = nearBottom;
@@ -740,17 +766,16 @@
 
   function jumpToLatest() {
     state.stickToBottom = true;
-    els.transcript.scrollTop = els.transcript.scrollHeight;
-    updateJumpLatest();
+    scrollTranscriptToBottom();
+    updateJumpLatestUiOnly();
   }
 
   function scrollIfSticky() {
     if (!state.stickToBottom) {
-      updateJumpLatest();
+      updateJumpLatestUiOnly();
       return;
     }
-    els.transcript.scrollTop = els.transcript.scrollHeight;
-    updateJumpLatest();
+    scrollTranscriptToBottom();
   }
 
   function setTermBodyContent(bodyEl, text) {
@@ -1072,6 +1097,8 @@
   }
 
   function applyHistoryMessages(messages, opts = {}) {
+    // Live stream owns the transcript while a turn is running (unless forced open)
+    if (state.turnRunning && !opts.force) return false;
     const list = messages || [];
     const fp = historyFingerprint(list);
     const sessionId = state.selectedId;
@@ -2620,11 +2647,14 @@
 
   async function refreshHistory(sessionId) {
     if (!sessionId || sessionId !== state.selectedId) return;
+    // Live stream owns the transcript while a turn is running
+    if (state.turnRunning) return;
     try {
       const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/history`));
       if (!res.ok) return;
       const data = await res.json();
       if (sessionId !== state.selectedId) return;
+      if (state.turnRunning) return;
       applyHistoryMessages(data.messages || []);
     } catch (_) {
       // keep current transcript on transient failures

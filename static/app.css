@@ -965,7 +965,7 @@ a {
   overflow-x: hidden;
   padding: 14px 16px 12px;
   overscroll-behavior: contain;
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
   font-family: var(--font);
   font-size: 13px;
   line-height: 1.55;
