@@ -72,12 +72,24 @@
         </div>
       </header>
 
-      <div id="usage-bar" class="usage-bar hidden" aria-label="Context window usage (session)" title="Context window usage (session)">
-        <div class="usage-bar-track">
-          <div id="usage-bar-fill" class="usage-bar-fill" style="width:0%" data-level="ok"></div>
+      <div id="usage-bar" class="usage-bar hidden" aria-label="Usage">
+        <div class="usage-seg usage-seg-context" data-usage-seg="context" tabindex="0" role="button" aria-expanded="false">
+          <span class="usage-seg-tag">CTX</span>
+          <div class="usage-bar-track">
+            <div id="usage-bar-fill" class="usage-bar-fill" style="width:0%" data-level="ok"></div>
+          </div>
+          <span id="usage-bar-label" class="usage-bar-label">—</span>
+          <span id="usage-bar-tokens" class="usage-bar-tokens muted">—</span>
         </div>
-        <span id="usage-bar-label" class="usage-bar-label">—</span>
-        <span id="usage-bar-monthly" class="usage-bar-monthly hidden" title="Monthly usage">M</span>
+        <div class="usage-seg-divider" aria-hidden="true"></div>
+        <div class="usage-seg usage-seg-monthly" data-usage-seg="monthly" tabindex="0" role="button" aria-expanded="false">
+          <span class="usage-seg-tag">M</span>
+          <div class="usage-bar-track usage-bar-track-sm">
+            <div id="usage-bar-fill-monthly" class="usage-bar-fill" style="width:0%" data-level="ok"></div>
+          </div>
+          <span id="usage-bar-monthly" class="usage-bar-monthly">—</span>
+        </div>
+        <div id="usage-popover" class="usage-popover hidden" role="tooltip"></div>
       </div>
 
       <div id="chat-panel" class="chat-panel">
