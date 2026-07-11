@@ -859,16 +859,19 @@ class Hub:
             log.exception("session/load failed")
             return web.json_response({"error": str(exc)}, status=500)
         await self.broadcast(self.status_payload())
-        if self.acp.available_commands:
+        cmds = list(self.acp.available_commands or [])
+        if cmds:
             await self.broadcast(
                 {
                     "type": "commands",
                     "sessionId": session_id,
-                    "commands": self.acp.available_commands,
+                    "commands": cmds,
                 },
                 session_id=session_id,
             )
-        return web.json_response({"sessionId": session_id, "loaded": True})
+        return web.json_response(
+            {"sessionId": session_id, "loaded": True, "commands": cmds}
+        )
 
     async def handle_attach_session(self, request: web.Request) -> web.Response:
         """Attach for chat: ensure live hub session for cwd (no prompt required).
@@ -914,12 +917,13 @@ class Hub:
             log.exception("attach failed view=%s", view_session_id)
             return web.json_response({"error": str(exc)}, status=500)
 
-        if self.acp.available_commands:
+        cmds = list(self.acp.available_commands or [])
+        if cmds:
             await self.broadcast(
                 {
                     "type": "commands",
                     "sessionId": live_id,
-                    "commands": self.acp.available_commands,
+                    "commands": cmds,
                 },
                 session_id=live_id,
             )
@@ -933,6 +937,7 @@ class Hub:
                 "reason": reason,
                 "cwd": cwd,
                 "message": message,
+                "commands": cmds,
             }
         )
 
@@ -944,6 +949,18 @@ class Hub:
         await ws.send_str(json.dumps(self.status_payload()))
         items = scan_sessions(self.config.sessions_root, limit=self.config.max_sessions)
         await ws.send_str(json.dumps({"type": "sessions", "items": [s.to_dict() for s in items]}))
+        # Push cached agent slash commands so reconnect/new clients get real list
+        # without waiting for attach or a later available_commands_update.
+        if self.acp.available_commands:
+            await ws.send_str(
+                json.dumps(
+                    {
+                        "type": "commands",
+                        "sessionId": None,
+                        "commands": self.acp.available_commands,
+                    }
+                )
+            )
 
         try:
             async for msg in ws:
@@ -989,6 +1006,23 @@ class Hub:
                     )
                 except Exception:
                     log.debug("failed to send history on subscribe session=%s", sid, exc_info=True)
+                if self.acp.available_commands:
+                    try:
+                        await ws.send_str(
+                            json.dumps(
+                                {
+                                    "type": "commands",
+                                    "sessionId": sid,
+                                    "commands": self.acp.available_commands,
+                                }
+                            )
+                        )
+                    except Exception:
+                        log.debug(
+                            "failed to send commands on subscribe session=%s",
+                            sid,
+                            exc_info=True,
+                        )
                 await self.tailer.ensure_watching(sid, path)
             return
         if typ == "unsubscribe":

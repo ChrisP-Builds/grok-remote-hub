@@ -31,10 +31,27 @@
     { name: "compact", description: "Compact conversation history" },
     { name: "skills", description: "List or inject a skill" },
     { name: "help", description: "Show help / available commands" },
+    { name: "clear", description: "Clear context / start fresh if supported" },
+    { name: "model", description: "Show or change model if supported" },
   ];
 
+  function applyCommands(cmds) {
+    if (!Array.isArray(cmds)) return;
+    // Keep non-empty agent lists; empty array would wipe a good cache.
+    if (cmds.length === 0) return;
+    state.commands = cmds;
+    setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+  }
+
   function slashCommandSource() {
-    return state.commands && state.commands.length ? state.commands : BUILTIN_SLASH;
+    const agent = Array.isArray(state.commands) ? state.commands : [];
+    if (!agent.length) return BUILTIN_SLASH.slice();
+    const names = new Set(agent.map((c) => (c.name || "").toLowerCase()));
+    const merged = agent.slice();
+    for (const b of BUILTIN_SLASH) {
+      if (!names.has((b.name || "").toLowerCase())) merged.push(b);
+    }
+    return merged;
   }
 
   function parseSimpleMarkdownTable(text) {
@@ -1247,13 +1264,22 @@
   }
 
   function handleAcpMessage(sessionId, message) {
-    if (!sessionId || sessionId !== state.selectedId) return;
     const method = message.method || "";
     if (method !== "session/update" && method !== "_x.ai/session/update") {
       return;
     }
     const update = (message.params && message.params.update) || {};
     const kind = update.sessionUpdate || "";
+
+    // Agent command lists are session-global cache; apply even if selectedId lags
+    // (view id vs live id during attach) or message is for another session.
+    if (kind === "available_commands_update") {
+      const cmds = update.availableCommands || update.available_commands || [];
+      applyCommands(Array.isArray(cmds) ? cmds : []);
+      return;
+    }
+
+    if (!sessionId || sessionId !== state.selectedId) return;
 
     if (kind === "user_message_chunk") {
       const text = extractText(update.content);
@@ -1394,12 +1420,6 @@
       return;
     }
 
-    if (kind === "available_commands_update") {
-      const cmds = update.availableCommands || update.available_commands || [];
-      state.commands = Array.isArray(cmds) ? cmds : [];
-      setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
-      return;
-    }
   }
 
   async function openSession(session) {
@@ -1474,6 +1494,9 @@
       liveId = data.liveSessionId || viewId;
       switched = !!data.switched && liveId !== viewId;
       const cwd = data.cwd || session.cwd || "";
+      if (Array.isArray(data.commands) && data.commands.length) {
+        applyCommands(data.commands);
+      }
 
       if (state.hubSessionIds.indexOf(liveId) < 0) {
         state.hubSessionIds = [liveId, ...state.hubSessionIds].slice(0, 50);
@@ -1695,10 +1718,8 @@
       return;
     }
     if (type === "commands") {
-      if (msg.sessionId === state.selectedId) {
-        state.commands = msg.commands || [];
-        setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
-      }
+      // Accept for selected session, any session, or null sessionId (global cache).
+      applyCommands(msg.commands || []);
       return;
     }
     if (type === "turn") {
