@@ -183,6 +183,8 @@
     attachSwitched: false, // true when live id != viewed foreign history id
     sessions: [],
     filter: "",
+    sessionKindFilter: "all", // all | standard | subagent
+    pinnedSessions: [],
     selectedId: null,
     selectedMeta: null,
     commands: [],
@@ -871,17 +873,58 @@
     updateMenuButton();
   }
 
+  function loadPins() {
+    try {
+      const raw = JSON.parse(localStorage.getItem("grh.pinnedSessions") || "[]");
+      return Array.isArray(raw) ? raw.filter((x) => typeof x === "string") : [];
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function savePins(ids) {
+    localStorage.setItem("grh.pinnedSessions", JSON.stringify(ids));
+  }
+
+  function isPinned(id) {
+    return (state.pinnedSessions || []).includes(id);
+  }
+
+  function togglePin(id) {
+    const pins = (state.pinnedSessions || []).slice();
+    const i = pins.indexOf(id);
+    if (i >= 0) pins.splice(i, 1);
+    else pins.push(id);
+    state.pinnedSessions = pins;
+    savePins(pins);
+    renderSessions();
+  }
+
   function renderSessions() {
     const q = state.filter.trim().toLowerCase();
-    const items = state.sessions.filter((s) => {
-      if (!q) return true;
-      return (
-        (s.title || "").toLowerCase().includes(q) ||
-        (s.cwd || "").toLowerCase().includes(q) ||
-        (s.sessionId || "").toLowerCase().startsWith(q) ||
-        basename(s.cwd).toLowerCase().includes(q)
-      );
-    });
+    const items = state.sessions
+      .filter((s) => {
+        if (state.sessionKindFilter === "subagent" && !s.isSubagent) return false;
+        if (state.sessionKindFilter === "standard" && s.isSubagent) return false;
+        if (!q) return true;
+        return (
+          (s.title || "").toLowerCase().includes(q) ||
+          (s.cwd || "").toLowerCase().includes(q) ||
+          (s.sessionId || "").toLowerCase().startsWith(q) ||
+          basename(s.cwd).toLowerCase().includes(q) ||
+          (s.agentName || "").toLowerCase().includes(q)
+        );
+      })
+      .slice()
+      .sort((a, b) => {
+        const ap = isPinned(a.sessionId) ? 1 : 0;
+        const bp = isPinned(b.sessionId) ? 1 : 0;
+        if (ap !== bp) return bp - ap;
+        const at = a.updatedAt || "";
+        const bt = b.updatedAt || "";
+        if (at === bt) return 0;
+        return at < bt ? 1 : -1;
+      });
 
     els.sessionList.innerHTML = "";
     els.sessionEmpty.classList.toggle("hidden", items.length > 0);
@@ -890,8 +933,8 @@
       if (emptyP) {
         if (!state.sessions.length) {
           emptyP.textContent = "No sessions yet. Tap New to start one in a project folder.";
-        } else if (q) {
-          emptyP.textContent = "No sessions match that search.";
+        } else if (q || state.sessionKindFilter !== "all") {
+          emptyP.textContent = "No sessions match that filter.";
         } else {
           emptyP.textContent = "No sessions to show.";
         }
@@ -899,9 +942,10 @@
     }
 
     for (const s of items) {
+      const pinned = isPinned(s.sessionId);
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "session-row";
+      btn.className = "session-row" + (pinned ? " pinned" : "");
       btn.setAttribute("role", "listitem");
       if (s.sessionId === state.selectedId) btn.classList.add("active");
       if (s.sessionId === state.status.loadedSessionId) btn.classList.add("live");
@@ -911,18 +955,58 @@
       bar.setAttribute("aria-hidden", "true");
 
       const body = document.createElement("span");
-      const title = document.createElement("div");
+      body.className = "session-body";
+
+      const titleRow = document.createElement("span");
+      titleRow.className = "title-row";
+      const title = document.createElement("span");
       title.className = "title";
       title.textContent = s.title || "Untitled session";
-      const meta = document.createElement("div");
+      titleRow.appendChild(title);
+      if (s.isSubagent) {
+        const pill = document.createElement("span");
+        pill.className = "session-pill subagent";
+        pill.textContent = "subagent";
+        titleRow.appendChild(pill);
+      }
+
+      const meta = document.createElement("span");
       meta.className = "meta";
       const proj = document.createElement("span");
       proj.textContent = basename(s.cwd) || "project";
+      meta.appendChild(proj);
+      if (s.isSubagent && s.agentName) {
+        const agent = document.createElement("span");
+        agent.textContent = s.agentName;
+        meta.appendChild(agent);
+      }
       const time = document.createElement("span");
       time.textContent = relativeTime(s.updatedAt);
-      meta.append(proj, time);
-      body.append(title, meta);
-      btn.append(bar, body);
+      meta.appendChild(time);
+
+      body.append(titleRow, meta);
+
+      const pin = document.createElement("span");
+      pin.className = "session-pin";
+      pin.setAttribute("role", "button");
+      pin.tabIndex = 0;
+      pin.setAttribute("aria-label", pinned ? "Unpin session" : "Pin session");
+      pin.title = pinned ? "Unpin from top" : "Pin to top";
+      pin.textContent = pinned ? "★" : "☆";
+      pin.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        togglePin(s.sessionId);
+      });
+      pin.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          togglePin(s.sessionId);
+        }
+      });
+
+      btn.append(bar, body, pin);
       btn.addEventListener("click", () => openSession(s));
       els.sessionList.appendChild(btn);
     }
@@ -3129,6 +3213,24 @@
       renderSessions();
     });
 
+    const kindFilter = document.querySelector(".session-kind-filter");
+    if (kindFilter) {
+      kindFilter.addEventListener("click", (e) => {
+        const chip = e.target.closest(".kind-chip");
+        if (!chip || !kindFilter.contains(chip)) return;
+        const kind = chip.getAttribute("data-kind");
+        if (kind !== "all" && kind !== "standard" && kind !== "subagent") return;
+        state.sessionKindFilter = kind;
+        try {
+          sessionStorage.setItem("grh.sessionKindFilter", kind);
+        } catch (_) {}
+        $$(".kind-chip", kindFilter).forEach((c) => {
+          c.classList.toggle("active", c.getAttribute("data-kind") === kind);
+        });
+        renderSessions();
+      });
+    }
+
     if (els.tabSessions) {
       els.tabSessions.addEventListener("click", () => setRailTab("sessions"));
     }
@@ -3837,6 +3939,23 @@
         if (els.rail) els.rail.setAttribute("aria-hidden", "true");
       }
     } catch (_) {}
+    try {
+      state.pinnedSessions = loadPins();
+    } catch (_) {
+      state.pinnedSessions = [];
+    }
+    try {
+      const kind = sessionStorage.getItem("grh.sessionKindFilter");
+      if (kind === "all" || kind === "standard" || kind === "subagent") {
+        state.sessionKindFilter = kind;
+      }
+    } catch (_) {}
+    const kindFilter = document.querySelector(".session-kind-filter");
+    if (kindFilter) {
+      $$(".kind-chip", kindFilter).forEach((c) => {
+        c.classList.toggle("active", c.getAttribute("data-kind") === state.sessionKindFilter);
+      });
+    }
     updateMenuButton();
     syncBrowseSessionsVisibility();
     window.addEventListener("resize", () => {

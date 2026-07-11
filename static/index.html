@@ -33,6 +33,11 @@
         <div class="search-wrap">
           <input type="search" id="session-search" class="input" placeholder="Search sessions" autocomplete="off" />
         </div>
+        <div class="session-kind-filter" role="group" aria-label="Session type">
+          <button type="button" class="kind-chip active" data-kind="all">All</button>
+          <button type="button" class="kind-chip" data-kind="standard">Standard</button>
+          <button type="button" class="kind-chip" data-kind="subagent">Subagent</button>
+        </div>
         <div id="session-list" class="session-list" role="list"></div>
         <div id="session-empty" class="empty-rail hidden">
           <p>No sessions yet. Tap New to start one in a project folder.</p>

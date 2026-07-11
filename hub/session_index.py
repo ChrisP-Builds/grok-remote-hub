@@ -23,6 +23,9 @@ class SessionInfo:
     updatedAt: str
     modelId: str
     path: str
+    isSubagent: bool = False
+    parentSessionId: str = ""
+    agentName: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -127,6 +130,16 @@ def scan_sessions(sessions_root: Path, limit: int = 80) -> list[SessionInfo]:
             )
             updated_dt = _parse_updated(str(updated_raw) if updated_raw else None)
 
+            parts = session_dir.parts
+            is_sub = False
+            parent_id = ""
+            if "subagents" in parts:
+                idx = parts.index("subagents")
+                is_sub = True
+                if idx > 0:
+                    parent_id = parts[idx - 1]  # parent session uuid folder
+            agent_name = str(summary.get("agent_name") or "").strip()
+
             found.append(
                 (
                     updated_dt,
@@ -137,6 +150,9 @@ def scan_sessions(sessions_root: Path, limit: int = 80) -> list[SessionInfo]:
                         updatedAt=updated_dt.isoformat().replace("+00:00", "Z"),
                         modelId=str(summary.get("current_model_id") or ""),
                         path=str(session_dir),
+                        isSubagent=is_sub,
+                        parentSessionId=parent_id,
+                        agentName=agent_name,
                     ),
                 )
             )
