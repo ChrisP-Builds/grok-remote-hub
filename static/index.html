@@ -135,6 +135,10 @@
         </div>
         <textarea id="file-editor" class="file-editor" spellcheck="false" disabled></textarea>
         <div id="file-preview" class="file-preview markdown-body hidden" tabindex="0" aria-label="Markdown preview"></div>
+        <div id="file-image-wrap" class="file-image-wrap hidden">
+          <img id="file-image" class="file-image" alt="Image preview" />
+          <p class="file-image-hint muted">Tap image to enlarge</p>
+        </div>
         <p id="file-status" class="file-status muted"></p>
       </div>
     </main>
@@ -159,6 +163,11 @@
   </div>
 
   <div id="toast-host" class="toast-host" aria-live="assertive"></div>
+
+  <div id="image-lightbox" class="image-lightbox hidden" role="dialog" aria-modal="true" aria-label="Image viewer">
+    <button type="button" id="btn-lightbox-close" class="btn btn-ghost btn-icon image-lightbox-close" aria-label="Close">×</button>
+    <img id="lightbox-img" class="image-lightbox-img" alt="" />
+  </div>
 
   <script src="/vendor/marked.min.js"></script>
   <script src="/vendor/purify.min.js"></script>

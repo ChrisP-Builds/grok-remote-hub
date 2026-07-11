@@ -165,6 +165,8 @@
     fileDirty: $("#file-dirty"),
     fileEditor: $("#file-editor"),
     filePreview: $("#file-preview"),
+    fileImageWrap: $("#file-image-wrap"),
+    fileImage: $("#file-image"),
     fileMdModes: $("#file-md-modes"),
     fileStatus: $("#file-status"),
     btnFileBack: $("#btn-file-back"),
@@ -172,6 +174,9 @@
     btnFilePreview: $("#btn-file-preview"),
     btnFileInsert: $("#btn-file-insert"),
     btnFileSave: $("#btn-file-save"),
+    imageLightbox: $("#image-lightbox"),
+    lightboxImg: $("#lightbox-img"),
+    btnLightboxClose: $("#btn-lightbox-close"),
     transcript: $("#transcript"),
     btnJumpLatest: $("#btn-jump-latest"),
     emptyMain: $("#empty-main"),
@@ -1758,6 +1763,34 @@
     return lower.endsWith(".md") || lower.endsWith(".markdown");
   }
 
+  function isImagePath(path) {
+    return /\.(png|jpe?g|gif|webp|bmp|svg|ico)$/i.test(String(path || ""));
+  }
+
+  function rawFsUrl(root, rel) {
+    const q =
+      `/api/fs/raw?root=${encodeURIComponent(root)}` +
+      `&path=${encodeURIComponent(rel)}`;
+    return apiUrl(q);
+  }
+
+  function hideImagePreview() {
+    if (els.fileImage) els.fileImage.src = "";
+    if (els.fileImageWrap) els.fileImageWrap.classList.add("hidden");
+    closeLightbox();
+  }
+
+  function openLightbox(src) {
+    if (!els.imageLightbox || !els.lightboxImg || !src) return;
+    els.lightboxImg.src = src;
+    els.imageLightbox.classList.remove("hidden");
+  }
+
+  function closeLightbox() {
+    if (els.lightboxImg) els.lightboxImg.src = "";
+    if (els.imageLightbox) els.imageLightbox.classList.add("hidden");
+  }
+
   function ensureMermaidReady() {
     if (state.mermaidReady) return true;
     if (typeof window.mermaid === "undefined") return false;
@@ -1854,11 +1887,13 @@
   }
 
   function setFileViewMode(mode) {
+    if (isImagePath(state.fs.openPath)) return;
     const next = mode === "preview" ? "preview" : "edit";
     state.fileViewMode = next;
     const showPreview = next === "preview";
     if (els.fileEditor) els.fileEditor.classList.toggle("hidden", showPreview);
     if (els.filePreview) els.filePreview.classList.toggle("hidden", !showPreview);
+    if (els.fileImageWrap) els.fileImageWrap.classList.add("hidden");
     if (els.btnFileEdit) els.btnFileEdit.setAttribute("aria-selected", showPreview ? "false" : "true");
     if (els.btnFilePreview) els.btnFilePreview.setAttribute("aria-selected", showPreview ? "true" : "false");
     if (showPreview) {
@@ -1870,15 +1905,22 @@
   }
 
   function updateMdModeUi(path) {
-    const isMd = isMarkdownPath(path);
+    const isMd = isMarkdownPath(path) && !isImagePath(path);
     if (els.fileMdModes) els.fileMdModes.classList.toggle("hidden", !isMd);
     if (!isMd) {
-      setFileViewMode("edit");
+      state.fileViewMode = "edit";
+      if (!isImagePath(path)) {
+        if (els.fileEditor) els.fileEditor.classList.remove("hidden");
+        if (els.filePreview) els.filePreview.classList.add("hidden");
+        if (els.btnFileEdit) els.btnFileEdit.setAttribute("aria-selected", "true");
+        if (els.btnFilePreview) els.btnFilePreview.setAttribute("aria-selected", "false");
+      }
     }
   }
 
   function clearFilePreview() {
     if (els.filePreview) els.filePreview.innerHTML = "";
+    hideImagePreview();
   }
 
   function resetFs(opts) {
@@ -1904,7 +1946,9 @@
       }
       clearFilePreview();
       if (els.filePreview) els.filePreview.classList.add("hidden");
+      if (els.fileImageWrap) els.fileImageWrap.classList.add("hidden");
       if (els.fileMdModes) els.fileMdModes.classList.add("hidden");
+      if (els.btnFileSave) els.btnFileSave.classList.remove("hidden");
       updateFileDirtyUi();
       if (state.mainMode === "file") {
         setMainMode("chat");
@@ -1915,9 +1959,12 @@
 
   function updateFileDirtyUi() {
     const dirty = !!state.fs.dirty;
-    if (els.fileDirty) els.fileDirty.classList.toggle("hidden", !dirty);
+    const isImage = isImagePath(state.fs.openPath);
+    if (els.fileDirty) els.fileDirty.classList.toggle("hidden", !dirty || isImage);
     if (els.btnFileSave) {
-      els.btnFileSave.disabled = !dirty || state.fs.saving || !state.fs.openPath;
+      els.btnFileSave.classList.toggle("hidden", isImage);
+      els.btnFileSave.disabled =
+        isImage || !dirty || state.fs.saving || !state.fs.openPath;
     }
   }
 
@@ -1946,7 +1993,9 @@
     }
     clearFilePreview();
     if (els.filePreview) els.filePreview.classList.add("hidden");
+    if (els.fileImageWrap) els.fileImageWrap.classList.add("hidden");
     if (els.fileMdModes) els.fileMdModes.classList.add("hidden");
+    if (els.btnFileSave) els.btnFileSave.classList.remove("hidden");
     if (els.filePathLabel) els.filePathLabel.textContent = "";
     if (els.fileStatus) els.fileStatus.textContent = "";
     updateFileDirtyUi();
@@ -2162,6 +2211,38 @@
       toast("No project root for this session", "danger");
       return;
     }
+
+    if (isImagePath(rel)) {
+      state.fs.root = root;
+      state.fs.openPath = rel;
+      state.fs.content = "";
+      state.fs.baseline = "";
+      state.fs.dirty = false;
+      state.fs.error = null;
+      state.fileViewMode = "edit";
+      if (els.fileEditor) {
+        els.fileEditor.value = "";
+        els.fileEditor.disabled = true;
+        els.fileEditor.classList.add("hidden");
+      }
+      if (els.filePreview) {
+        els.filePreview.innerHTML = "";
+        els.filePreview.classList.add("hidden");
+      }
+      if (els.fileMdModes) els.fileMdModes.classList.add("hidden");
+      if (els.filePathLabel) els.filePathLabel.textContent = rel;
+      const src = rawFsUrl(root, rel) + "&t=" + Date.now();
+      if (els.fileImage) els.fileImage.src = src;
+      if (els.fileImageWrap) els.fileImageWrap.classList.remove("hidden");
+      if (els.fileStatus) els.fileStatus.textContent = "Image preview";
+      updateFileDirtyUi();
+      setMainMode("file");
+      renderFileTree();
+      closeRail();
+      return;
+    }
+
+    hideImagePreview();
     state.fs.loading = true;
     if (els.fileStatus) els.fileStatus.textContent = "Loading…";
     try {
@@ -2190,6 +2271,7 @@
       if (els.fileEditor) {
         els.fileEditor.disabled = false;
         els.fileEditor.value = content;
+        els.fileEditor.classList.remove("hidden");
       }
       if (els.filePathLabel) els.filePathLabel.textContent = rel;
       if (els.fileStatus) {
@@ -2607,6 +2689,31 @@
     if (els.fileEditor) {
       els.fileEditor.addEventListener("input", onFileEditorInput);
     }
+    if (els.fileImage) {
+      els.fileImage.addEventListener("click", () => {
+        const src = els.fileImage.getAttribute("src") || "";
+        if (src) openLightbox(src);
+      });
+    }
+    if (els.btnLightboxClose) {
+      els.btnLightboxClose.addEventListener("click", (e) => {
+        e.stopPropagation();
+        closeLightbox();
+      });
+    }
+    if (els.imageLightbox) {
+      els.imageLightbox.addEventListener("click", (e) => {
+        if (e.target === els.imageLightbox) closeLightbox();
+      });
+    }
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        if (els.imageLightbox && !els.imageLightbox.classList.contains("hidden")) {
+          e.preventDefault();
+          closeLightbox();
+        }
+      }
+    });
 
     els.btnMenu.addEventListener("click", openRail);
     els.backdrop.addEventListener("click", closeRail);
