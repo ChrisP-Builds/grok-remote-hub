@@ -1667,9 +1667,12 @@
     const vvHeight =
       (window.visualViewport && window.visualViewport.height) || window.innerHeight || 600;
     const maxPx = Math.max(120, Math.floor(vvHeight * 0.4));
-    ta.style.height = "auto";
+    // Collapse first so scrollHeight is content-sized (fixes inflated height on WebKit)
+    ta.style.height = "0px";
     const scrollH = ta.scrollHeight;
-    const h = Math.min(scrollH, maxPx);
+    // Single-line min: ~ line-height + padding
+    const minPx = Math.ceil(parseFloat(getComputedStyle(ta).lineHeight) || 20) + 10;
+    const h = Math.max(minPx, Math.min(scrollH, maxPx));
     ta.style.height = h + "px";
     ta.style.overflowY = scrollH > maxPx ? "auto" : "hidden";
   }

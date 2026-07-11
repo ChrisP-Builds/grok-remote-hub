@@ -1421,7 +1421,7 @@ a {
 .composer {
   display: flex;
   gap: 8px;
-  align-items: flex-end;
+  align-items: flex-start;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -1435,8 +1435,9 @@ a {
   color: var(--accent);
   font-weight: 500;
   font-size: 16px;
-  line-height: 1.45;
-  padding: 5px 0;
+  line-height: 1.5;
+  padding-top: 6px;
+  padding-bottom: 0;
   flex-shrink: 0;
   user-select: none;
 }
@@ -1447,22 +1448,28 @@ a {
 }
 
 .composer-input {
-  flex: 1;
+  flex: 1 1 auto;
+  align-self: stretch;
   min-width: 0;
   width: 100%;
   resize: none;
   border: none;
   outline: none;
   background: transparent;
-  min-height: 1.5em;
+  min-height: 0;
+  height: auto;
   line-height: 1.5;
-  padding: 6px 0;
+  padding: 6px 0 4px;
+  margin: 0;
+  vertical-align: top;
+  field-sizing: content;
   overflow-x: hidden;
   overflow-y: hidden;
   overflow-wrap: anywhere;
   word-break: break-word;
   font-family: var(--font);
   font-size: 13px;
+  display: block;
 }
 
 .composer-actions {
@@ -1470,6 +1477,8 @@ a {
   gap: 6px;
   align-items: center;
   flex-shrink: 0;
+  align-self: flex-end;
+  padding-bottom: 2px;
 }
 
 .composer-hint {
@@ -1956,8 +1965,10 @@ a {
   }
 
   .composer-input {
+    flex: 0 0 auto;
     min-width: 0;
     width: 100%;
+    min-height: 0;
   }
 
   .composer-actions {
