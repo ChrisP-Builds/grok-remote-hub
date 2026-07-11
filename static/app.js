@@ -1666,15 +1666,23 @@
     if (!ta) return;
     const vvHeight =
       (window.visualViewport && window.visualViewport.height) || window.innerHeight || 600;
-    const maxPx = Math.max(120, Math.floor(vvHeight * 0.4));
-    // Collapse first so scrollHeight is content-sized (fixes inflated height on WebKit)
+    const maxPx = Math.max(96, Math.floor(vvHeight * 0.35));
+    const cs = getComputedStyle(ta);
+    const lineH = parseFloat(cs.lineHeight);
+    const linePx = Number.isFinite(lineH) && lineH > 0 ? lineH : 16 * 1.35;
+    const padY =
+      (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+    const minPx = Math.ceil(linePx + padY);
+
+    // Measure content height without leaving a tall empty box
     ta.style.height = "0px";
+    ta.style.overflowY = "hidden";
     const scrollH = ta.scrollHeight;
-    // Single-line min: ~ line-height + padding
-    const minPx = Math.ceil(parseFloat(getComputedStyle(ta).lineHeight) || 20) + 10;
-    const h = Math.max(minPx, Math.min(scrollH, maxPx));
+    const h = Math.max(minPx, Math.min(scrollH || minPx, maxPx));
     ta.style.height = h + "px";
     ta.style.overflowY = scrollH > maxPx ? "auto" : "hidden";
+    // Keep scroll at top so caret/text stay top-aligned when growing
+    ta.scrollTop = 0;
   }
 
   function setRailTab(tab) {
@@ -2594,6 +2602,13 @@
     });
 
     els.input.addEventListener("input", onComposerInput);
+    els.input.addEventListener("focus", () => {
+      autoGrow();
+      // prevent iOS scroll-jump centering the field mid-screen too aggressively
+      setTimeout(() => {
+        if (state.stickToBottom) scrollIfSticky();
+      }, 50);
+    });
     els.input.addEventListener("keydown", (e) => {
       if (state.slashOpen) {
         if (e.key === "ArrowDown") {
