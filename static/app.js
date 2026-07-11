@@ -133,6 +133,7 @@
     selectedMeta: null,
     commands: [],
     turnRunning: false,
+    promptQueueLength: 0,
     stickToBottom: true,
     _ignoreScroll: false,
     historyLoadedFor: null,
@@ -566,6 +567,8 @@
     if (running) {
       els.turnStrip.dataset.state = quietVisual ? "stalled" : "running";
       const parts = ["running"];
+      const q = state.promptQueueLength || 0;
+      if (q > 0) parts.push("queue " + q);
       if (tool) parts.push(tool);
       if (model) parts.push(model);
       els.turnStripText.textContent = parts.join(" · ");
@@ -580,15 +583,18 @@
   }
 
   function setComposerEnabled(on) {
-    const canSend = on && !state.turnRunning && state.selectedId;
-    els.input.disabled = !on || !state.selectedId || state.turnRunning;
-    els.btnSend.disabled = !canSend;
+    // Keep input enabled during turn so user can queue the next message
+    els.input.disabled = !on || !state.selectedId;
+    els.btnSend.disabled = !on || !state.selectedId;
     els.btnStop.classList.toggle("hidden", !state.turnRunning || !state.selectedId);
     if (!state.selectedId) {
       els.composerHint.textContent =
         "Remote agent stream. Load a session to chat; desktop TUI stays separate.";
     } else if (state.turnRunning) {
-      els.composerHint.textContent = "Turn running…";
+      const q = state.promptQueueLength || 0;
+      els.composerHint.textContent = q
+        ? `Turn running · ${q} queued. Send adds to queue.`
+        : "Turn running · Send queues your next message.";
     } else if (state.sessionMode === "history") {
       els.composerHint.textContent =
         "History view. Opening attaches a live remote session (not the desktop TUI).";
@@ -1439,6 +1445,7 @@
     const viewId = session.sessionId;
     state.selectedId = viewId;
     state.selectedMeta = session;
+    state.promptQueueLength = 0;
     // Keep prior agent commands until a new list arrives; builtins cover empty.
     state.streamBuffers = emptyStreamBuffers();
     state.attachSwitched = false;
@@ -1636,6 +1643,9 @@
       if (msg.cliVersion != null) state.cliVersion = msg.cliVersion;
       if (msg.compatOk != null) state.compatOk = !!msg.compatOk;
       if (Array.isArray(msg.compatIssues)) state.compatIssues = msg.compatIssues;
+      if (msg.promptQueueLength != null) {
+        state.promptQueueLength = Number(msg.promptQueueLength) || 0;
+      }
       if (Array.isArray(msg.hubSessionIds)) {
         state.hubSessionIds = msg.hubSessionIds;
         // Promote selected session to live-remote if server says hub-created
@@ -1666,6 +1676,19 @@
       updateStatusPill();
       renderSessions();
       setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+      return;
+    }
+    if (type === "queued") {
+      state.promptQueueLength = msg.queueLength || msg.position || 0;
+      toast(`Queued (#${msg.position || state.promptQueueLength})`, "");
+      setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+      updateTurnStrip();
+      return;
+    }
+    if (type === "queue") {
+      state.promptQueueLength = msg.queueLength || 0;
+      setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
+      updateTurnStrip();
       return;
     }
     if (type === "sessions") {
@@ -1737,18 +1760,21 @@
       return;
     }
     if (type === "error") {
-      setTurnRunning(false);
+      const errText = msg.message || "Error";
+      const queueFull = /queue full/i.test(errText);
+      // Queue-full is non-fatal while a turn still runs; do not unlock the turn.
+      if (!queueFull) {
+        setTurnRunning(false);
+      }
       setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
       updateStatusPill();
-      const errText = msg.message || "Error";
       const busy = /busy|stuck/i.test(errText);
-      toast(busy ? "Agent busy or stuck; try again" : errText, "danger");
-      // Never leave Send disabled after error
+      toast(busy && !queueFull ? "Agent busy or stuck; try again" : errText, "danger");
+      // Keep Send available when connected (queue path allows send while running)
       els.btnSend.disabled = !(
         state.wsState === "open" &&
         state.status.agent === "up" &&
-        state.selectedId &&
-        !state.turnRunning
+        state.selectedId
       );
       return;
     }
@@ -2441,7 +2467,7 @@
 
   function submitPrompt() {
     const text = els.input.value.trim();
-    if (!text || !state.selectedId || state.turnRunning) return;
+    if (!text || !state.selectedId) return;
     if (state.wsState !== "open" || state.status.agent !== "up") {
       toast("Not connected to agent", "danger");
       return;
@@ -2450,7 +2476,11 @@
     if (isHubCreatedSession(state.selectedId)) {
       setSessionMode("live-remote");
     }
-    beginNewUserTurn();
+    const alreadyRunning = !!state.turnRunning;
+    // Do not reset stream buffers when only queuing behind an active turn
+    if (!alreadyRunning) {
+      beginNewUserTurn();
+    }
     sendWs({
       type: "prompt",
       sessionId: state.selectedId,
@@ -2460,7 +2490,12 @@
     els.input.value = "";
     autoGrow();
     closeSlash();
-    setTurnRunning(true);
+    if (!alreadyRunning) {
+      setTurnRunning(true);
+    } else {
+      // Optimistic until server "queued" / status arrives
+      state.promptQueueLength = (state.promptQueueLength || 0) + 1;
+    }
     setComposerEnabled(true);
     updateStatusPill();
   }
