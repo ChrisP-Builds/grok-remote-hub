@@ -20,7 +20,10 @@
           <span class="brand-mark" aria-hidden="true"></span>
           <span class="brand-text">Grok Hub</span>
         </div>
-        <button type="button" id="btn-new" class="btn btn-accent btn-sm">New</button>
+        <div class="rail-header-actions">
+          <button type="button" id="btn-rail-collapse" class="btn btn-ghost btn-sm btn-icon" aria-label="Collapse sidebar" title="Collapse sidebar">‹</button>
+          <button type="button" id="btn-new" class="btn btn-accent btn-sm">New</button>
+        </div>
       </div>
       <div class="rail-tabs" role="tablist" aria-label="Sidebar">
         <button type="button" role="tab" id="tab-sessions" class="rail-tab" aria-selected="true" aria-controls="panel-sessions">Sessions</button>
@@ -54,7 +57,7 @@
 
     <main class="main">
       <header class="topbar">
-        <button type="button" id="btn-menu" class="btn btn-ghost btn-icon" aria-label="Open sessions">☰</button>
+        <button type="button" id="btn-menu" class="btn btn-ghost btn-icon" aria-label="Open sidebar" title="Browse sessions">☰</button>
         <div class="topbar-meta">
           <h1 id="chat-title" class="chat-title">Select a session</h1>
           <div class="chat-sub">

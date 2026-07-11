@@ -288,9 +288,11 @@
     composerHint: $("#composer-hint"),
     slash: $("#slash-palette"),
     btnMenu: $("#btn-menu"),
+    btnRailCollapse: $("#btn-rail-collapse"),
     btnNew: $("#btn-new"),
     btnEmptySessions: $("#btn-empty-sessions"),
     btnEmptyNew: $("#btn-empty-new"),
+    app: $("#app"),
     modalNew: $("#modal-new"),
     projectList: $("#project-list"),
     projectSearch: $("#project-search"),
@@ -803,14 +805,60 @@
     updateTurnStrip();
   }
 
+  function isRailVisible() {
+    if (isMobile()) return els.rail.classList.contains("open");
+    return !(els.app || document.getElementById("app")).classList.contains("rail-collapsed");
+  }
+
+  function updateMenuButton() {
+    if (!els.btnMenu) return;
+    if (isMobile()) {
+      els.btnMenu.classList.remove("force-show");
+    } else {
+      els.btnMenu.classList.toggle("force-show", !isRailVisible());
+    }
+  }
+
+  function syncBrowseSessionsVisibility() {
+    $$("#btn-empty-sessions").forEach((btn) => {
+      btn.classList.toggle("hidden", isRailVisible());
+    });
+  }
+
+  function setRailCollapsed(collapsed) {
+    const app = els.app || document.getElementById("app");
+    if (!app) return;
+    app.classList.toggle("rail-collapsed", !!collapsed);
+    if (els.rail) {
+      els.rail.setAttribute("aria-hidden", collapsed ? "true" : "false");
+    }
+    try {
+      localStorage.setItem("grh.railCollapsed", collapsed ? "1" : "0");
+    } catch (_) {}
+  }
+
   function openRail() {
-    els.rail.classList.add("open");
-    els.backdrop.hidden = false;
+    if (isMobile()) {
+      els.rail.classList.add("open");
+      els.backdrop.hidden = false;
+      if (els.rail) els.rail.setAttribute("aria-hidden", "false");
+    } else {
+      setRailCollapsed(false);
+    }
+    syncBrowseSessionsVisibility();
+    updateMenuButton();
   }
 
   function closeRail() {
-    els.rail.classList.remove("open");
-    els.backdrop.hidden = true;
+    if (isMobile()) {
+      els.rail.classList.remove("open");
+      els.backdrop.hidden = true;
+      if (els.rail) els.rail.setAttribute("aria-hidden", "true");
+    } else {
+      setRailCollapsed(true);
+    }
+    syncBrowseSessionsVisibility();
+    updateMenuButton();
   }
 
   function renderSessions() {
@@ -908,6 +956,7 @@
         $("#btn-empty-new", wrap).addEventListener("click", openNewModal);
       }
       setSessionMode("none");
+      syncBrowseSessionsVisibility();
     } else {
       const em = $("#empty-main", els.transcript);
       if (em) em.remove();
@@ -1569,7 +1618,7 @@
     });
     renderSessions();
     syncFsForSession();
-    closeRail();
+    if (isMobile()) closeRail();
     setComposerEnabled(composerConnected());
     forceComposerUnlocked();
     updateTurnStrip();
@@ -2439,7 +2488,7 @@
       updateFileDirtyUi();
       setMainMode("file");
       renderFileTree();
-      closeRail();
+      if (isMobile()) closeRail();
       return;
     }
 
@@ -2488,7 +2537,7 @@
       }
       setMainMode("file");
       renderFileTree();
-      closeRail();
+      if (isMobile()) closeRail();
       if (state.fileViewMode === "edit" && els.fileEditor) {
         els.fileEditor.focus();
       }
@@ -3120,6 +3169,9 @@
 
     els.btnMenu.addEventListener("click", openRail);
     els.backdrop.addEventListener("click", closeRail);
+    if (els.btnRailCollapse) {
+      els.btnRailCollapse.addEventListener("click", closeRail);
+    }
     els.btnNew.addEventListener("click", openNewModal);
     if (els.btnEmptyNew) els.btnEmptyNew.addEventListener("click", openNewModal);
     if (els.btnEmptySessions) els.btnEmptySessions.addEventListener("click", openRail);
@@ -3432,6 +3484,20 @@
     hideUsageBar();
     startHistoryPoll();
     startUsagePoll();
+
+    try {
+      if (localStorage.getItem("grh.railCollapsed") === "1" && !isMobile()) {
+        const app = els.app || document.getElementById("app");
+        if (app) app.classList.add("rail-collapsed");
+        if (els.rail) els.rail.setAttribute("aria-hidden", "true");
+      }
+    } catch (_) {}
+    updateMenuButton();
+    syncBrowseSessionsVisibility();
+    window.addEventListener("resize", () => {
+      updateMenuButton();
+      syncBrowseSessionsVisibility();
+    });
 
     let savedTab = "sessions";
     try {
