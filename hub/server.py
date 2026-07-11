@@ -23,6 +23,7 @@ from hub.fs_browser import (
 )
 from hub.history import load_session_history
 from hub.projects import ProjectError, create_project
+from hub.prompt_queue import PromptQueue
 from hub.session_index import find_session, list_projects, scan_sessions
 from hub.session_signals import read_session_signals, read_signals_file, find_signals_path
 from hub.session_policy import (
@@ -145,6 +146,9 @@ class Hub:
         self.remote_agent_session: dict[str, str] = {}
         self.remote_sessions_path = REMOTE_SESSIONS_FILE
         self._load_remote_sessions_map()
+        # FIFO prompts while a turn is running (data only; no ws refs).
+        self._prompt_queue = PromptQueue(max_size=10)
+        self._prompt_queue_lock = asyncio.Lock()
         self._app: web.Application | None = None
         self._status_resync_task: asyncio.Task | None = None
         self._last_broadcast_force_clear: str | None = None
@@ -209,6 +213,7 @@ class Hub:
             "loadedSessionId": self.acp.loaded_session_id,
             "turnRunning": self.acp.turn_running,
             "turnSessionId": self.acp.turn_session_id,
+            "promptQueueLength": len(self._prompt_queue),
             "hubVersion": HUB_VERSION,
             "cliVersion": self.cli_version or compat.get("cliVersion"),
             "compatOk": bool(compat.get("ok")),
@@ -1147,36 +1152,92 @@ class Hub:
                 )
             await self.broadcast(self.status_payload())
 
+        cwd_raw = str(payload.get("cwd") or "")
+        # While a turn is active, queue instead of rejecting (TUI-like).
         if self.acp.turn_running:
-            busy_msg = "Agent is busy. Wait for the current turn to finish."
-            await ws.send_str(json.dumps({"type": "error", "message": busy_msg}))
-            # Unlock client UI even though another turn is still active
-            await ws.send_str(
-                json.dumps(
-                    {
-                        "type": "turn",
-                        "sessionId": view_session_id,
-                        "state": "idle",
-                        "error": busy_msg,
-                    }
-                )
-            )
+            await self._enqueue_prompt(ws, view_session_id, text, cwd_raw)
             return
 
-        session = find_session(self.config.sessions_root, view_session_id)
-        cwd = (payload.get("cwd") or (session.cwd if session else "") or "").strip()
-        if not cwd and self.acp.loaded_session_id != view_session_id:
-            await ws.send_str(json.dumps({"type": "error", "message": "cwd unknown for session"}))
-            await ws.send_str(
-                json.dumps(
-                    {
-                        "type": "turn",
-                        "sessionId": view_session_id,
-                        "state": "idle",
-                        "error": "cwd unknown for session",
-                    }
-                )
+        await self._execute_prompt(
+            view_session_id, text, cwd_raw, ws=ws, echo_user=True
+        )
+        await self._drain_prompt_queue()
+
+    async def _enqueue_prompt(
+        self,
+        ws: web.WebSocketResponse,
+        view_session_id: str,
+        text: str,
+        cwd_raw: str,
+    ) -> None:
+        """Queue a prompt while a turn is running. Echoes user text immediately."""
+        async with self._prompt_queue_lock:
+            position = self._prompt_queue.try_enqueue(
+                {
+                    "view_session_id": view_session_id,
+                    "text": text,
+                    "cwd": cwd_raw,
+                }
             )
+            if position is None:
+                await ws.send_str(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": "Queue full (max 10). Wait for turns to finish.",
+                        }
+                    )
+                )
+                return
+            queue_length = len(self._prompt_queue)
+
+        await self.broadcast(
+            {
+                "type": "queued",
+                "sessionId": view_session_id,
+                "text": text,
+                "position": position,
+                "queueLength": queue_length,
+            }
+        )
+        # Echo so transcript shows the queued user message immediately
+        await self.broadcast(
+            {
+                "type": "acp",
+                "sessionId": view_session_id,
+                "message": {
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": view_session_id,
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "content": {"type": "text", "text": text},
+                        },
+                    },
+                },
+            },
+            session_id=view_session_id,
+        )
+        await self.broadcast(self.status_payload())
+
+    async def _execute_prompt(
+        self,
+        view_session_id: str,
+        text: str,
+        cwd_raw: str,
+        *,
+        ws: web.WebSocketResponse | None = None,
+        echo_user: bool = True,
+    ) -> None:
+        """Run one prompt turn. Does not enqueue; caller drains the queue after."""
+        session = find_session(self.config.sessions_root, view_session_id)
+        cwd = (cwd_raw or (session.cwd if session else "") or "").strip()
+        if not cwd and self.acp.loaded_session_id != view_session_id:
+            err = "cwd unknown for session"
+            if ws is not None and not ws.closed:
+                await ws.send_str(json.dumps({"type": "error", "message": err}))
+            await self._broadcast_turn(view_session_id, "idle", err)
+            await self.broadcast(self.status_payload())
             return
 
         session_id = view_session_id
@@ -1187,13 +1248,16 @@ class Hub:
             )
         except Exception as exc:
             log.exception("ensure hub agent session failed view=%s", view_session_id)
-            await ws.send_str(json.dumps({"type": "error", "message": str(exc)}))
+            if ws is not None and not ws.closed:
+                await ws.send_str(json.dumps({"type": "error", "message": str(exc)}))
             await self._broadcast_turn(
                 view_session_id, "idle", str(exc), also_session_id=session_id
             )
+            await self.broadcast(self.status_payload())
             return
 
-        self.subscriptions.setdefault(ws, set()).add(session_id)
+        if ws is not None:
+            self.subscriptions.setdefault(ws, set()).add(session_id)
         log.info(
             "WS prompt start session=%s view=%s hub_created=%s",
             session_id,
@@ -1205,23 +1269,25 @@ class Hub:
             session_id, "running", None, also_session_id=view_session_id
         )
         # Echo user message as acp-shaped update so all clients see it immediately
-        await self.broadcast(
-            {
-                "type": "acp",
-                "sessionId": session_id,
-                "message": {
-                    "method": "session/update",
-                    "params": {
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "user_message_chunk",
-                            "content": {"type": "text", "text": text},
+        # (skip when item was already echoed at enqueue time)
+        if echo_user:
+            await self.broadcast(
+                {
+                    "type": "acp",
+                    "sessionId": session_id,
+                    "message": {
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "user_message_chunk",
+                                "content": {"type": "text", "text": text},
+                            },
                         },
                     },
                 },
-            },
-            session_id=session_id,
-        )
+                session_id=session_id,
+            )
 
         # Hub-created sessions are already loaded via session/new; never load foreign ids.
         allow_load = session_id in self.acp_created_sessions
@@ -1262,7 +1328,8 @@ class Hub:
                         "message": NO_OUTPUT_USER_MSG,
                     }
                     await self.broadcast(switch)
-                    self.subscriptions.setdefault(ws, set()).add(fresh)
+                    if ws is not None:
+                        self.subscriptions.setdefault(ws, set()).add(fresh)
                     items = scan_sessions(
                         self.config.sessions_root, limit=self.config.max_sessions
                     )
@@ -1299,10 +1366,43 @@ class Hub:
                 )
         await self.broadcast(self.status_payload())
 
+    async def _drain_prompt_queue(self) -> None:
+        """Run queued prompts FIFO until empty or a turn is still running."""
+        while True:
+            async with self._prompt_queue_lock:
+                if self.acp.turn_running or not self._prompt_queue:
+                    return
+                item = self._prompt_queue.pop()
+                if item is None:
+                    return
+                remaining = len(self._prompt_queue)
+            await self.broadcast(
+                {
+                    "type": "queue",
+                    "queueLength": remaining,
+                    "sessionId": item.get("view_session_id") or "",
+                }
+            )
+            try:
+                await self._execute_prompt(
+                    str(item.get("view_session_id") or ""),
+                    str(item.get("text") or ""),
+                    str(item.get("cwd") or ""),
+                    ws=None,
+                    echo_user=False,
+                )
+            except Exception:
+                log.exception("queued prompt failed")
+                # continue draining remaining items
+
     async def _ws_cancel(self, ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
         session_id = str(payload.get("sessionId") or "")
         if not session_id:
             return
+        # Stop cancels active turn and drops any waiting queued prompts.
+        async with self._prompt_queue_lock:
+            self._prompt_queue.clear()
+        await self.broadcast({"type": "queue", "queueLength": 0, "sessionId": session_id})
         try:
             await self.acp.session_cancel(session_id)
             await self.broadcast(
@@ -1318,6 +1418,7 @@ class Hub:
                     }
                 )
             )
+        await self.broadcast(self.status_payload())
 
 
 def create_app(config: Config | None = None) -> web.Application:
