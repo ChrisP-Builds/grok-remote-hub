@@ -1,0 +1,13 @@
+{
+  "name": "grok-remote-hub",
+  "private": true,
+  "description": "Dev tooling for Grok Remote Hub (Playwright smoke only; runtime is Python)",
+  "scripts": {
+    "test:e2e": "playwright test -c playwright.config.mjs --workers=1",
+    "test:e2e:install": "playwright install chromium",
+    "test:e2e:note": "If this hangs on Windows/Node 24, use: python -m pytest tests/test_e2e_smoke.py -v"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.49.0"
+  }
+}

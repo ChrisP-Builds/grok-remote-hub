@@ -40,7 +40,8 @@ def test_html_turn_strip_and_empty_state() -> None:
     assert 'id="turn-strip"' in html
     assert "turn-strip-text" in html
     assert "turn-strip-cursor" in html
-    assert "Open a session to attach the stream" in html
+    assert "No session selected" in html
+    assert "Pick a chat from the sidebar" in html
     assert "Message… (/ for commands)" in html or "Message" in html
     assert "IBM+Plex+Mono" in html or "IBM Plex Mono" in html
     assert "composer-prompt" in html
@@ -66,6 +67,12 @@ def test_js_term_line_structure() -> None:
     assert "tool-detail" in js
     assert "planHasActiveWork" in js
     assert 'createElement("details")' in js
+    # Tools default closed; never auto-open on create/update
+    assert "row.open = false" in js
+    assert "toolOneLinerRedundant" in js
+    # Live tool_call must not build label+summary as title
+    assert 'truncate(`${label} ${summary}`, 160)' not in js
+    assert "truncate(`${label} ${summary}`, 160)" not in js
 
 
 def test_css_tool_plan_expand() -> None:
@@ -75,6 +82,13 @@ def test_css_tool_plan_expand() -> None:
     assert ".tool-detail" in css
     assert '.plan-item[data-status="running"]' in css
     assert ".plan-item.active" in css
+    # Closed tools/thoughts/plans hide non-summary children (WebKit/iOS)
+    assert ".term-line.tool:not([open]) > :not(summary)" in css
+    assert "display: none !important" in css
+    # Compact single-line tool summary row
+    assert "flex-wrap: nowrap" in css
+    assert ".term-line.tool .tool-name" in css
+    assert "text-overflow: ellipsis" in css
 
 
 def test_format_term_prefix() -> None:
