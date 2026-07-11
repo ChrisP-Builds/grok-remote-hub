@@ -1462,7 +1462,7 @@ a {
   padding: 6px 0 4px;
   margin: 0;
   vertical-align: top;
-  field-sizing: content;
+  text-align: left;
   overflow-x: hidden;
   overflow-y: hidden;
   overflow-wrap: anywhere;
@@ -1793,9 +1793,52 @@ a {
 
   input,
   textarea,
+  select,
   .input,
   .composer-input {
-    font-size: 16px;
+    font-size: 16px !important;
+  }
+
+  .composer-prompt {
+    display: none !important;
+  }
+
+  .composer {
+    flex-direction: row;
+    align-items: flex-start;
+    width: 100%;
+    padding: 8px 10px;
+    gap: 8px;
+  }
+
+  .composer-input {
+    flex: 1 1 auto;
+    width: auto;
+    min-width: 0;
+    min-height: 24px;
+    /* CRITICAL for iOS no-zoom */
+    font-size: 16px !important;
+    line-height: 1.35 !important;
+    text-align: left !important;
+    text-align-last: left;
+    padding: 8px 0 !important;
+    margin: 0 !important;
+    /* top-left caret / text */
+    vertical-align: top;
+    display: block;
+    box-sizing: border-box;
+    -webkit-appearance: none;
+    appearance: none;
+    /* avoid iOS weird internal centering */
+    writing-mode: horizontal-tb;
+  }
+
+  .composer-actions {
+    align-self: flex-end;
+    flex-shrink: 0;
+    width: auto;
+    justify-content: flex-end;
+    padding-bottom: 6px;
   }
 
   #app,
@@ -1931,10 +1974,6 @@ a {
     padding: 8px 10px calc(8px + var(--safe-b));
   }
 
-  .composer {
-    width: 100%;
-  }
-
   .slash-palette {
     left: 10px;
     right: 10px;
@@ -1951,11 +1990,26 @@ a {
   }
 }
 
-/* Narrow phones: stack composer */
+/* Coarse pointer (iPhone etc.): force 16px + hide decorative prompt */
+@media (hover: none) and (pointer: coarse) {
+  input,
+  textarea,
+  select,
+  .input,
+  .composer-input {
+    font-size: 16px !important;
+  }
+
+  .composer-prompt {
+    display: none !important;
+  }
+}
+
+/* Narrow phones: keep row layout (do not stack composer) */
 @media (max-width: 480px) {
   .composer {
-    flex-direction: column;
-    align-items: stretch;
+    flex-direction: row;
+    align-items: flex-start;
     padding: 8px 10px;
     gap: 8px;
   }
@@ -1965,15 +2019,18 @@ a {
   }
 
   .composer-input {
-    flex: 0 0 auto;
+    flex: 1 1 auto;
     min-width: 0;
-    width: 100%;
-    min-height: 0;
+    width: auto;
+    min-height: 24px;
+    font-size: 16px !important;
   }
 
   .composer-actions {
     justify-content: flex-end;
-    width: 100%;
+    width: auto;
+    flex-shrink: 0;
+    align-self: flex-end;
   }
 
   .empty-card {
