@@ -3402,6 +3402,18 @@
     return "ok";
   }
 
+  function setUsageBarTitles(title) {
+    if (els.usageBar) {
+      els.usageBar.title = title;
+      if (title) els.usageBar.setAttribute("aria-label", title.replace(/\n/g, " "));
+      else els.usageBar.setAttribute("aria-label", "Context usage");
+    }
+    if (els.usageBarFill) els.usageBarFill.title = title;
+    if (els.usageBarLabel) els.usageBarLabel.title = title;
+    const track = els.usageBar && els.usageBar.querySelector(".usage-bar-track");
+    if (track) track.title = title;
+  }
+
   function hideUsageBar() {
     state.usage = null;
     if (els.usageBar) els.usageBar.classList.add("hidden");
@@ -3415,7 +3427,7 @@
       els.usageBarMonthly.textContent = "M";
       els.usageBarMonthly.title = "Monthly usage";
     }
-    if (els.usageBar) els.usageBar.title = "";
+    setUsageBarTitles("");
   }
 
   function updateUsageBar(data) {
@@ -3426,7 +3438,7 @@
       els.usageBarFill.style.width = "0%";
       els.usageBarFill.dataset.level = "ok";
       els.usageBarLabel.textContent = "—";
-      els.usageBar.title = "Context usage unavailable";
+      setUsageBarTitles("Context usage unavailable");
       if (els.usageBarMonthly) els.usageBarMonthly.classList.add("hidden");
       return;
     }
@@ -3435,15 +3447,24 @@
     els.usageBar.classList.remove("hidden");
     els.usageBarFill.style.width = `${pct}%`;
     els.usageBarFill.dataset.level = usageLevel(pct);
+    // Compact visible label; full used/total lives on hover
     els.usageBarLabel.textContent = `${rounded}%`;
 
     const used = data.contextTokensUsed;
     const windowTok = data.contextWindowTokens;
-    let title = `Context ${rounded}%`;
+    let title;
     if (used != null && windowTok != null) {
-      title += ` (${used.toLocaleString()} / ${windowTok.toLocaleString()} tokens)`;
+      const usedN = Number(used).toLocaleString();
+      const winN = Number(windowTok).toLocaleString();
+      title =
+        `Context window: ${usedN} / ${winN} tokens (${rounded}%)\n` +
+        `This is session context fill, not monthly Grok subscription usage.`;
+    } else {
+      title =
+        `Context window: ${rounded}%\n` +
+        `This is session context fill, not monthly Grok subscription usage.`;
     }
-    els.usageBar.title = title;
+    setUsageBarTitles(title);
 
     if (els.usageBarMonthly) {
       const monthly = data.monthlyPercent;
