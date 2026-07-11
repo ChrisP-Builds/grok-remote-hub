@@ -1166,6 +1166,27 @@
       if (!text) return;
       const last = els.transcript.lastElementChild;
       if (last && last.classList.contains("user") && last.classList.contains("term-line")) {
+        const body = last.querySelector(".term-body");
+        if (!body) return;
+        const existing = body._rawText != null ? String(body._rawText) : String(body.textContent || "");
+        // Exact duplicate (hub echo + ACP full message)
+        if (existing === text) {
+          scrollIfSticky();
+          return;
+        }
+        // Already have this text as prefix (ACP re-sends shorter/same)
+        if (existing.startsWith(text)) {
+          scrollIfSticky();
+          return;
+        }
+        // Replacement with longer full message that extends existing stream
+        if (text.startsWith(existing)) {
+          setTermBodyContent(body, text);
+          body._rawText = text;
+          scrollIfSticky();
+          return;
+        }
+        // True streaming chunk
         appendToBody(last, text);
       } else {
         beginNewUserTurn();
