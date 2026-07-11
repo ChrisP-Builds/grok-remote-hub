@@ -44,13 +44,9 @@ foreach ($r in $rules) {
 }
 
 Write-Host ""
-Write-Host "Done. From your phone (Tailscale on), open:"
-Write-Host "  http://100.110.172.25:8787"
-Write-Host "Or MagicDNS:"
-Write-Host "  http://r10.taile6a47f.ts.net:8787"
+Write-Host "Done. From your phone (Tailscale on), open the URL printed by start-hub.ps1,"
+Write-Host "  e.g. http://<your-tailscale-ip>:8787"
 Write-Host ""
-Write-Host "Optional HTTPS (better Safari): enable Tailscale Serve at"
-Write-Host "  https://login.tailscale.com/f/serve?node=naxhXah3J521CNTRL"
-Write-Host "Then on this PC run:"
+Write-Host "Optional HTTPS (better Safari): enable Tailscale Serve, then:"
 Write-Host '  & "C:\Program Files\Tailscale\tailscale.exe" serve --bg http://127.0.0.1:8787'
-Write-Host "Phone URL becomes: https://r10.taile6a47f.ts.net"
+Write-Host "Use your MagicDNS https:// URL from the Tailscale admin console."

@@ -145,7 +145,7 @@ foreach ($h in $candidates) {
 if ($tsIp) {
     Write-Host ""
     Write-Host "Phone (Tailscale Connected): http://${tsIp}:${port}"
-    Write-Host "MagicDNS: http://r10.taile6a47f.ts.net:${port}"
+    # MagicDNS name is machine-specific; print IP only (run: tailscale status)
 }
 Write-Host ""
 exit 0
