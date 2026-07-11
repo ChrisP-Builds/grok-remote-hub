@@ -717,6 +717,34 @@ a {
   margin-bottom: 0;
 }
 
+.markdown-body .mermaid-wrap {
+  margin: 12px 0;
+  padding: 12px;
+  overflow-x: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.markdown-body .mermaid-wrap svg {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+.markdown-body .mermaid-error {
+  color: var(--danger);
+  font-size: 12px;
+  margin: 0 0 8px;
+  font-family: var(--font-ui);
+}
+
+.markdown-body .mermaid-wrap > pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .file-status {
   margin: 0;
   padding: 6px 12px 10px;

@@ -129,6 +129,7 @@
     railTab: "sessions", // sessions | files
     mainMode: "chat", // chat | file
     fileViewMode: "edit", // edit | preview (meaningful for markdown only)
+    mermaidReady: false,
     fs: {
       root: "",
       filter: "",
@@ -1654,7 +1655,78 @@
     return lower.endsWith(".md") || lower.endsWith(".markdown");
   }
 
-  function renderMarkdownPreview() {
+  function ensureMermaidReady() {
+    if (state.mermaidReady) return true;
+    if (typeof window.mermaid === "undefined") return false;
+    try {
+      window.mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: "strict",
+        theme: "dark",
+        darkMode: true,
+        fontFamily: "IBM Plex Sans, system-ui, sans-serif",
+      });
+      state.mermaidReady = true;
+      return true;
+    } catch (err) {
+      console.warn("mermaid.initialize failed", err);
+      return false;
+    }
+  }
+
+  async function renderMermaidBlocks(root) {
+    if (!root || !ensureMermaidReady()) return;
+    const blocks = Array.from(root.querySelectorAll("pre > code.language-mermaid, pre.language-mermaid > code, code.language-mermaid"));
+    const seen = new Set();
+    const targets = [];
+    for (const code of blocks) {
+      const pre = code.closest("pre") || code.parentElement;
+      if (!pre || seen.has(pre)) continue;
+      seen.add(pre);
+      const src = code.textContent || "";
+      const wrap = document.createElement("div");
+      wrap.className = "mermaid-wrap";
+      const diagram = document.createElement("div");
+      diagram.className = "mermaid";
+      diagram.textContent = src;
+      wrap.appendChild(diagram);
+      pre.replaceWith(wrap);
+      targets.push({ wrap, diagram, src });
+    }
+    if (!targets.length) return;
+
+    const nodes = targets.map((t) => t.diagram);
+    try {
+      await window.mermaid.run({ nodes });
+    } catch (err) {
+      // mermaid.run may reject on first failure; render remaining via per-node fallback
+      console.warn("mermaid.run failed", err);
+    }
+
+    for (let i = 0; i < targets.length; i++) {
+      const { wrap, diagram, src } = targets[i];
+      if (wrap.querySelector("svg")) continue;
+      try {
+        const id = "mmd-" + Date.now() + "-" + i;
+        const { svg } = await window.mermaid.render(id, src);
+        wrap.innerHTML = "";
+        const holder = document.createElement("div");
+        holder.innerHTML = svg;
+        while (holder.firstChild) wrap.appendChild(holder.firstChild);
+      } catch (err) {
+        wrap.innerHTML = "";
+        const errEl = document.createElement("div");
+        errEl.className = "mermaid-error";
+        errEl.textContent = "Mermaid error: " + (err && err.message ? err.message : String(err));
+        const pre = document.createElement("pre");
+        pre.textContent = src;
+        wrap.appendChild(errEl);
+        wrap.appendChild(pre);
+      }
+    }
+  }
+
+  async function renderMarkdownPreview() {
     if (!els.filePreview) return;
     let source = els.fileEditor ? els.fileEditor.value : "";
     if (!source && state.fs.content) source = state.fs.content;
@@ -1672,6 +1744,7 @@
           ? window.marked.parse(source || "")
           : window.marked(source || "");
       els.filePreview.innerHTML = window.DOMPurify.sanitize(rawHtml);
+      await renderMermaidBlocks(els.filePreview);
     } catch (err) {
       els.filePreview.textContent = "Preview failed: " + err + "\n\n" + (source || "");
     }
@@ -1686,7 +1759,7 @@
     if (els.btnFileEdit) els.btnFileEdit.setAttribute("aria-selected", showPreview ? "false" : "true");
     if (els.btnFilePreview) els.btnFilePreview.setAttribute("aria-selected", showPreview ? "true" : "false");
     if (showPreview) {
-      renderMarkdownPreview();
+      void renderMarkdownPreview();
       if (els.filePreview) els.filePreview.focus();
     } else if (els.fileEditor && !els.fileEditor.disabled) {
       els.fileEditor.focus();
