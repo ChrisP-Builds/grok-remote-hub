@@ -26,6 +26,17 @@
     return true;
   }
 
+  const BUILTIN_SLASH = [
+    { name: "new", description: "Start a new session" },
+    { name: "compact", description: "Compact conversation history" },
+    { name: "skills", description: "List or inject a skill" },
+    { name: "help", description: "Show help / available commands" },
+  ];
+
+  function slashCommandSource() {
+    return state.commands && state.commands.length ? state.commands : BUILTIN_SLASH;
+  }
+
   function parseSimpleMarkdownTable(text) {
     if (!text || !String(text).includes("|")) return null;
     const lines = String(text).split(/\r?\n/);
@@ -110,6 +121,8 @@
     historyLoadedFor: null,
     historyFingerprint: null,
     historyPollTimer: null,
+    usagePollTimer: null,
+    usage: null,
     streamBuffers: {
       assistantEl: null,
       thoughtEl: null,
@@ -211,6 +224,10 @@
     compatDot: $("#compat-dot"),
     sessionBanner: $("#session-banner"),
     sessionBannerText: $("#session-banner-text"),
+    usageBar: $("#usage-bar"),
+    usageBarFill: $("#usage-bar-fill"),
+    usageBarLabel: $("#usage-bar-label"),
+    usageBarMonthly: $("#usage-bar-monthly"),
   };
 
   function tokenFromQuery() {
@@ -560,7 +577,7 @@
         "History view. Opening attaches a live remote session (not the desktop TUI).";
     } else if (!state.commands.length) {
       els.composerHint.textContent =
-        "Live remote stream. Slash commands appear when the agent sends them.";
+        "Live remote stream. Type / for built-in commands (agent list loads when available).";
     } else {
       els.composerHint.textContent = `${state.commands.length} slash commands available. Type / to open palette.`;
     }
@@ -634,7 +651,7 @@
     }
     state.selectedId = toId;
     state.selectedMeta = meta;
-    state.commands = [];
+    // Keep prior commands until agent sends a fresh list; builtins fill gaps.
     state.streamBuffers = emptyStreamBuffers();
     state.historyLoadedFor = null;
     state.historyFingerprint = null;
@@ -647,6 +664,7 @@
     });
 
     setTopbarSessionMeta(meta);
+    refreshUsage();
     renderSessions();
 
     // Fresh stream view for the hub-owned session (system line may arrive via type:system)
@@ -1377,7 +1395,7 @@
     }
 
     if (kind === "available_commands_update") {
-      const cmds = update.availableCommands || [];
+      const cmds = update.availableCommands || update.available_commands || [];
       state.commands = Array.isArray(cmds) ? cmds : [];
       setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
       return;
@@ -1401,7 +1419,7 @@
     const viewId = session.sessionId;
     state.selectedId = viewId;
     state.selectedMeta = session;
-    state.commands = [];
+    // Keep prior agent commands until a new list arrives; builtins cover empty.
     state.streamBuffers = emptyStreamBuffers();
     state.attachSwitched = false;
     // Disk open = history until attach promotes to live-remote
@@ -1421,6 +1439,7 @@
     closeRail();
     setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
     updateTurnStrip();
+    refreshUsage();
 
     // History for the viewed session first (catch-up / TUI context)
     try {
@@ -1516,6 +1535,7 @@
 
     setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
     updateTurnStrip();
+    refreshUsage();
     els.input.focus();
   }
 
@@ -1686,6 +1706,9 @@
         setTurnRunning(msg.state === "running");
         if (msg.error && msg.state === "idle") {
           toast(msg.error, "danger");
+        }
+        if (msg.state === "idle") {
+          refreshUsage();
         }
         setComposerEnabled(state.wsState === "open" && state.status.agent === "up");
         updateStatusPill();
@@ -2424,7 +2447,8 @@
   // Slash palette
   function openSlash(filter) {
     const q = (filter || "").toLowerCase();
-    const items = (state.commands || []).filter((c) => {
+    const source = slashCommandSource();
+    const items = source.filter((c) => {
       const name = (c.name || "").toLowerCase();
       const desc = (c.description || "").toLowerCase();
       return !q || name.includes(q) || desc.includes(q);
@@ -2432,13 +2456,10 @@
     state.slashItems = items.slice(0, 40);
     state.slashIndex = 0;
     if (!state.slashItems.length) {
-      if (!state.commands.length) {
-        els.slash.innerHTML = `<div class="slash-item"><span class="desc">Load a session for / commands</span></div>`;
-        els.slash.classList.remove("hidden");
-        state.slashOpen = true;
-        return;
-      }
-      closeSlash();
+      // Always show palette when typing /; builtins keep it non-empty.
+      els.slash.innerHTML = `<div class="slash-item"><span class="desc">No matching commands</span></div>`;
+      els.slash.classList.remove("hidden");
+      state.slashOpen = true;
       return;
     }
     renderSlash();
@@ -2755,6 +2776,13 @@
     els.input.addEventListener("input", onComposerInput);
     els.input.addEventListener("focus", () => {
       autoGrow();
+      const val = els.input.value || "";
+      if (val.startsWith("/")) {
+        const firstLine = val.split("\n")[0];
+        if (!firstLine.includes(" ") || firstLine === "/") {
+          openSlash(firstLine.slice(1));
+        }
+      }
       // prevent iOS scroll-jump centering the field mid-screen too aggressively
       setTimeout(() => {
         if (state.stickToBottom) scrollIfSticky();
@@ -2840,6 +2868,105 @@
     }, 4000);
   }
 
+  function usageLevel(pct) {
+    if (pct == null || !Number.isFinite(pct)) return "ok";
+    if (pct >= 50) return "danger";
+    if (pct >= 35) return "warn";
+    return "ok";
+  }
+
+  function hideUsageBar() {
+    state.usage = null;
+    if (els.usageBar) els.usageBar.classList.add("hidden");
+    if (els.usageBarFill) {
+      els.usageBarFill.style.width = "0%";
+      els.usageBarFill.dataset.level = "ok";
+    }
+    if (els.usageBarLabel) els.usageBarLabel.textContent = "—";
+    if (els.usageBarMonthly) {
+      els.usageBarMonthly.classList.add("hidden");
+      els.usageBarMonthly.textContent = "M";
+      els.usageBarMonthly.title = "Monthly usage";
+    }
+    if (els.usageBar) els.usageBar.title = "";
+  }
+
+  function updateUsageBar(data) {
+    if (!els.usageBar || !els.usageBarFill || !els.usageBarLabel) return;
+    if (!data || data.contextPercent == null || !Number.isFinite(Number(data.contextPercent))) {
+      // Still show bar when session selected but no data yet
+      els.usageBar.classList.remove("hidden");
+      els.usageBarFill.style.width = "0%";
+      els.usageBarFill.dataset.level = "ok";
+      els.usageBarLabel.textContent = "—";
+      els.usageBar.title = "Context usage unavailable";
+      if (els.usageBarMonthly) els.usageBarMonthly.classList.add("hidden");
+      return;
+    }
+    const pct = Math.max(0, Math.min(100, Number(data.contextPercent)));
+    const rounded = Math.round(pct);
+    els.usageBar.classList.remove("hidden");
+    els.usageBarFill.style.width = `${pct}%`;
+    els.usageBarFill.dataset.level = usageLevel(pct);
+    els.usageBarLabel.textContent = `${rounded}%`;
+
+    const used = data.contextTokensUsed;
+    const windowTok = data.contextWindowTokens;
+    let title = `Context ${rounded}%`;
+    if (used != null && windowTok != null) {
+      title += ` (${used.toLocaleString()} / ${windowTok.toLocaleString()} tokens)`;
+    }
+    els.usageBar.title = title;
+
+    if (els.usageBarMonthly) {
+      const monthly = data.monthlyPercent;
+      if (monthly != null && Number.isFinite(Number(monthly))) {
+        const m = Math.round(Number(monthly));
+        els.usageBarMonthly.classList.remove("hidden");
+        els.usageBarMonthly.textContent = `M ${m}%`;
+        els.usageBarMonthly.title = `Monthly usage: ${m}%`;
+      } else if (data.isMonthly) {
+        els.usageBarMonthly.classList.remove("hidden");
+        els.usageBarMonthly.textContent = "M";
+        els.usageBarMonthly.title = "Monthly usage";
+      } else {
+        els.usageBarMonthly.classList.add("hidden");
+        els.usageBarMonthly.textContent = "M";
+        els.usageBarMonthly.title = "Monthly usage";
+      }
+    }
+  }
+
+  async function refreshUsage() {
+    if (!state.selectedId) {
+      hideUsageBar();
+      return;
+    }
+    const id = state.selectedId;
+    try {
+      const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(id)}/usage`));
+      if (!res.ok) {
+        if (id === state.selectedId) updateUsageBar(null);
+        return;
+      }
+      const data = await res.json();
+      if (id !== state.selectedId) return;
+      state.usage = data;
+      updateUsageBar(data);
+    } catch (_) {
+      if (id === state.selectedId) updateUsageBar(null);
+    }
+  }
+
+  function startUsagePoll() {
+    if (state.usagePollTimer) return;
+    state.usagePollTimer = setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      if (!state.selectedId) return;
+      refreshUsage();
+    }, 6000);
+  }
+
   async function bootstrap() {
     bindEvents();
     setupViewport();
@@ -2848,7 +2975,9 @@
     updateSessionBanner();
     setComposerEnabled(false);
     updateTurnStrip();
+    hideUsageBar();
     startHistoryPoll();
+    startUsagePoll();
 
     let savedTab = "sessions";
     try {

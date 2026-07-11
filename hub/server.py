@@ -24,6 +24,7 @@ from hub.fs_browser import (
 from hub.history import load_session_history
 from hub.projects import ProjectError, create_project
 from hub.session_index import find_session, list_projects, scan_sessions
+from hub.session_signals import read_session_signals, read_signals_file, find_signals_path
 from hub.session_policy import (
     STUCK_TURN_SECONDS,
     cwd_key,
@@ -258,7 +259,11 @@ class Hub:
             update = (msg.get("params") or {}).get("update") or {}
             kind = update.get("sessionUpdate") or ""
             if kind == "available_commands_update" and session_id:
-                cmds = update.get("availableCommands") or []
+                cmds = (
+                    update.get("availableCommands")
+                    or update.get("available_commands")
+                    or []
+                )
                 await self.broadcast(
                     {"type": "commands", "sessionId": session_id, "commands": cmds},
                     session_id=session_id,
@@ -462,6 +467,7 @@ class Hub:
         app.router.add_post("/api/compat/refresh", self.handle_compat_refresh)
         app.router.add_get("/api/sessions", self.handle_sessions)
         app.router.add_get("/api/sessions/{id}/history", self.handle_history)
+        app.router.add_get("/api/sessions/{id}/usage", self.handle_session_usage)
         app.router.add_post("/api/sessions", self.handle_new_session)
         app.router.add_post("/api/sessions/{id}/load", self.handle_load_session)
         app.router.add_post("/api/sessions/{id}/attach", self.handle_attach_session)
@@ -646,6 +652,37 @@ class Hub:
             max_messages=self.config.max_history_messages,
         )
         return web.json_response({"sessionId": session_id, "messages": messages})
+
+    async def handle_session_usage(self, request: web.Request) -> web.Response:
+        session_id = request.match_info["id"]
+        normalized = read_session_signals(self.config.sessions_root, session_id)
+        path = find_signals_path(self.config.sessions_root, session_id)
+        raw = read_signals_file(path) if path else None
+        raw_subset: dict[str, Any] = {}
+        if isinstance(raw, dict):
+            for key in (
+                "contextWindowUsage",
+                "contextTokensUsed",
+                "contextWindowTokens",
+                "monthlyUsagePercent",
+                "monthly_usage_percent",
+                "usageMonthlyPercent",
+                "isMonthly",
+                "usagePeriod",
+                "usage_period",
+            ):
+                if key in raw:
+                    raw_subset[key] = raw[key]
+            usage = raw.get("usage")
+            if isinstance(usage, dict):
+                raw_subset["usage"] = usage
+        return web.json_response(
+            {
+                "sessionId": session_id,
+                **normalized,
+                "raw": raw_subset,
+            }
+        )
 
     async def handle_projects(self, request: web.Request) -> web.Response:
         sessions = scan_sessions(self.config.sessions_root, limit=self.config.max_sessions)
@@ -876,6 +913,16 @@ class Hub:
         except Exception as exc:
             log.exception("attach failed view=%s", view_session_id)
             return web.json_response({"error": str(exc)}, status=500)
+
+        if self.acp.available_commands:
+            await self.broadcast(
+                {
+                    "type": "commands",
+                    "sessionId": live_id,
+                    "commands": self.acp.available_commands,
+                },
+                session_id=live_id,
+            )
 
         message = REMOTE_SESSION_SYSTEM_NOTE if switched else REMOTE_SESSION_SAME_NOTE
         return web.json_response(
