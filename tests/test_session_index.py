@@ -117,6 +117,53 @@ def test_scan_sessions_respects_limit(tmp_path: Path) -> None:
     assert len(results) == 3
 
 
+def test_scan_sessions_detects_subagents(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    parent_id = "019f493c-af12-7652-a6d8-bf645c10921c"
+    child_id = "019f06ee-305f-7903-b295-d706c08f0b4f"
+    cwd_key = "D%3A%5CProjects%5CAlpha"
+
+    parent = root / cwd_key / parent_id
+    _write_summary(
+        parent / "summary.json",
+        {
+            "info": {"id": parent_id, "cwd": r"D:\Projects\Alpha"},
+            "generated_title": "Parent session",
+            "updated_at": "2026-07-09T12:00:00Z",
+            "num_chat_messages": 2,
+            "current_model_id": "grok-4.5",
+        },
+    )
+
+    child = parent / "subagents" / child_id
+    _write_summary(
+        child / "summary.json",
+        {
+            "info": {"id": child_id, "cwd": r"D:\Projects\Alpha"},
+            "generated_title": "Child agent work",
+            "agent_name": "general-purpose",
+            "updated_at": "2026-07-09T13:00:00Z",
+            "num_chat_messages": 1,
+            "current_model_id": "grok-build",
+        },
+    )
+
+    results = scan_sessions(root, limit=80)
+    by_id = {r.sessionId: r for r in results}
+    assert parent_id in by_id
+    assert child_id in by_id
+
+    parent_info = by_id[parent_id]
+    assert parent_info.isSubagent is False
+    assert parent_info.parentSessionId == ""
+    assert parent_info.agentName == ""
+
+    child_info = by_id[child_id]
+    assert child_info.isSubagent is True
+    assert child_info.parentSessionId == parent_id
+    assert child_info.agentName == "general-purpose"
+
+
 def test_list_projects_merges_dirs_and_cwds(tmp_path: Path) -> None:
     projects = tmp_path / "Projects"
     (projects / "AppOne").mkdir(parents=True)

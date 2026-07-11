@@ -270,9 +270,42 @@ a {
   overscroll-behavior: contain;
 }
 
+.session-kind-filter {
+  display: flex;
+  gap: 4px;
+  padding: 0 10px 8px;
+  flex-shrink: 0;
+}
+
+.kind-chip {
+  flex: 1;
+  padding: 4px 6px;
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--muted);
+  border-radius: 3px;
+  border: 1px solid transparent;
+  background: transparent;
+  transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
+  cursor: pointer;
+}
+
+.kind-chip:hover,
+.kind-chip:focus-visible {
+  color: var(--text);
+  background: var(--surface-2);
+  outline: none;
+}
+
+.kind-chip.active {
+  color: var(--text);
+  border-color: var(--border);
+  background: var(--surface-2);
+}
+
 .session-row {
   display: grid;
-  grid-template-columns: 3px minmax(0, 1fr);
+  grid-template-columns: 3px minmax(0, 1fr) auto;
   gap: 8px;
   align-items: start;
   width: 100%;
@@ -284,6 +317,7 @@ a {
   border: 1px solid transparent;
   margin-bottom: 2px;
   transition: background 160ms ease, border-color 160ms ease;
+  position: relative;
 }
 
 .session-row:hover,
@@ -319,6 +353,24 @@ a {
   animation: pulse-bar 1.6s ease-in-out infinite;
 }
 
+.session-row .session-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.session-row .title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.session-row .title-row .title {
+  flex: 1;
+  min-width: 0;
+}
+
 .session-row .title {
   font-weight: 500;
   font-size: 12.5px;
@@ -326,6 +378,26 @@ a {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.session-pill {
+  display: inline-flex;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  text-transform: lowercase;
+  line-height: 1.4;
+  flex-shrink: 0;
+}
+
+.session-pill.subagent {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  background: rgba(230, 184, 77, 0.08);
 }
 
 .session-row .meta {
@@ -339,6 +411,43 @@ a {
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
+}
+
+.session-pin {
+  flex-shrink: 0;
+  align-self: start;
+  margin-top: 1px;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  opacity: 0;
+  cursor: pointer;
+  border-radius: 3px;
+  transition: opacity 120ms ease, color 120ms ease, background 120ms ease;
+}
+
+.session-row:hover .session-pin,
+.session-row:focus-within .session-pin,
+.session-row.pinned .session-pin {
+  opacity: 1;
+}
+
+.session-pin:hover,
+.session-pin:focus-visible {
+  color: var(--accent);
+  background: var(--surface-2);
+  outline: none;
+}
+
+.session-row.pinned .session-pin {
+  color: var(--accent);
 }
 
 .empty-rail {
@@ -893,13 +1002,14 @@ a {
 }
 
 .usage-seg-context {
-  flex: 1 1 auto;
+  flex: 1 1 45%;
+  max-width: 55%;
 }
 
 .usage-seg-plan {
-  flex: 0 1 auto;
-  max-width: 42%;
-  min-width: 4.5rem;
+  flex: 1 1 50%;
+  max-width: none;
+  min-width: 7rem;
 }
 
 .usage-seg-plan.usage-seg-na {
@@ -934,9 +1044,15 @@ a {
   overflow: hidden;
 }
 
+.usage-seg-context .usage-bar-track {
+  height: 3px;
+}
+
 .usage-bar-track-sm {
-  min-width: 20px;
-  max-width: 72px;
+  min-width: 48px;
+  max-width: none;
+  flex: 1 1 auto;
+  height: 8px;
 }
 
 .usage-bar-fill {
@@ -969,6 +1085,11 @@ a {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   line-height: 1.2;
+}
+
+.usage-bar-plan {
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .usage-bar-reset {
@@ -2316,8 +2437,12 @@ a {
   }
 
   .usage-seg-plan {
-    max-width: 40%;
-    min-width: 3.8rem;
+    max-width: none;
+    min-width: 5.5rem;
+  }
+
+  .usage-seg-context {
+    max-width: 50%;
   }
 
   .usage-bar-reset {
