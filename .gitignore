@@ -10,3 +10,36 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+# Personal / local-only notes (not for public GitHub)
+SESSION_LOG.md
+docs/superpowers/
+# Local probes / dumps (never ship)
+_probe*
+_scan*
+_try*
+_debug*
+_dbg*
+_raw*
+_fs*
+_shell*
+_ask*
+_dump*
+_fetch*
+_find*
+_write*
+_u.txt
+out_*.txt
+probe_*.py
+probe_*.txt
+playwright_*.txt
+pw_*.txt
+$null
+.superpowers/
+mcps/
+playwright-report/
+test-results/
+.playwright/
+node_modules/
+package-lock.json
+npm_install_log.txt
+_release_scan.txt
