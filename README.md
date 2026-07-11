@@ -2,6 +2,13 @@
 
 Always-on Tailscale web UI for **Grok Build**: resume any local project session from phone or desktop, stream live replies on every connected browser, hydrate transcripts from disk.
 
+## Product scope
+
+- **Hub = remote control of the agent stream** over Tailscale (or localhost). It is a thin client for prompts, live session updates, and saved history.
+- **Not full TUI parity.** Desktop Grok CLI TUI is a separate process; the hub does not inject into that TUI. Hub-owned sessions stream independently.
+- Create a project folder under the configured root from New session (`POST /api/projects`), then start a remote session in that cwd.
+- After a CLI upgrade, check the **Hub · CLI** badge in the rail footer, or `GET /api/compat` / `POST /api/compat/refresh` for structural compatibility (versions, agent/ACP, sessions root, static UI). Smoke does not run a paid model prompt.
+
 ## Requirements
 
 - Windows PC with Grok Build (`grok` on PATH or `%USERPROFILE%\.grok\bin\grok.exe`)
@@ -36,10 +43,28 @@ Start at logon:
 ## Use from your phone
 
 1. Install Tailscale on the PC and phone; same account / tailnet.
-2. Start the hub on the PC (`start-hub.ps1` or the logon task).
-3. On the phone browser, open `http://<pc-tailscale-ip>:8787`.
-4. Optional: Add to Home Screen for an app-like shell.
-5. Pick a session, wait for history + load, then chat.
+2. Start the hub on the PC (`start-hub.ps1` or the logon task). Confirm it prints `Hub is up` and both URLs show `OK`.
+3. **Windows Firewall (required once):** open **elevated** PowerShell and run:
+   ```powershell
+   cd "D:\Projects\Grok Remote Hub"
+   .\fix-firewall.ps1
+   ```
+   Without this, Safari on the phone often cannot connect even though the PC can open the same URL.
+4. On the phone (Tailscale connected), open one of:
+   - `http://100.110.172.25:8787` (this PC's Tailscale IP)
+   - `http://r10.taile6a47f.ts.net:8787` (MagicDNS)
+5. Optional: Add to Home Screen for an app-like shell.
+6. Pick a session, wait for history + load, then chat.
+
+### If Safari still will not load
+
+| Check | What to do |
+|---|---|
+| Hub dead | On PC: `.\start-hub.ps1` then open `http://127.0.0.1:8787` in desktop browser |
+| Firewall | Run `.\fix-firewall.ps1` **as Administrator** |
+| Tailscale on phone | Status should show Connected; both devices same account |
+| Wrong URL | Must include `:8787` and `http://` (not https) unless Serve is enabled |
+| Optional HTTPS | Enable Serve in admin console, then `tailscale serve --bg http://127.0.0.1:8787` and use `https://r10.taile6a47f.ts.net` |
 
 Without Tailscale the hub binds `127.0.0.1` only and the UI shows **Local only**.
 
@@ -58,9 +83,49 @@ Copy `config.example.toml` to `config.toml` for local overrides.
 ## Architecture (short)
 
 - Hub process: static SPA + REST + UI WebSocket fan-out
-- Sole ACP client to `grok agent serve` on `127.0.0.1:2419`
+- Sole ACP client to `grok agent serve` on `127.0.0.1:2419` (full client surface: permissions, fs, terminal)
+- **Sole-writer sessions:** live prompts use hub-owned `session/new` only; never `session/load` of foreign/CLI ids for prompt
+- **Dual-hub topology:** phone + desktop browsers share this process over Tailscale; stock Grok TUI is not multi-client
 - Session list from `~/.grok/sessions/**/summary.json`
 - Transcript hydrate from `updates.jsonl` (ACP load does not replay chat)
+- Detached start via WMI (`start-hub.ps1`); see [docs/adr/](docs/adr/) (ADR 001–004)
+
+## Safari and desktop: what is live where
+
+| Path | Live together? | Notes |
+|---|---|---|
+| Safari hub ↔ desktop **browser** hub | Yes | Same hub process; WebSocket fan-out to every open UI |
+| Safari hub → **stock Grok CLI TUI** | No | Separate process; cannot inject into the TUI |
+| Safari hub → **desktop terminal follower** | Yes | Read-only tail of the same `updates.jsonl` the hub/agent write |
+
+### Desktop terminal follower
+
+While the hub (or any Grok agent) is writing a session, open a terminal on the PC and run:
+
+```powershell
+cd "D:\Projects\Grok Remote Hub"
+.\follow.ps1
+# or pin a session / project:
+.\follow.ps1 --session 019f493c-af12-7652-a6d8-bf645c10921c
+.\follow.ps1 --cwd "D:\Projects\Circana Connections"
+.\.venv\Scripts\python.exe -m hub.follow -v
+```
+
+Behavior:
+
+1. Resolves session (`--session`, else hub's `logs/last-remote-session.txt` after a Safari remote prompt, else most recent for `--cwd`, else most recent overall)
+2. Prints title / cwd / path and a compact recent transcript (`You:` / `Grok:`; `-v` adds tools/thoughts)
+3. Tails `updates.jsonl` from EOF and prints new turns live
+4. Ctrl+C exits cleanly (read-only on disk; does not touch the hub server)
+
+**Safari remote streaming:** prompts never inject into the stock desktop TUI session. The hub creates a **hub-owned** agent session (`session/new`) and may send `session_switch` so the UI follows that id. After a remote prompt, follow the new id:
+
+```powershell
+.\follow.ps1                          # defaults to last-remote-session.txt when present
+.\follow.ps1 --session <NEW_REMOTE_ID>
+```
+
+Use this when you chat from Safari on the hub UI and want the same stream in a desktop terminal without the stock Grok TUI.
 
 ## Dev
 
