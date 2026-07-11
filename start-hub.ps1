@@ -1,4 +1,6 @@
-# Start Grok Remote Hub (venv, deps, background process)
+# Start Grok Remote Hub (venv, deps, detached background process)
+# Uses WMI Win32_Process.Create so the hub survives after this script exits
+# (shell job objects kill Start-Process children).
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
@@ -20,45 +22,70 @@ if (-not (Test-Path $Python)) {
 
 New-Item -ItemType Directory -Force -Path $Logs | Out-Null
 
-if (Test-Path $PidFile) {
-    $oldPid = Get-Content $PidFile -ErrorAction SilentlyContinue
-    if ($oldPid -match '^\d+$') {
-        $proc = Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue
-        if ($proc) {
-            Write-Host "Hub already running (PID $oldPid)"
-            # Still report health URLs if reachable
-        } else {
-            Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
+function Get-HubProcesses {
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.CommandLine -and
+            $_.CommandLine -match '-m\s+hub' -and
+            ($_.CommandLine -like "*Grok Remote Hub*" -or $_.CommandLine -like "*$Root*")
+        }
+}
+
+function Test-HubHealth([string]$HostAddr, [int]$PortNum) {
+    $url = "http://${HostAddr}:${PortNum}/health"
+    try {
+        $r = Invoke-RestMethod -Uri $url -TimeoutSec 2 -ErrorAction Stop
+        return ($null -ne $r -and $r.ok -eq $true)
+    } catch {
+        return $false
+    }
+}
+
+# Already healthy?
+$port = 8787
+$cfg = Join-Path $Root "config.toml"
+if (Test-Path $cfg) {
+    $m = Select-String -Path $cfg -Pattern '^\s*bind_port\s*=\s*(\d+)' | Select-Object -First 1
+    if ($m) { $port = [int]$m.Matches[0].Groups[1].Value }
+}
+
+if (Test-HubHealth "127.0.0.1" $port) {
+    $live = @(Get-HubProcesses)
+    if ($live.Count -gt 0) {
+        $live[0].ProcessId | Set-Content -Path $PidFile -Encoding ascii
+        Write-Host "Hub already running (PID $($live[0].ProcessId))"
+    } else {
+        Write-Host "Hub already healthy on port $port"
+    }
+} else {
+    # Clear stale pid
+    if (Test-Path $PidFile) {
+        $oldPid = Get-Content $PidFile -ErrorAction SilentlyContinue
+        if ($oldPid -match '^\d+$') {
+            $proc = Get-Process -Id ([int]$oldPid) -ErrorAction SilentlyContinue
+            if (-not $proc) { Remove-Item $PidFile -Force -ErrorAction SilentlyContinue }
         }
     }
-}
 
-$day = (Get-Date).ToString("yyyyMMdd")
-$outLog = Join-Path $Logs "hub-stdout-$day.log"
-$errLog = Join-Path $Logs "hub-stderr-$day.log"
-$hubLog = Join-Path $Logs "hub-$day.log"
-
-$already = $false
-if (Test-Path $PidFile) {
-    $checkPid = Get-Content $PidFile -ErrorAction SilentlyContinue
-    if ($checkPid -match '^\d+$' -and (Get-Process -Id ([int]$checkPid) -ErrorAction SilentlyContinue)) {
-        $already = $true
+    # Kill stale hub procs that are not healthy
+    Get-HubProcesses | ForEach-Object {
+        Write-Host "Stopping stale hub PID $($_.ProcessId)"
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
-}
+    Start-Sleep -Milliseconds 400
 
-if (-not $already) {
-    # Hub FileHandler also writes logs/hub-YYYYMMDD.log.
-    # Redirected Start-Process keeps a stable PID for hub.pid.
-    $p = Start-Process -FilePath $Python `
-        -ArgumentList @("-m", "hub") `
-        -WorkingDirectory $Root `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $outLog `
-        -RedirectStandardError $errLog `
-        -PassThru
-
-    $p.Id | Set-Content -Path $PidFile -Encoding ascii
-    Write-Host "Started hub PID $($p.Id)"
+    $py = (Resolve-Path $Python).Path
+    $cmdLine = "`"$py`" -m hub"
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+        CommandLine      = $cmdLine
+        CurrentDirectory = $Root
+    }
+    if ($r.ReturnValue -ne 0 -or -not $r.ProcessId) {
+        Write-Host "ERROR: Failed to start hub (WMI ReturnValue=$($r.ReturnValue))"
+        exit 1
+    }
+    $r.ProcessId | Set-Content -Path $PidFile -Encoding ascii
+    Write-Host "Started hub PID $($r.ProcessId) (detached)"
 }
 
 # Resolve Tailscale URL
@@ -75,27 +102,13 @@ if (-not $tsIp) {
     } catch {}
 }
 
-$port = 8787
-$cfg = Join-Path $Root "config.toml"
-if (Test-Path $cfg) {
-    $m = Select-String -Path $cfg -Pattern '^\s*bind_port\s*=\s*(\d+)' | Select-Object -First 1
-    if ($m) { $port = [int]$m.Matches[0].Groups[1].Value }
-}
-
 $candidates = @("127.0.0.1")
 if ($tsIp -and $tsIp -ne "127.0.0.1") {
     $candidates += $tsIp
 }
 
-function Test-HubHealth([string]$HostAddr, [int]$PortNum) {
-    $url = "http://${HostAddr}:${PortNum}/health"
-    try {
-        $r = Invoke-RestMethod -Uri $url -TimeoutSec 2 -ErrorAction Stop
-        return ($null -ne $r -and $r.ok -eq $true)
-    } catch {
-        return $false
-    }
-}
+$day = (Get-Date).ToString("yyyyMMdd")
+$hubLog = Join-Path $Logs "hub-$day.log"
 
 Write-Host "Waiting for health (up to 30s)..."
 $deadline = (Get-Date).AddSeconds(30)
@@ -107,12 +120,7 @@ while ((Get-Date) -lt $deadline) {
             $okHosts += $h
         }
     }
-    # Success when localhost is up; Tailscale optional but preferred when present
     if ($okHosts -contains "127.0.0.1") {
-        break
-    }
-    # Or at least one host if only TS was bound (legacy)
-    if ($okHosts.Count -gt 0 -and -not ($candidates -contains "127.0.0.1")) {
         break
     }
     Start-Sleep -Milliseconds 500
@@ -120,10 +128,7 @@ while ((Get-Date) -lt $deadline) {
 
 if ($okHosts.Count -eq 0) {
     Write-Host "ERROR: Hub did not become healthy within 30s."
-    Write-Host "  Logs:"
-    Write-Host "    $errLog"
-    Write-Host "    $outLog"
-    Write-Host "    $hubLog"
+    Write-Host "  Log: $hubLog"
     exit 1
 }
 
@@ -137,8 +142,10 @@ foreach ($h in $candidates) {
         Write-Host "  --  $url  (not responding yet)"
     }
 }
-if (-not $tsIp) {
-    Write-Host "(Tailscale IP not found; local only)"
+if ($tsIp) {
+    Write-Host ""
+    Write-Host "Phone (Tailscale Connected): http://${tsIp}:${port}"
+    Write-Host "MagicDNS: http://r10.taile6a47f.ts.net:${port}"
 }
 Write-Host ""
 exit 0
