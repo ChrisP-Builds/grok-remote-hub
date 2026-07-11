@@ -2444,8 +2444,38 @@
     updateStatusPill();
   }
 
-  // Slash palette
+  // Slash palette (position: fixed so chat-panel overflow does not clip it)
+  function positionSlashPalette() {
+    if (!els.slash || els.slash.classList.contains("hidden")) return;
+    const shell = els.form && els.form.closest(".composer-shell");
+    const anchor = shell || els.form || els.input;
+    if (!anchor) return;
+    const rect = anchor.getBoundingClientRect();
+    const vv = window.visualViewport;
+    const vTop = vv ? vv.offsetTop : 0;
+    const vHeight = vv ? vv.height : window.innerHeight;
+    const margin = 8;
+    const maxH = Math.min(240, Math.floor(vHeight * 0.4));
+    const availAbove = rect.top - vTop - margin;
+    const height = Math.min(maxH, Math.max(120, availAbove));
+    let top = rect.top - height - 4;
+    if (top < vTop + margin) {
+      // Not enough room above — place below composer if possible, else clamp
+      top = Math.max(vTop + margin, rect.bottom + 4);
+    }
+    const left = Math.max(margin, rect.left);
+    const width = Math.max(120, rect.width);
+    const maxHeight = Math.min(maxH, Math.max(80, vHeight - (top - vTop) - margin));
+    els.slash.style.top = Math.round(top) + "px";
+    els.slash.style.left = Math.round(left) + "px";
+    els.slash.style.width = Math.round(width) + "px";
+    els.slash.style.right = "auto";
+    els.slash.style.bottom = "auto";
+    els.slash.style.maxHeight = Math.round(maxHeight) + "px";
+  }
+
   function openSlash(filter) {
+    if (!els.slash) return;
     const q = (filter || "").toLowerCase();
     const source = slashCommandSource();
     const items = source.filter((c) => {
@@ -2460,14 +2490,17 @@
       els.slash.innerHTML = `<div class="slash-item"><span class="desc">No matching commands</span></div>`;
       els.slash.classList.remove("hidden");
       state.slashOpen = true;
+      positionSlashPalette();
       return;
     }
     renderSlash();
     els.slash.classList.remove("hidden");
     state.slashOpen = true;
+    positionSlashPalette();
   }
 
   function renderSlash() {
+    if (!els.slash) return;
     els.slash.innerHTML = "";
     state.slashItems.forEach((c, i) => {
       const btn = document.createElement("button");
@@ -2482,7 +2515,15 @@
       desc.className = "desc";
       desc.textContent = c.description || "";
       btn.append(name, desc);
-      btn.addEventListener("click", () => selectSlash(c));
+      let picked = false;
+      const pick = (e) => {
+        if (picked) return;
+        picked = true;
+        e.preventDefault();
+        selectSlash(c);
+      };
+      btn.addEventListener("pointerup", pick);
+      btn.addEventListener("click", pick);
       els.slash.appendChild(btn);
     });
     const active = els.slash.querySelector(".slash-item.active");
@@ -2493,8 +2534,15 @@
 
   function closeSlash() {
     state.slashOpen = false;
+    if (!els.slash) return;
     els.slash.classList.add("hidden");
     els.slash.innerHTML = "";
+    els.slash.style.top = "";
+    els.slash.style.left = "";
+    els.slash.style.width = "";
+    els.slash.style.right = "";
+    els.slash.style.bottom = "";
+    els.slash.style.maxHeight = "";
   }
 
   function selectSlash(cmd) {
@@ -2506,18 +2554,22 @@
     autoGrow();
   }
 
-  function onComposerInput() {
-    autoGrow();
-    const val = els.input.value;
+  function maybeOpenSlashFromValue() {
+    const val = els.input.value || "";
     if (val.startsWith("/")) {
       const firstLine = val.split("\n")[0];
       if (!firstLine.includes(" ") || firstLine === "/") {
-        const filter = firstLine.slice(1);
-        openSlash(filter);
-        return;
+        openSlash(firstLine.slice(1));
+        return true;
       }
     }
     closeSlash();
+    return false;
+  }
+
+  function onComposerInput() {
+    autoGrow();
+    maybeOpenSlashFromValue();
   }
 
   async function openNewModal() {
@@ -2650,6 +2702,7 @@
         document.documentElement.style.setProperty("--vv-offset", offset + "px");
       }
       autoGrow();
+      if (state.slashOpen) positionSlashPalette();
       if (state.stickToBottom) scrollIfSticky();
     };
     const vv = window.visualViewport;
@@ -2774,18 +2827,29 @@
     });
 
     els.input.addEventListener("input", onComposerInput);
+    els.input.addEventListener("keyup", (e) => {
+      if (
+        e.key === "/" ||
+        e.key === "Backspace" ||
+        e.key === "Process" ||
+        (els.input.value || "").startsWith("/")
+      ) {
+        maybeOpenSlashFromValue();
+      }
+    });
+    els.input.addEventListener("beforeinput", (e) => {
+      // iOS sometimes delivers "/" before the value updates; schedule a check
+      if (e.data === "/" || (els.input.value || "").startsWith("/")) {
+        requestAnimationFrame(() => maybeOpenSlashFromValue());
+      }
+    });
     els.input.addEventListener("focus", () => {
       autoGrow();
-      const val = els.input.value || "";
-      if (val.startsWith("/")) {
-        const firstLine = val.split("\n")[0];
-        if (!firstLine.includes(" ") || firstLine === "/") {
-          openSlash(firstLine.slice(1));
-        }
-      }
+      maybeOpenSlashFromValue();
       // prevent iOS scroll-jump centering the field mid-screen too aggressively
       setTimeout(() => {
         if (state.stickToBottom) scrollIfSticky();
+        if (state.slashOpen) positionSlashPalette();
       }, 50);
     });
     els.input.addEventListener("keydown", (e) => {

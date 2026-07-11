@@ -1631,20 +1631,27 @@ a {
 }
 
 .slash-palette {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 100%;
-  max-width: 100%;
+  position: fixed; /* escape chat-panel overflow:hidden clip */
+  left: 12px;
+  right: 12px;
+  bottom: auto;
+  top: auto;
+  width: auto;
+  max-width: none;
   max-height: min(240px, 40dvh);
   overflow-x: hidden;
   overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 4px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
-  z-index: 50;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
+  z-index: 200;
   font-family: var(--font);
+}
+
+.slash-palette.hidden {
+  display: none !important;
 }
 
 .slash-item {
@@ -2128,12 +2135,6 @@ a {
 
   .composer-shell {
     padding: 8px 10px calc(8px + var(--safe-b));
-  }
-
-  .slash-palette {
-    left: 0;
-    right: 0;
-    max-width: 100%;
   }
 
   .usage-bar {
