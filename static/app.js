@@ -195,7 +195,7 @@
     historyPollTimer: null,
     usagePollTimer: null,
     usage: null,
-    usageTitles: { context: "", monthly: "" },
+    usageTitles: { context: "", plan: "" },
     usagePopoverSeg: null,
     usagePopoverPinned: false,
     usageHideTimer: null,
@@ -311,13 +311,14 @@
     sessionBannerText: $("#session-banner-text"),
     usageBar: $("#usage-bar"),
     usageBarFill: $("#usage-bar-fill"),
-    usageBarFillMonthly: $("#usage-bar-fill-monthly"),
+    usageBarFillPlan: $("#usage-bar-fill-plan"),
     usageBarLabel: $("#usage-bar-label"),
     usageBarTokens: $("#usage-bar-tokens"),
-    usageBarMonthly: $("#usage-bar-monthly"),
+    usageBarPlan: $("#usage-bar-plan"),
+    usageBarReset: $("#usage-bar-reset"),
     usagePopover: $("#usage-popover"),
     usageSegContext: document.querySelector('[data-usage-seg="context"]'),
-    usageSegMonthly: document.querySelector('[data-usage-seg="monthly"]'),
+    usageSegPlan: document.querySelector('[data-usage-seg="plan"]'),
   };
 
   function tokenFromQuery() {
@@ -3423,6 +3424,54 @@
     return (m >= 10 ? Math.round(m) : Math.round(m * 10) / 10).toString().replace(/\.0$/, "") + "M";
   }
 
+  function parseIsoDate(iso) {
+    if (!iso || typeof iso !== "string") return null;
+    const d = new Date(iso);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  function formatResetCompact(iso) {
+    const d = parseIsoDate(iso);
+    if (!d) return "";
+    return (
+      "↻ " +
+      d.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+    );
+  }
+
+  function formatPeriodDay(iso) {
+    const d = parseIsoDate(iso);
+    if (!d) return "";
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  }
+
+  function formatResetLong(iso) {
+    const d = parseIsoDate(iso);
+    if (!d) return "";
+    return d.toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+    });
+  }
+
+  function formatResetAria(iso) {
+    const d = parseIsoDate(iso);
+    if (!d) return "";
+    return d.toLocaleDateString(undefined, {
+      month: "long",
+      day: "numeric",
+    });
+  }
+
+  function productLabel(product) {
+    if (!product || typeof product !== "string") return "Grok Build";
+    if (product === "GrokBuild") return "Grok Build";
+    return product;
+  }
+
   function clearUsageHideTimer() {
     if (state.usageHideTimer) {
       clearTimeout(state.usageHideTimer);
@@ -3435,9 +3484,9 @@
       els.usageSegContext.classList.toggle("usage-seg-active", seg === "context");
       els.usageSegContext.setAttribute("aria-expanded", seg === "context" ? "true" : "false");
     }
-    if (els.usageSegMonthly) {
-      els.usageSegMonthly.classList.toggle("usage-seg-active", seg === "monthly");
-      els.usageSegMonthly.setAttribute("aria-expanded", seg === "monthly" ? "true" : "false");
+    if (els.usageSegPlan) {
+      els.usageSegPlan.classList.toggle("usage-seg-active", seg === "plan");
+      els.usageSegPlan.setAttribute("aria-expanded", seg === "plan" ? "true" : "false");
     }
   }
 
@@ -3470,7 +3519,7 @@
     els.usagePopover.textContent = text || "—";
     state.usagePopoverSeg = seg;
     setUsageSegActive(seg);
-    positionUsagePopover(anchorEl || (seg === "monthly" ? els.usageSegMonthly : els.usageSegContext));
+    positionUsagePopover(anchorEl || (seg === "plan" ? els.usageSegPlan : els.usageSegContext));
   }
 
   function hideUsagePopover() {
@@ -3504,21 +3553,25 @@
 
   function hideUsageBar() {
     state.usage = null;
-    state.usageTitles = { context: "", monthly: "" };
+    state.usageTitles = { context: "", plan: "" };
     hideUsagePopover();
     if (els.usageBar) els.usageBar.classList.add("hidden");
     if (els.usageBarFill) {
       els.usageBarFill.style.width = "0%";
       els.usageBarFill.dataset.level = "ok";
     }
-    if (els.usageBarFillMonthly) {
-      els.usageBarFillMonthly.style.width = "0%";
-      els.usageBarFillMonthly.dataset.level = "ok";
+    if (els.usageBarFillPlan) {
+      els.usageBarFillPlan.style.width = "0%";
+      els.usageBarFillPlan.dataset.level = "ok";
     }
     if (els.usageBarLabel) els.usageBarLabel.textContent = "—";
     if (els.usageBarTokens) els.usageBarTokens.textContent = "—";
-    if (els.usageBarMonthly) els.usageBarMonthly.textContent = "—";
-    if (els.usageSegMonthly) els.usageSegMonthly.classList.add("usage-seg-na");
+    if (els.usageBarPlan) els.usageBarPlan.textContent = "—";
+    if (els.usageBarReset) els.usageBarReset.textContent = "";
+    if (els.usageSegPlan) {
+      els.usageSegPlan.classList.add("usage-seg-na");
+      els.usageSegPlan.setAttribute("aria-label", "Weekly plan usage unavailable");
+    }
   }
 
   function updateUsageBar(data) {
@@ -3538,7 +3591,7 @@
         "Session context window\n" +
         "Not available from this session yet.\n\n" +
         "How full this chat is vs the model context limit.\n" +
-        "Not your monthly Grok subscription.";
+        "Not your weekly Grok plan limit.";
     } else {
       const pct = Math.max(0, Math.min(100, Number(data.contextPercent)));
       const rounded = Math.round(pct);
@@ -3561,47 +3614,94 @@
           "Session context window\n" +
           `${Number(used).toLocaleString()} / ${Number(windowTok).toLocaleString()} tokens (${rounded}%)\n\n` +
           "How full this chat is vs the model context limit.\n" +
-          "Not your monthly Grok subscription.";
+          "Not your weekly Grok plan limit.";
       } else {
         state.usageTitles.context =
           "Session context window\n" +
           `${rounded}%\n\n` +
           "How full this chat is vs the model context limit.\n" +
-          "Not your monthly Grok subscription.";
+          "Not your weekly Grok plan limit.";
       }
     }
 
-    // Monthly segment always visible; muted when missing
-    const monthly = data && data.monthlyPercent;
-    const monthlyOk = monthly != null && Number.isFinite(Number(monthly));
-    if (els.usageBarFillMonthly) {
-      if (monthlyOk) {
-        const mPct = Math.max(0, Math.min(100, Number(monthly)));
-        els.usageBarFillMonthly.style.width = `${mPct}%`;
-        els.usageBarFillMonthly.dataset.level = usageLevel(mPct);
+    // Weekly plan segment (from nested plan or top-level weeklyPercent)
+    const plan = (data && data.plan) || null;
+    const weeklyRaw =
+      plan && plan.weeklyPercent != null
+        ? plan.weeklyPercent
+        : data && data.weeklyPercent != null
+          ? data.weeklyPercent
+          : null;
+    const planOk = weeklyRaw != null && Number.isFinite(Number(weeklyRaw));
+    const periodEnd =
+      (plan && plan.periodEnd) || (data && data.periodEnd) || null;
+    const periodStart =
+      (plan && plan.periodStart) || (data && data.periodStart) || null;
+    const product =
+      (plan && plan.product) || (data && data.product) || "GrokBuild";
+
+    if (els.usageBarFillPlan) {
+      if (planOk) {
+        const pPct = Math.max(0, Math.min(100, Number(weeklyRaw)));
+        els.usageBarFillPlan.style.width = `${pPct}%`;
+        els.usageBarFillPlan.dataset.level = usageLevel(pPct);
       } else {
-        els.usageBarFillMonthly.style.width = "0%";
-        els.usageBarFillMonthly.dataset.level = "ok";
+        els.usageBarFillPlan.style.width = "0%";
+        els.usageBarFillPlan.dataset.level = "ok";
       }
     }
-    if (els.usageBarMonthly) {
-      els.usageBarMonthly.textContent = monthlyOk ? `${Math.round(Number(monthly))}%` : "—";
+    if (els.usageBarPlan) {
+      els.usageBarPlan.textContent = planOk ? `${Math.round(Number(weeklyRaw))}%` : "—";
     }
-    if (els.usageSegMonthly) {
-      els.usageSegMonthly.classList.toggle("usage-seg-na", !monthlyOk);
+    if (els.usageBarReset) {
+      els.usageBarReset.textContent = planOk ? formatResetCompact(periodEnd) : "";
     }
-    if (monthlyOk) {
-      const m = Math.round(Number(monthly));
-      state.usageTitles.monthly =
-        "Monthly subscription usage\n" +
-        `${m}% of plan quota\n\n` +
-        "Your Grok plan/subscription fill for the period.\n" +
-        "Separate from session context window.";
+    if (els.usageSegPlan) {
+      els.usageSegPlan.classList.toggle("usage-seg-na", !planOk);
+      if (planOk) {
+        const p = Math.round(Number(weeklyRaw));
+        const resetAria = formatResetAria(periodEnd);
+        els.usageSegPlan.setAttribute(
+          "aria-label",
+          resetAria
+            ? `Weekly plan usage ${p}%, resets ${resetAria}`
+            : `Weekly plan usage ${p}%`
+        );
+      } else {
+        const err =
+          (plan && plan.error) || (data && data.planError) || null;
+        els.usageSegPlan.setAttribute(
+          "aria-label",
+          err ? `Weekly plan usage unavailable: ${err}` : "Weekly plan usage unavailable"
+        );
+      }
+    }
+    if (planOk) {
+      const p = Math.round(Number(weeklyRaw));
+      const startDay = formatPeriodDay(periodStart);
+      const endDay = formatPeriodDay(periodEnd);
+      const resetLong = formatResetLong(periodEnd);
+      let body =
+        `Weekly plan usage (${productLabel(product)})\n` +
+        `${p}% of weekly allowance\n`;
+      if (startDay && endDay) {
+        body += `\nPeriod: ${startDay} – ${endDay}`;
+      }
+      if (resetLong) {
+        body += `\nNext reset: ${resetLong} (local)`;
+      }
+      body += "\n\nAuto-updates while this page is open.";
+      state.usageTitles.plan = body;
     } else {
-      state.usageTitles.monthly =
-        "Monthly subscription usage\n" +
-        "Not available from this session yet.\n\n" +
-        "When Grok reports it, this bar shows plan/quota fill.";
+      const err =
+        (plan && plan.error) ||
+        (data && data.plan && data.plan.error) ||
+        null;
+      state.usageTitles.plan =
+        "Weekly plan usage (Grok Build)\n" +
+        (err ? `Unavailable (${err}).\n\n` : "Not available yet.\n\n") +
+        "Shows weekly Grok Build allowance from local CLI login.\n" +
+        "Separate from session context window.";
     }
 
     // Keep open popover text fresh
@@ -3609,7 +3709,7 @@
       const t = state.usageTitles[state.usagePopoverSeg] || "";
       els.usagePopover.textContent = t || "—";
       const anchor =
-        state.usagePopoverSeg === "monthly" ? els.usageSegMonthly : els.usageSegContext;
+        state.usagePopoverSeg === "plan" ? els.usageSegPlan : els.usageSegContext;
       positionUsagePopover(anchor);
     }
   }
@@ -3619,7 +3719,7 @@
 
     const segs = [
       { key: "context", el: els.usageSegContext },
-      { key: "monthly", el: els.usageSegMonthly },
+      { key: "plan", el: els.usageSegPlan },
     ];
 
     for (const { key, el } of segs) {
@@ -3666,7 +3766,7 @@
     window.addEventListener("resize", () => {
       if (!state.usagePopoverSeg) return;
       const anchor =
-        state.usagePopoverSeg === "monthly" ? els.usageSegMonthly : els.usageSegContext;
+        state.usagePopoverSeg === "plan" ? els.usageSegPlan : els.usageSegContext;
       positionUsagePopover(anchor);
     });
   }
