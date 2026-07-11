@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,7 @@ CLIENT_VERSION = "0.2.93"
 BILLING_TTL_S = 90.0
 TOKEN_SKEW_S = 60.0
 HTTP_TIMEOUT_S = 20.0
+DEFAULT_KEY_TTL_S = 3600.0
 
 _lock = threading.Lock()
 _token_cache: dict[str, Any] = {
@@ -149,10 +151,70 @@ def _load_auth_entry() -> dict[str, Any] | None:
         return None
     if not isinstance(raw, dict):
         return None
+    # Prefer OIDC entries that still have a refresh_token (even if revoked).
     for _key, value in raw.items():
         if isinstance(value, dict) and value.get("refresh_token"):
             return value
+    # Fall back to any entry with a JWT-like key/access_token.
+    for _key, value in raw.items():
+        if isinstance(value, dict) and _candidate_access_token(value):
+            return value
     return None
+
+
+def _candidate_access_token(entry: dict[str, Any]) -> str | None:
+    """Return JWT-like token from access_token or key (never logs the value)."""
+    for field in ("access_token", "key"):
+        val = entry.get(field)
+        if isinstance(val, str) and val.count(".") == 2 and len(val) > 40:
+            return val
+    return None
+
+
+def _parse_expires_at_epoch(exp: Any) -> float | None:
+    """Parse expires_at (ISO string, epoch seconds/ms) to epoch seconds."""
+    if exp is None or exp is False:
+        return None
+    if isinstance(exp, bool):
+        return None
+    if isinstance(exp, (int, float)):
+        epoch = float(exp)
+        if epoch > 1e12:  # milliseconds
+            epoch = epoch / 1000.0
+        return epoch if epoch > 0 else None
+    if not isinstance(exp, str):
+        return None
+    s = exp.strip()
+    if not s:
+        return None
+    try:
+        # bare number string
+        if s.replace(".", "", 1).isdigit():
+            return _parse_expires_at_epoch(float(s))
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _entry_expired(entry: dict[str, Any]) -> bool:
+    """True if expires_at is present and past (with small skew). Missing => not expired."""
+    epoch = _parse_expires_at_epoch(entry.get("expires_at"))
+    if epoch is None:
+        return False
+    return epoch < time.time() + 30.0
+
+
+def _cache_expires_for_entry(entry: dict[str, Any], now: float) -> float:
+    """Cache TTL when using stored key/access_token: entry expires_at or default 1h."""
+    epoch = _parse_expires_at_epoch(entry.get("expires_at"))
+    if epoch is not None and epoch > now + 30.0:
+        return max(now + 30.0, epoch - TOKEN_SKEW_S)
+    return now + DEFAULT_KEY_TTL_S
 
 
 def _ssl_context() -> ssl.SSLContext:
@@ -176,6 +238,15 @@ def _discover_token_endpoint(issuer: str) -> str:
     return fallback
 
 
+class TokenRefreshError(RuntimeError):
+    """OIDC refresh failure; may carry HTTP status / oauth error code (no secrets)."""
+
+    def __init__(self, message: str, *, http_status: int | None = None, error_code: str | None = None):
+        super().__init__(message)
+        self.http_status = http_status
+        self.error_code = error_code
+
+
 def _refresh_access_token(entry: dict[str, Any]) -> tuple[str, float, str]:
     """Return (access_token, expires_at_epoch, user_id). Never logs secrets."""
     issuer = str(entry.get("oidc_issuer") or "https://auth.x.ai").rstrip("/")
@@ -183,7 +254,7 @@ def _refresh_access_token(entry: dict[str, Any]) -> tuple[str, float, str]:
     refresh = str(entry.get("refresh_token") or "")
     user_id = str(entry.get("user_id") or entry.get("principal_id") or "")
     if not refresh or not client_id:
-        raise RuntimeError("auth incomplete")
+        raise TokenRefreshError("auth incomplete", error_code="auth_incomplete")
 
     token_url = _discover_token_endpoint(issuer)
     body = urllib.parse.urlencode(
@@ -206,24 +277,47 @@ def _refresh_access_token(entry: dict[str, Any]) -> tuple[str, float, str]:
         with urllib.request.urlopen(req, context=_ssl_context(), timeout=HTTP_TIMEOUT_S) as resp:
             tok = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        log.warning("token refresh HTTP %s", exc.code)
-        raise RuntimeError(f"token refresh HTTP {exc.code}") from exc
+        err_code: str | None = None
+        try:
+            err_body = json.loads(exc.read().decode("utf-8", errors="replace"))
+            if isinstance(err_body, dict):
+                raw_err = err_body.get("error")
+                if isinstance(raw_err, str) and raw_err.strip():
+                    err_code = raw_err.strip()[:80]
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning("token refresh HTTP %s error_type=%s", exc.code, err_code or type(exc).__name__)
+        raise TokenRefreshError(
+            f"token refresh HTTP {exc.code}",
+            http_status=exc.code,
+            error_code=err_code,
+        ) from exc
     except Exception as exc:
         log.warning("token refresh failed: %s", type(exc).__name__)
-        raise RuntimeError("token refresh failed") from exc
+        raise TokenRefreshError("token refresh failed", error_code=type(exc).__name__) from exc
 
     if not isinstance(tok, dict):
-        raise RuntimeError("token response invalid")
+        raise TokenRefreshError("token response invalid", error_code="invalid_response")
     access = tok.get("access_token")
     if not isinstance(access, str) or not access:
-        raise RuntimeError("no access token")
+        raise TokenRefreshError("no access token", error_code="no_access_token")
     expires_in = _as_float(tok.get("expires_in")) or 3600.0
     expires_at = time.time() + max(30.0, expires_in - TOKEN_SKEW_S)
     return access, expires_at, user_id
 
 
+def _store_token_cache(access: str, expires_at: float, user_id: str) -> None:
+    with _lock:
+        _token_cache["access_token"] = access
+        _token_cache["expires_at"] = expires_at
+        _token_cache["user_id"] = user_id
+
+
 def _get_access_token() -> tuple[str, str]:
-    """Cached access token + user_id. Thread-safe."""
+    """Cached access token + user_id. Prefer stored JWT key; fall back to refresh.
+
+    Never logs token values. Thread-safe.
+    """
     now = time.time()
     with _lock:
         cached = _token_cache.get("access_token")
@@ -236,12 +330,46 @@ def _get_access_token() -> tuple[str, str]:
     if not entry:
         raise RuntimeError("no local grok auth")
 
-    access, expires_at, user_id = _refresh_access_token(entry)
-    with _lock:
-        _token_cache["access_token"] = access
-        _token_cache["expires_at"] = expires_at
-        _token_cache["user_id"] = user_id
-    return access, user_id
+    user_id = str(entry.get("user_id") or entry.get("principal_id") or "")
+    candidate = _candidate_access_token(entry)
+
+    # Prefer stored JWT (access_token or key) when present and not clearly expired.
+    if candidate and not _entry_expired(entry):
+        expires_at = _cache_expires_for_entry(entry, now)
+        _store_token_cache(candidate, expires_at, user_id)
+        log.info("auth source=key")
+        return candidate, user_id
+
+    # Refresh when no usable stored JWT, or expires_at says expired.
+    try:
+        access, expires_at, refresh_uid = _refresh_access_token(entry)
+        uid_out = refresh_uid or user_id
+        _store_token_cache(access, expires_at, uid_out)
+        log.info("auth source=refresh")
+        return access, uid_out
+    except TokenRefreshError as exc:
+        log.warning(
+            "token refresh failed status=%s error_type=%s",
+            exc.http_status,
+            exc.error_code or type(exc).__name__,
+        )
+        # Refresh revoked / 400: still try stored key (expires_at may be stale while JWT works).
+        invalid_grant = (exc.error_code or "") == "invalid_grant" or exc.http_status == 400
+        if candidate and (invalid_grant or _entry_expired(entry)):
+            expires_at = _cache_expires_for_entry(entry, now)
+            # Short cache if entry looked expired so we retry refresh later.
+            if _entry_expired(entry):
+                expires_at = min(expires_at, now + 300.0)
+            _store_token_cache(candidate, expires_at, user_id)
+            log.info("auth source=key")
+            return candidate, user_id
+        if (exc.error_code or "") == "invalid_grant" or (
+            exc.http_status == 400 and not candidate
+        ):
+            raise RuntimeError(
+                "Run grok login on this PC (refresh token revoked)"
+            ) from exc
+        raise RuntimeError(str(exc) or "token refresh failed") from exc
 
 
 def _http_get_billing(access: str, user_id: str) -> dict[str, Any]:

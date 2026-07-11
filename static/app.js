@@ -3580,6 +3580,8 @@
     const hasContext =
       data && data.contextPercent != null && Number.isFinite(Number(data.contextPercent));
 
+    // Always show bar once updateUsageBar runs (context and/or plan segments).
+    // Never leave the bar hidden when contextPercent is present.
     els.usageBar.classList.remove("hidden");
 
     if (!hasContext) {
@@ -3777,18 +3779,32 @@
       return;
     }
     const id = state.selectedId;
+    const keepOrBlank = () => {
+      if (id !== state.selectedId) return;
+      // Keep last good snapshot (esp. contextPercent) rather than blanking the bar.
+      if (
+        state.usage &&
+        state.usage.contextPercent != null &&
+        Number.isFinite(Number(state.usage.contextPercent))
+      ) {
+        updateUsageBar(state.usage);
+      } else {
+        updateUsageBar(null);
+      }
+    };
     try {
       const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(id)}/usage`));
       if (!res.ok) {
-        if (id === state.selectedId) updateUsageBar(null);
+        keepOrBlank();
         return;
       }
       const data = await res.json();
       if (id !== state.selectedId) return;
       state.usage = data;
+      // Always paint bar when context or plan signals exist (plan.error still shows popover).
       updateUsageBar(data);
     } catch (_) {
-      if (id === state.selectedId) updateUsageBar(null);
+      keepOrBlank();
     }
   }
 
