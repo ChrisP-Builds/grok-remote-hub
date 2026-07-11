@@ -52,7 +52,7 @@ class Config:
     log_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "logs")
     static_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "static")
     max_sessions: int = 80
-    max_history_messages: int = 200
+    max_history_messages: int = 800
 
     @property
     def agent_ws_url(self) -> str:
@@ -106,5 +106,5 @@ def load_config(path: Path | None = None) -> Config:
         log_dir=_as_path(hub.get("log_dir"), PROJECT_ROOT / "logs"),
         static_dir=_as_path(hub.get("static_dir"), PROJECT_ROOT / "static"),
         max_sessions=int(hub.get("max_sessions", 80)),
-        max_history_messages=int(hub.get("max_history_messages", 200)),
+        max_history_messages=int(hub.get("max_history_messages", 800)),
     )

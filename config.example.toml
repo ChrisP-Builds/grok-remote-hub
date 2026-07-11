@@ -13,7 +13,7 @@ sessions_root = "~/.grok/sessions"
 projects_root = "D:\\Projects"
 # grok_bin = "C:\\Users\\YOU\\.grok\\bin\\grok.exe"
 # max_sessions = 80
-# max_history_messages = 200
+# max_history_messages = 800
 
 [agent]
 bind = "127.0.0.1"

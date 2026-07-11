@@ -28,17 +28,29 @@ if (Test-Path $PidFile) {
     Remove-Item $PidFile -Force -ErrorAction SilentlyContinue
 }
 
-# Fallback: find python -m hub in this root
-Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction SilentlyContinue |
+# Kill full process tree for python -m hub (venv launcher + child)
+Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
         $_.CommandLine -and
         $_.CommandLine -match '-m\s+hub' -and
         ($_.CommandLine -like "*$Root*" -or $_.CommandLine -like "*Grok Remote Hub*")
     } |
     ForEach-Object {
-        Write-Host "Stopping leftover hub process PID $($_.ProcessId)"
+        Write-Host "Stopping hub process PID $($_.ProcessId)"
         Stop-PidSafe ([int]$_.ProcessId) | Out-Null
         $stopped = $true
+    }
+
+# Anyone still listening on 8787 from our tree
+Get-NetTCPConnection -LocalPort 8787 -State Listen -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $op = $_.OwningProcess
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId=$op" -ErrorAction SilentlyContinue
+        if ($p -and $p.CommandLine -and $p.CommandLine -match 'hub') {
+            Write-Host "Stopping listener PID $op on 8787"
+            Stop-PidSafe ([int]$op) | Out-Null
+            $stopped = $true
+        }
     }
 
 # Orphaned hub-owned agent: only kill if it looks like our serve on 2419 with our secret
