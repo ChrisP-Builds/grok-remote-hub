@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security report
+    url: https://github.com/ChrisP-Builds/grok-remote-hub/blob/master/SECURITY.md
+    about: How to report a vulnerability without posting exploit detail publicly
+  - name: Architecture decisions (ADRs)
+    url: https://github.com/ChrisP-Builds/grok-remote-hub/tree/master/docs/adr
+    about: Why sessions, ACP sole-writer, and dual-browser topology work this way

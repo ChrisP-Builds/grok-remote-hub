@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="480" viewBox="0 0 1280 480" role="img" aria-label="Grok Remote Hub">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1020"/>
+      <stop offset="55%" stop-color="#121a2e"/>
+      <stop offset="100%" stop-color="#1a1420"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#f5a524"/>
+      <stop offset="100%" stop-color="#ff7a18"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1c2740" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#141c30" stop-opacity="0.95"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#ffffff" stroke-opacity="0.04" stroke-width="1"/>
+    </pattern>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="b"/>
+      <feMerge>
+        <feMergeNode in="b"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1280" height="480" fill="url(#bg)"/>
+  <rect width="1280" height="480" fill="url(#grid)"/>
+  <circle cx="1080" cy="80" r="180" fill="#f5a524" fill-opacity="0.06"/>
+  <circle cx="200" cy="420" r="160" fill="#3b82f6" fill-opacity="0.05"/>
+
+  <!-- left rail mock -->
+  <rect x="72" y="88" width="280" height="304" rx="16" fill="url(#panel)" stroke="#2a3654" stroke-width="1.5"/>
+  <rect x="92" y="112" width="120" height="14" rx="4" fill="#f5a524" fill-opacity="0.9"/>
+  <rect x="92" y="144" width="240" height="36" rx="8" fill="#0f1628" stroke="#2a3654"/>
+  <rect x="104" y="156" width="90" height="12" rx="3" fill="#8b9bb8"/>
+  <rect x="92" y="196" width="240" height="48" rx="8" fill="#1a2338" stroke="#3d4f73"/>
+  <rect x="104" y="210" width="140" height="10" rx="3" fill="#e8eefc"/>
+  <rect x="104" y="226" width="100" height="8" rx="3" fill="#6b7c99"/>
+  <rect x="92" y="256" width="240" height="48" rx="8" fill="#0f1628" stroke="#2a3654"/>
+  <rect x="104" y="270" width="120" height="10" rx="3" fill="#c5d0e6"/>
+  <rect x="104" y="286" width="80" height="8" rx="3" fill="#6b7c99"/>
+  <rect x="92" y="316" width="240" height="48" rx="8" fill="#0f1628" stroke="#2a3654"/>
+
+  <!-- main pane mock -->
+  <rect x="376" y="88" width="560" height="304" rx="16" fill="url(#panel)" stroke="#2a3654" stroke-width="1.5"/>
+  <rect x="400" y="112" width="200" height="12" rx="3" fill="#8b9bb8"/>
+  <rect x="400" y="148" width="420" height="18" rx="4" fill="#e8eefc" fill-opacity="0.12"/>
+  <rect x="400" y="178" width="360" height="18" rx="4" fill="#e8eefc" fill-opacity="0.08"/>
+  <rect x="400" y="208" width="480" height="18" rx="4" fill="#f5a524" fill-opacity="0.18"/>
+  <rect x="400" y="238" width="400" height="18" rx="4" fill="#e8eefc" fill-opacity="0.08"/>
+  <rect x="400" y="268" width="300" height="18" rx="4" fill="#e8eefc" fill-opacity="0.06"/>
+  <rect x="400" y="320" width="480" height="44" rx="10" fill="#0f1628" stroke="#3d4f73"/>
+  <circle cx="428" cy="342" r="6" fill="#22c55e" filter="url(#glow)"/>
+  <rect x="448" y="334" width="200" height="16" rx="4" fill="#6b7c99"/>
+
+  <!-- phone mock -->
+  <rect x="980" y="120" width="180" height="280" rx="28" fill="#0a0e18" stroke="#3d4f73" stroke-width="3"/>
+  <rect x="996" y="148" width="148" height="220" rx="12" fill="#121a2e"/>
+  <rect x="1010" y="164" width="80" height="8" rx="2" fill="#f5a524"/>
+  <rect x="1010" y="188" width="120" height="28" rx="6" fill="#1a2338"/>
+  <rect x="1010" y="228" width="120" height="28" rx="6" fill="#1a2338"/>
+  <rect x="1010" y="268" width="120" height="28" rx="6" fill="#1a2338"/>
+  <rect x="1036" y="380" width="68" height="6" rx="3" fill="#3d4f73"/>
+
+  <!-- connection arcs -->
+  <path d="M936 240 C960 240, 960 260, 980 260" fill="none" stroke="url(#amber)" stroke-width="2" stroke-opacity="0.7"/>
+  <path d="M936 200 C955 200, 965 200, 980 210" fill="none" stroke="#60a5fa" stroke-width="1.5" stroke-opacity="0.5"/>
+
+  <!-- title block -->
+  <text x="72" y="56" fill="#f5a524" font-family="Segoe UI, ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="600" letter-spacing="3">GROK BUILD · REMOTE</text>
+  <text x="72" y="430" fill="#e8eefc" font-family="Segoe UI, ui-sans-serif, system-ui, sans-serif" font-size="36" font-weight="700">Grok Remote Hub</text>
+  <text x="72" y="462" fill="#8b9bb8" font-family="Segoe UI, ui-sans-serif, system-ui, sans-serif" font-size="18">Always-on Tailscale UI for sessions on phone and desktop</text>
+</svg>

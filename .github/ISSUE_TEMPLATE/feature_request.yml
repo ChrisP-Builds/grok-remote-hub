@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest an improvement for the hub UI or ops scripts
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What is hard or missing today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: markdown
+    attributes:
+      value: |
+        Out of scope for early releases unless discussed: multi-agent concurrent turns, full stock TUI parity, non-Windows primary support.
