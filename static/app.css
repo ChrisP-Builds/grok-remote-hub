@@ -1688,6 +1688,14 @@ a {
   background: rgba(230, 184, 77, 0.08);
 }
 
+.slash-item.weak {
+  opacity: 0.55;
+}
+
+.slash-item.weak .name {
+  color: var(--muted);
+}
+
 .slash-item .name {
   font-family: var(--font);
   font-weight: 500;

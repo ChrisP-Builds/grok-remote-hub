@@ -35,6 +35,7 @@ from hub.session_policy import (
     save_remote_sessions,
 )
 from hub.session_tailer import EventDedupe, SessionTailer
+from hub.skills_index import list_skills
 from hub.version_info import HUB_VERSION, get_cli_version, structural_compat
 
 log = logging.getLogger("hub.server")
@@ -487,6 +488,7 @@ class Hub:
         app.router.add_post("/api/admin/reset-turn", self.handle_reset_turn)
         app.router.add_get("/api/projects", self.handle_projects)
         app.router.add_post("/api/projects", self.handle_create_project)
+        app.router.add_get("/api/skills", self.handle_skills)
         app.router.add_get("/api/fs/list", self.handle_fs_list)
         app.router.add_get("/api/fs/read", self.handle_fs_read)
         app.router.add_get("/api/fs/raw", self.handle_fs_raw)
@@ -700,6 +702,14 @@ class Hub:
     async def handle_projects(self, request: web.Request) -> web.Response:
         sessions = scan_sessions(self.config.sessions_root, limit=self.config.max_sessions)
         items = list_projects(self.config.projects_root, sessions)
+        return web.json_response({"items": items})
+
+    async def handle_skills(self, request: web.Request) -> web.Response:
+        try:
+            items = await asyncio.to_thread(list_skills)
+        except Exception:
+            log.exception("list_skills failed")
+            return web.json_response({"items": [], "error": "skills scan failed"}, status=500)
         return web.json_response({"items": items})
 
     async def handle_create_project(self, request: web.Request) -> web.Response:
