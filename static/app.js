@@ -44,14 +44,68 @@
   }
 
   function slashCommandSource() {
+    // Merge priority: agent > skill > builtin (first name wins).
+    const names = new Set();
+    const merged = [];
+    const push = (c) => {
+      const n = (c.name || "").toLowerCase();
+      if (!n || names.has(n)) return;
+      names.add(n);
+      merged.push(c);
+    };
     const agent = Array.isArray(state.commands) ? state.commands : [];
-    if (!agent.length) return BUILTIN_SLASH.slice();
-    const names = new Set(agent.map((c) => (c.name || "").toLowerCase()));
-    const merged = agent.slice();
-    for (const b of BUILTIN_SLASH) {
-      if (!names.has((b.name || "").toLowerCase())) merged.push(b);
+    for (const c of agent) push(c);
+    for (const s of state.skills || []) {
+      push({
+        name: s.name,
+        description: s.description ? `Skill: ${s.description}` : "Skill",
+        _skill: true,
+      });
     }
+    for (const b of BUILTIN_SLASH) push(b);
     return merged;
+  }
+
+  /** Name-first rank for slash filter. Desc-only is weak (never auto-pick over typed name). */
+  function rankSlashMatch(c, q) {
+    if (!q) return 1;
+    const name = (c.name || "").toLowerCase();
+    const desc = (c.description || "").toLowerCase();
+    if (name === q) return 100;
+    if (name.startsWith(q)) return 80;
+    if (name.includes(q)) return 60;
+    if (desc.includes(q)) return 10;
+    return 0;
+  }
+
+  /**
+   * On Enter/Submit with palette open:
+   * - exact typed name → send prompt as-is (never rewrite /handoff → /doc-sync)
+   * - strong prefix completion only → selectSlash
+   * - desc-only / no strong match → send typed text as-is
+   */
+  function resolveSlashOnSubmit() {
+    if (!state.slashOpen) return "prompt";
+    const raw = (els.input.value || "").trim();
+    const m = raw.match(/^\/([^\s/]+)/);
+    const typed = m ? m[1].toLowerCase() : "";
+    if (!typed) return "prompt";
+
+    const source = slashCommandSource();
+    const exact = source.find((c) => (c.name || "").toLowerCase() === typed);
+    if (exact) return "prompt";
+
+    const active = state.slashItems[state.slashIndex];
+    const activeName = active ? (active.name || "").toLowerCase() : "";
+    if (
+      active &&
+      state.slashStrongMatch &&
+      activeName.startsWith(typed) &&
+      activeName !== typed
+    ) {
+      return "select";
+    }
+    return "prompt";
   }
 
   function parseSimpleMarkdownTable(text) {
@@ -153,6 +207,10 @@
     slashOpen: false,
     slashIndex: 0,
     slashItems: [],
+    slashStrongMatch: false,
+    skills: [],
+    _skillsLoaded: false,
+    _skillsFetching: false,
     projects: [],
     turnStartedAt: 0,
     lastTermLineAt: 0,
@@ -2601,17 +2659,71 @@
     els.slash.style.maxHeight = Math.round(maxHeight) + "px";
   }
 
+  async function refreshSkills() {
+    try {
+      const res = await fetch(apiUrl("/api/skills"));
+      if (!res.ok) return;
+      const data = await res.json();
+      state.skills = data.items || [];
+      state._skillsLoaded = true;
+    } catch (_) {
+      /* keep prior list */
+    }
+  }
+
   function openSlash(filter) {
     if (!els.slash) return;
+    // Fetch skills once on first open if bootstrap has not finished.
+    if (!state._skillsLoaded && !state._skillsFetching) {
+      state._skillsFetching = true;
+      refreshSkills()
+        .finally(() => {
+          state._skillsFetching = false;
+        })
+        .then(() => {
+          if (state.slashOpen) openSlash(filter);
+        });
+    }
     const q = (filter || "").toLowerCase();
     const source = slashCommandSource();
-    const items = source.filter((c) => {
-      const name = (c.name || "").toLowerCase();
-      const desc = (c.description || "").toLowerCase();
-      return !q || name.includes(q) || desc.includes(q);
-    });
-    state.slashItems = items.slice(0, 40);
-    state.slashIndex = 0;
+    const ranked = source
+      .map((c) => ({ c, score: rankSlashMatch(c, q) }))
+      .filter((x) => x.score > 0 || !q)
+      .sort(
+        (a, b) =>
+          b.score - a.score || (a.c.name || "").localeCompare(b.c.name || "")
+      );
+    state.slashItems = ranked
+      .map((x) => Object.assign({}, x.c, { _slashScore: x.score }))
+      .slice(0, 50);
+
+    let idx = 0;
+    let strong = false;
+    if (q) {
+      const exact = state.slashItems.findIndex(
+        (c) => (c.name || "").toLowerCase() === q
+      );
+      if (exact >= 0) {
+        idx = exact;
+        strong = true;
+      } else {
+        const pref = state.slashItems.findIndex((c) =>
+          (c.name || "").toLowerCase().startsWith(q)
+        );
+        if (pref >= 0) {
+          idx = pref;
+          strong = true;
+        } else {
+          idx = 0;
+          strong = false;
+        }
+      }
+    } else {
+      strong = false;
+    }
+    state.slashIndex = state.slashItems.length ? idx : 0;
+    state.slashStrongMatch = Boolean(strong && q && state.slashItems.length);
+
     if (!state.slashItems.length) {
       // Always show palette when typing /; builtins keep it non-empty.
       els.slash.innerHTML = `<div class="slash-item"><span class="desc">No matching commands</span></div>`;
@@ -2629,10 +2741,25 @@
   function renderSlash() {
     if (!els.slash) return;
     els.slash.innerHTML = "";
+    const q = (() => {
+      const val = els.input.value || "";
+      if (!val.startsWith("/")) return "";
+      const first = val.split("\n")[0];
+      if (first.includes(" ") && first !== "/") return "";
+      return first.slice(1).toLowerCase();
+    })();
     state.slashItems.forEach((c, i) => {
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "slash-item" + (i === state.slashIndex ? " active" : "");
+      const weak =
+        q &&
+        (c._slashScore === 10 ||
+          (!(c.name || "").toLowerCase().includes(q) &&
+            (c.description || "").toLowerCase().includes(q)));
+      btn.className =
+        "slash-item" +
+        (i === state.slashIndex ? " active" : "") +
+        (weak ? " weak" : "");
       btn.setAttribute("role", "option");
       if (i === state.slashIndex) btn.setAttribute("aria-selected", "true");
       const name = document.createElement("span");
@@ -2947,10 +3074,12 @@
 
     els.form.addEventListener("submit", (e) => {
       e.preventDefault();
-      if (state.slashOpen && state.slashItems[state.slashIndex]) {
+      const action = resolveSlashOnSubmit();
+      if (action === "select" && state.slashItems[state.slashIndex]) {
         selectSlash(state.slashItems[state.slashIndex]);
         return;
       }
+      closeSlash();
       submitPrompt();
     });
 
@@ -3001,7 +3130,13 @@
         }
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
-          if (state.slashItems[state.slashIndex]) selectSlash(state.slashItems[state.slashIndex]);
+          const action = resolveSlashOnSubmit();
+          if (action === "select" && state.slashItems[state.slashIndex]) {
+            selectSlash(state.slashItems[state.slashIndex]);
+            return;
+          }
+          closeSlash();
+          submitPrompt();
           return;
         }
       }
@@ -3187,6 +3322,7 @@
       }
     } catch (_) {}
 
+    await refreshSkills();
     connectWs();
   }
 
