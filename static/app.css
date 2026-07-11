@@ -89,6 +89,7 @@ a {
   display: flex;
   flex-direction: column;
   z-index: 40;
+  transition: width 180ms ease, min-width 180ms ease, opacity 180ms ease, border-color 180ms ease;
 }
 
 .rail-header {
@@ -97,6 +98,28 @@ a {
   justify-content: space-between;
   gap: 8px;
   padding: 12px 12px 8px;
+}
+
+.rail-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+@media (min-width: 900px) {
+  #app.rail-collapsed .rail {
+    width: 0;
+    min-width: 0;
+    border-right: none;
+    overflow: hidden;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  #app.rail-collapsed #btn-menu,
+  #btn-menu.force-show {
+    display: inline-flex;
+  }
 }
 
 .rail-tabs {
