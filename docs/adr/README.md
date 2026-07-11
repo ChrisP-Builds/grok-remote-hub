@@ -29,3 +29,5 @@ a new ADR.
 | 002 | Implement full advertised ACP client surface | Accepted | 2026-07-10 |
 | 003 | Dual-hub remote topology, not TUI multi-client | Accepted | 2026-07-10 |
 | 004 | Detached hub process start via WMI | Accepted | 2026-07-11 |
+| 005 | Queue prompts while a turn is running | Accepted | 2026-07-11 |
+| 006 | Session-cwd sandboxed file browser over REST | Accepted | 2026-07-11 |

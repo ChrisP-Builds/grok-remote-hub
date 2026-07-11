@@ -88,7 +88,16 @@ Copy `config.example.toml` to `config.toml` for local overrides.
 - **Dual-hub topology:** phone + desktop browsers share this process over Tailscale; stock Grok TUI is not multi-client
 - Session list from `~/.grok/sessions/**/summary.json`
 - Transcript hydrate from `updates.jsonl` (ACP load does not replay chat)
-- Detached start via WMI (`start-hub.ps1`); see [docs/adr/](docs/adr/) (ADR 001–004)
+- Detached start via WMI (`start-hub.ps1`); see [docs/adr/](docs/adr/) (ADR 001–006)
+- Sandboxed REST file browser for the session cwd (`/api/fs/list|read|write|raw`); skills index (`/api/skills`)
+- FIFO **prompt queue** while a turn runs (Stop clears the queue); see ADR-005
+
+## UI capabilities (current)
+
+- **Sessions | Files** rail: list/search sessions; lazy file tree for session cwd; text edit/save; markdown Preview (+ Mermaid); image preview + lightbox
+- **Composer:** multi-line grow, iOS ≥16px no-zoom, slash palette (agent commands + disk skills, name-first match), prompt queue while a turn runs
+- **Transcript:** tool rows collapsed by default (expand for detail); plan checklist auto-opens while tasks are active and highlights the running item
+- **Chrome:** project name chip, context usage bar (`signals.json` via `/api/sessions/{id}/usage`), collapsible desktop rail (Browse sessions only when rail is hidden)
 
 ## Safari and desktop: what is live where
 
