@@ -25,6 +25,7 @@ from hub.history import load_session_history
 from hub.projects import ProjectError, create_project
 from hub.prompt_queue import PromptQueue
 from hub.session_index import find_session, list_projects, scan_sessions
+from hub.billing_usage import fetch_credits_usage
 from hub.session_signals import read_session_signals, read_signals_file, find_signals_path
 from hub.session_policy import (
     STUCK_TURN_SECONDS,
@@ -482,6 +483,7 @@ class Hub:
         app.router.add_get("/api/sessions", self.handle_sessions)
         app.router.add_get("/api/sessions/{id}/history", self.handle_history)
         app.router.add_get("/api/sessions/{id}/usage", self.handle_session_usage)
+        app.router.add_get("/api/usage/plan", self.handle_usage_plan)
         app.router.add_post("/api/sessions", self.handle_new_session)
         app.router.add_post("/api/sessions/{id}/load", self.handle_load_session)
         app.router.add_post("/api/sessions/{id}/attach", self.handle_attach_session)
@@ -691,11 +693,37 @@ class Hub:
             usage = raw.get("usage")
             if isinstance(usage, dict):
                 raw_subset["usage"] = usage
+        plan = await asyncio.to_thread(fetch_credits_usage)
+        # Nested plan only — never surface tokens or auth material
+        plan_safe = {
+            "weeklyPercent": plan.get("weeklyPercent"),
+            "periodType": plan.get("periodType"),
+            "periodStart": plan.get("periodStart"),
+            "periodEnd": plan.get("periodEnd"),
+            "product": plan.get("product"),
+            "available": bool(plan.get("available")),
+            "error": plan.get("error"),
+        }
         return web.json_response(
             {
                 "sessionId": session_id,
                 **normalized,
+                "plan": plan_safe,
                 "raw": raw_subset,
+            }
+        )
+
+    async def handle_usage_plan(self, request: web.Request) -> web.Response:
+        plan = await asyncio.to_thread(fetch_credits_usage)
+        return web.json_response(
+            {
+                "weeklyPercent": plan.get("weeklyPercent"),
+                "periodType": plan.get("periodType"),
+                "periodStart": plan.get("periodStart"),
+                "periodEnd": plan.get("periodEnd"),
+                "product": plan.get("product"),
+                "available": bool(plan.get("available")),
+                "error": plan.get("error"),
             }
         )
 

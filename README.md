@@ -97,7 +97,11 @@ Copy `config.example.toml` to `config.toml` for local overrides.
 - **Sessions | Files** rail: list/search sessions; lazy file tree for session cwd; text edit/save; markdown Preview (+ Mermaid); image preview + lightbox
 - **Composer:** multi-line grow, iOS ≥16px no-zoom, slash palette (agent commands + disk skills, name-first match), prompt queue while a turn runs
 - **Transcript:** tool rows collapsed by default (expand for detail); plan checklist auto-opens while tasks are active and highlights the running item
-- **Chrome:** project name chip, context usage bar (`signals.json` via `/api/sessions/{id}/usage`), collapsible desktop rail (Browse sessions only when rail is hidden)
+- **Chrome:** project name chip, dual usage bar (session context from `signals.json` + weekly Grok plan from local CLI auth via `/api/sessions/{id}/usage` and `/api/usage/plan`), collapsible desktop rail (Browse sessions only when rail is hidden)
+
+### Privacy note (plan usage)
+
+The hub reads `~/.grok/auth.json` on this machine (same login the Grok CLI uses), refreshes an access token server-side, and calls xAI billing credits to show the **W** (weekly) plan segment. Access and refresh tokens never leave the hub process in API responses or browser payloads.
 
 ## Safari and desktop: what is live where
 

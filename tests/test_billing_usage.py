@@ -1,0 +1,122 @@
+"""Unit tests for weekly plan billing usage normalization (no live network)."""
+
+from __future__ import annotations
+
+from hub.billing_usage import clear_caches, normalize_credits_config
+
+
+SAMPLE_CONFIG = {
+    "creditUsagePercent": 4.0,
+    "currentPeriod": {
+        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+        "start": "2026-07-10T21:20:20.719654+00:00",
+        "end": "2026-07-17T21:20:20.719654+00:00",
+    },
+    "billingPeriodStart": "2026-07-10T21:20:20.719654+00:00",
+    "billingPeriodEnd": "2026-07-17T21:20:20.719654+00:00",
+    "productUsage": [
+        {"product": "GrokBuild", "usagePercent": 4.0},
+        {"product": "Api"},
+        {"product": "GrokChat"},
+        {"product": "GrokImagine"},
+    ],
+    "isUnifiedBillingUser": True,
+    "onDemandCap": {"val": 0},
+    "onDemandUsed": {"val": 0},
+    "prepaidBalance": {"val": 0},
+}
+
+
+def test_normalize_weekly_sample() -> None:
+    result = normalize_credits_config(SAMPLE_CONFIG)
+    assert result["available"] is True
+    assert result["error"] is None
+    assert result["weeklyPercent"] == 4.0
+    assert result["periodType"] == "WEEKLY"
+    assert result["periodStart"] == "2026-07-10T21:20:20.719654+00:00"
+    assert result["periodEnd"] == "2026-07-17T21:20:20.719654+00:00"
+    assert result["product"] == "GrokBuild"
+
+
+def test_normalize_prefers_grokbuild_product() -> None:
+    config = {
+        "creditUsagePercent": 99.0,
+        "productUsage": [
+            {"product": "GrokChat", "usagePercent": 50.0},
+            {"product": "GrokBuild", "usagePercent": 12.5},
+        ],
+        "currentPeriod": {
+            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+            "start": "2026-07-10T00:00:00+00:00",
+            "end": "2026-07-17T00:00:00+00:00",
+        },
+    }
+    result = normalize_credits_config(config)
+    assert result["weeklyPercent"] == 12.5
+    assert result["product"] == "GrokBuild"
+
+
+def test_normalize_falls_back_to_credit_usage_percent() -> None:
+    config = {
+        "creditUsagePercent": 7.0,
+        "productUsage": [{"product": "Api"}, {"product": "GrokChat"}],
+        "currentPeriod": {
+            "type": "USAGE_PERIOD_TYPE_WEEKLY",
+            "start": "2026-07-01T00:00:00+00:00",
+            "end": "2026-07-08T00:00:00+00:00",
+        },
+    }
+    result = normalize_credits_config(config)
+    assert result["available"] is True
+    assert result["weeklyPercent"] == 7.0
+    assert result["product"] == "GrokBuild"
+
+
+def test_normalize_period_type_monthly() -> None:
+    result = normalize_credits_config(
+        {
+            "creditUsagePercent": 1.0,
+            "currentPeriod": {
+                "type": "USAGE_PERIOD_TYPE_MONTHLY",
+                "start": "2026-07-01T00:00:00+00:00",
+                "end": "2026-08-01T00:00:00+00:00",
+            },
+        }
+    )
+    assert result["periodType"] == "MONTHLY"
+    assert result["weeklyPercent"] == 1.0
+
+
+def test_normalize_billing_period_fallback() -> None:
+    result = normalize_credits_config(
+        {
+            "creditUsagePercent": 3.0,
+            "billingPeriodStart": "2026-07-10T00:00:00+00:00",
+            "billingPeriodEnd": "2026-07-17T00:00:00+00:00",
+        }
+    )
+    assert result["periodStart"] == "2026-07-10T00:00:00+00:00"
+    assert result["periodEnd"] == "2026-07-17T00:00:00+00:00"
+    assert result["periodType"] is None
+
+
+def test_normalize_clamps_percent() -> None:
+    assert normalize_credits_config({"creditUsagePercent": 150})["weeklyPercent"] == 100.0
+    assert normalize_credits_config({"creditUsagePercent": -2})["weeklyPercent"] == 0.0
+
+
+def test_normalize_zero_percent_available() -> None:
+    result = normalize_credits_config({"creditUsagePercent": 0})
+    assert result["available"] is True
+    assert result["weeklyPercent"] == 0.0
+
+
+def test_normalize_invalid() -> None:
+    assert normalize_credits_config(None)["available"] is False
+    assert normalize_credits_config({})["available"] is False
+    assert "error" in normalize_credits_config({})
+    assert normalize_credits_config({})["error"]
+
+
+def test_clear_caches_noop() -> None:
+    clear_caches()

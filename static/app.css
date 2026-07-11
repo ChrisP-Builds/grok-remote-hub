@@ -896,13 +896,13 @@ a {
   flex: 1 1 auto;
 }
 
-.usage-seg-monthly {
+.usage-seg-plan {
   flex: 0 1 auto;
-  max-width: 38%;
+  max-width: 42%;
   min-width: 4.5rem;
 }
 
-.usage-seg-monthly.usage-seg-na {
+.usage-seg-plan.usage-seg-na {
   opacity: 0.72;
 }
 
@@ -960,7 +960,7 @@ a {
 }
 
 .usage-bar-label,
-.usage-bar-monthly {
+.usage-bar-plan {
   flex: 0 0 auto;
   font-size: 11px;
   color: var(--muted);
@@ -969,6 +969,17 @@ a {
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   line-height: 1.2;
+}
+
+.usage-bar-reset {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  line-height: 1.2;
+  max-width: 5.5em;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .usage-bar-tokens {
@@ -2304,9 +2315,14 @@ a {
     max-width: 5.5em;
   }
 
-  .usage-seg-monthly {
-    max-width: 34%;
+  .usage-seg-plan {
+    max-width: 40%;
     min-width: 3.8rem;
+  }
+
+  .usage-bar-reset {
+    font-size: 9px;
+    max-width: 4.5em;
   }
 
   .usage-seg-tag {
