@@ -1,0 +1,64 @@
+name: Bug report
+description: Something broken in the hub UI, start scripts, or ACP session flow
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **Do not** include tokens, `agent.secret`, or `auth.json` contents.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Short summary of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Numbered steps.
+      placeholder: |
+        1. Start hub with start-hub.ps1
+        2. Open Working session
+        3. …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: Windows 11
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Grok CLI (`grok --version`) and hub from GET /health (hubVersion / cliVersion)
+      placeholder: "cli: grok 0.2.x · hub: 0.2.0"
+    validations:
+      required: false
+  - type: dropdown
+    id: access
+    attributes:
+      label: How are you connecting?
+      options:
+        - Localhost only
+        - Tailscale (phone)
+        - Tailscale (desktop browser)
+        - Other / mixed
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs (redacted)
+      description: Snippets from logs/ only. Strip secrets and personal IPs if needed.
