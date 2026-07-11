@@ -2,6 +2,8 @@
 
 Always-on Tailscale web UI for **Grok Build**: resume any local project session from phone or desktop, stream live replies on every connected browser, hydrate transcripts from disk.
 
+**License:** [MIT](LICENSE)
+
 ## Product scope
 
 - **Hub = remote control of the agent stream** over Tailscale (or localhost). It is a thin client for prompts, live session updates, and saved history.
@@ -15,10 +17,24 @@ Always-on Tailscale web UI for **Grok Build**: resume any local project session 
 - Python 3.11+
 - Tailscale (recommended) for phone access on your tailnet
 
+## Development / release checks
+
+```powershell
+# Unit + structural tests (no hub required)
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+
+# Live UI smoke (hub must be running on :8787)
+python -m playwright install chromium
+python -m pytest tests/test_e2e_smoke.py -v
+```
+
+Optional Node Playwright (`package.json`) is provided for JS tooling, but on some Windows/Node builds the CLI hangs. Prefer the Python Playwright suite above for CI and release gates.
+
 ## Quick start
 
 ```powershell
-cd "D:\Projects\Grok Remote Hub"
+cd path\to\grok-remote-hub   # your clone of this repo
 .\start-hub.ps1
 ```
 
@@ -44,17 +60,15 @@ Start at logon:
 
 1. Install Tailscale on the PC and phone; same account / tailnet.
 2. Start the hub on the PC (`start-hub.ps1` or the logon task). Confirm it prints `Hub is up` and both URLs show `OK`.
-3. **Windows Firewall (required once):** open **elevated** PowerShell and run:
+3. **Windows Firewall (required once):** open **elevated** PowerShell in the repo root and run:
    ```powershell
-   cd "D:\Projects\Grok Remote Hub"
    .\fix-firewall.ps1
    ```
    Without this, Safari on the phone often cannot connect even though the PC can open the same URL.
-4. On the phone (Tailscale connected), open one of:
-   - `http://100.110.172.25:8787` (this PC's Tailscale IP)
-   - `http://r10.taile6a47f.ts.net:8787` (MagicDNS)
+4. On the phone (Tailscale connected), open the URL printed by `start-hub.ps1` (Tailscale IP and optional MagicDNS), for example:
+   - `http://<tailscale-ip>:8787`
 5. Optional: Add to Home Screen for an app-like shell.
-6. Pick a session, wait for history + load, then chat.
+6. Pick a session under **Working**, wait for history + load, then chat.
 
 ### If Safari still will not load
 
@@ -64,7 +78,7 @@ Start at logon:
 | Firewall | Run `.\fix-firewall.ps1` **as Administrator** |
 | Tailscale on phone | Status should show Connected; both devices same account |
 | Wrong URL | Must include `:8787` and `http://` (not https) unless Serve is enabled |
-| Optional HTTPS | Enable Serve in admin console, then `tailscale serve --bg http://127.0.0.1:8787` and use `https://r10.taile6a47f.ts.net` |
+| Optional HTTPS | Enable Serve in the Tailscale admin console, then `tailscale serve --bg http://127.0.0.1:8787` and use your MagicDNS HTTPS URL |
 
 Without Tailscale the hub binds `127.0.0.1` only and the UI shows **Local only**.
 
@@ -88,17 +102,17 @@ Copy `config.example.toml` to `config.toml` for local overrides.
 - **Dual-hub topology:** phone + desktop browsers share this process over Tailscale; stock Grok TUI is not multi-client
 - Session list from `~/.grok/sessions/**/summary.json`
 - Transcript hydrate from `updates.jsonl` (ACP load does not replay chat)
-- Detached start via WMI (`start-hub.ps1`); see [docs/adr/](docs/adr/) (ADR 001–008)
+- Detached start via WMI (`start-hub.ps1`); detached restart via `restart-hub.ps1` (do not `stop-hub.ps1` from a hub/agent session); see [docs/adr/](docs/adr/) (ADR 001–008)
 - Sandboxed REST file browser for the session cwd (`/api/fs/list|read|write|raw`); skills index (`/api/skills`)
 - FIFO **prompt queue** while a turn runs (Stop clears the queue); see ADR-005
 - Session list classifies **subagents** from `summary.json` `session_kind` (legacy path fallback); user renames via `PATCH /api/sessions/{id}` → `hub_title` (ADR-007, ADR-008)
 
 ## UI capabilities (current)
 
-- **Sessions | Files** rail: list/search sessions; **All | Standard | Subagent** filter; pin-to-top; hover tooltips (project, model, path); rename (✎ on row / topbar); lazy file tree for session cwd; text edit/save; markdown Preview (+ Mermaid); image preview + lightbox
-- **Composer:** multi-line grow, iOS ≥16px no-zoom, slash palette (agent commands + disk skills, name-first match), prompt queue while a turn runs
-- **Transcript:** tool rows collapsed by default to a **single compact line** (expand for detail; mobile ellipsis); plan checklist auto-opens while tasks are active and highlights the running item
-- **Chrome:** project name chip, dual usage bar (session context from `signals.json` + weekly Grok plan from local CLI auth via `/api/sessions/{id}/usage` and `/api/usage/plan`), collapsible desktop rail (Browse sessions only when rail is hidden)
+- **Sessions | Files** rail: list/search; **Working | Subagent | All** filters; pin; rename; delete; project/model/path info bubble; file tree (edit/save, markdown + Mermaid, images)
+- **Composer:** multi-line grow, iOS ≥16px no-zoom, slash palette, prompt queue while a turn runs, OS spellcheck
+- **Transcript:** tools collapsed by default; thinking open for live progress; plan auto-expands active items; mid-turn session switch keeps streaming
+- **Chrome:** dual usage bar (session context + weekly plan), collapsible desktop rail
 
 ### Privacy note (plan usage)
 
@@ -117,11 +131,11 @@ The hub reads `~/.grok/auth.json` on this machine (same login the Grok CLI uses)
 While the hub (or any Grok agent) is writing a session, open a terminal on the PC and run:
 
 ```powershell
-cd "D:\Projects\Grok Remote Hub"
+cd path\to\grok-remote-hub
 .\follow.ps1
 # or pin a session / project:
-.\follow.ps1 --session 019f493c-af12-7652-a6d8-bf645c10921c
-.\follow.ps1 --cwd "D:\Projects\Circana Connections"
+.\follow.ps1 --session <session-uuid>
+.\follow.ps1 --cwd "C:\path\to\your\project"
 .\.venv\Scripts\python.exe -m hub.follow -v
 ```
 
@@ -149,6 +163,14 @@ python -m venv .venv
 .\.venv\Scripts\python -m pytest -q
 .\.venv\Scripts\python -m hub
 ```
+
+After code changes that need a hub process restart, use the detached restart script from any shell (including a hub-owned agent session):
+
+```powershell
+.\restart-hub.ps1
+```
+
+Do **not** run bare `stop-hub.ps1` from a hub/agent session: that kills the hub mid-turn and leaves the browser stuck until someone runs `start-hub.ps1` again. `restart-hub.ps1` schedules stop+start via WMI so the restart chain survives the hub dying.
 
 ## Known limits (MVP)
 
