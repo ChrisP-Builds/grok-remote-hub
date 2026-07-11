@@ -24,7 +24,14 @@ from hub.fs_browser import (
 from hub.history import load_session_history
 from hub.projects import ProjectError, create_project
 from hub.prompt_queue import PromptQueue
-from hub.session_index import find_session, list_projects, scan_sessions
+from hub.session_index import (
+    delete_session,
+    find_session,
+    list_projects,
+    rename_session,
+    scan_sessions,
+    stamp_hub_origin,
+)
 from hub.billing_usage import fetch_credits_usage
 from hub.session_signals import read_session_signals, read_signals_file, find_signals_path
 from hub.session_policy import (
@@ -135,6 +142,7 @@ class Hub:
             on_message=self._on_acp_message,
             on_connection=self._on_acp_connection,
         )
+        self.acp.on_user_question = self._on_user_question
         self._acp_dedupe = EventDedupe(maxlen=2000)
         self.tailer = SessionTailer(
             config.sessions_root,
@@ -251,6 +259,58 @@ class Hub:
         session_id = self._session_id_from_acp(msg)
         await self._emit_acp(session_id, msg)
 
+    async def _on_user_question(self, payload: dict[str, Any]) -> None:
+        """Fan out agent ask_user_question to all connected UIs."""
+        await self.broadcast(
+            {
+                "type": "user_question",
+                "requestId": payload.get("requestId"),
+                "sessionId": payload.get("sessionId"),
+                "questions": payload.get("questions") or [],
+                "toolCallId": payload.get("toolCallId"),
+            }
+        )
+
+    async def _ws_user_question_answer(
+        self, ws: web.WebSocketResponse, payload: dict[str, Any]
+    ) -> None:
+        """Resolve a pending ACP ask_user_question from the web UI."""
+        from hub.acp_ask_user import build_accepted_result
+
+        request_id = str(payload.get("requestId") or "")
+        if not request_id:
+            await ws.send_str(
+                json.dumps({"type": "error", "message": "user_question_answer missing requestId"})
+            )
+            return
+        outcome = str(payload.get("outcome") or "accepted").lower()
+        answers = payload.get("answers") or {}
+        if not isinstance(answers, dict):
+            answers = {}
+        if outcome == "cancelled":
+            ok = self.acp.cancel_user_question(request_id)
+        else:
+            # answers: {qid: [str, ...]}
+            ok = self.acp.answer_user_question(request_id, build_accepted_result(answers))
+        await self.broadcast(
+            {
+                "type": "user_question_resolved",
+                "requestId": request_id,
+                "outcome": "cancelled" if outcome == "cancelled" else "accepted",
+                "ok": ok,
+            }
+        )
+        if not ok:
+            await ws.send_str(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": f"No pending user question for requestId={request_id}",
+                    }
+                )
+            )
+
+
     async def _on_disk_event(self, session_id: str, msg: dict[str, Any]) -> None:
         """Disk tailer path: CLI (or any process) wrote updates.jsonl."""
         sid = self._session_id_from_acp(msg) or session_id
@@ -315,6 +375,8 @@ class Hub:
             "session_switch",
             "queued",
             "queue",
+            "user_question",
+            "user_question_resolved",
         )
         scoped = ("acp", "history", "commands", "turn", "system")
         for ws in list(self.clients):
@@ -391,6 +453,35 @@ class Hub:
         except OSError as exc:
             log.debug("failed to write last-remote-session.txt: %s", exc)
 
+    def _hub_remote_ids(self) -> set[str]:
+        return set(self.remote_agent_session.values())
+
+    def _scan_sessions(self) -> list:
+        return scan_sessions(
+            self.config.sessions_root,
+            limit=self.config.max_sessions,
+            hub_remote_ids=self._hub_remote_ids(),
+        )
+
+    async def _stamp_origin_with_retry(self, session_id: str, origin: str) -> None:
+        """Best-effort hub_origin write; summary may appear shortly after session/new."""
+        for delay in (0, 0.4, 1.0):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                if stamp_hub_origin(self.config.sessions_root, session_id, origin):
+                    return
+            except Exception as exc:
+                log.debug(
+                    "stamp_hub_origin error session=%s origin=%s: %s",
+                    session_id,
+                    origin,
+                    exc,
+                )
+        log.debug(
+            "stamp_hub_origin gave up session=%s origin=%s", session_id, origin
+        )
+
     async def _ensure_hub_agent_session(
         self,
         view_session_id: str,
@@ -423,6 +514,9 @@ class Hub:
                     )
                     agent_sid = await self.acp.session_new(cwd)
                     self._record_hub_session(agent_sid, cwd)
+                    asyncio.create_task(
+                        self._stamp_origin_with_retry(agent_sid, "attach")
+                    )
                     reason = "need_session_new"
             log.info(
                 "Reuse hub remote session %s for view %s cwd=%s reason=%s",
@@ -434,6 +528,7 @@ class Hub:
         else:
             agent_sid = await self.acp.session_new(cwd)
             self._record_hub_session(agent_sid, cwd)
+            asyncio.create_task(self._stamp_origin_with_retry(agent_sid, "attach"))
             reason = "need_session_new"
             log.info(
                 "Created hub remote session %s for view %s cwd=%s",
@@ -462,9 +557,7 @@ class Hub:
                 await self.broadcast(switch)
                 if ws is not None:
                     self.subscriptions.setdefault(ws, set()).add(agent_sid)
-                items = scan_sessions(
-                    self.config.sessions_root, limit=self.config.max_sessions
-                )
+                items = self._scan_sessions()
                 await self.broadcast(
                     {"type": "sessions", "items": [s.to_dict() for s in items]}
                 )
@@ -485,6 +578,8 @@ class Hub:
         app.router.add_get("/api/sessions/{id}/usage", self.handle_session_usage)
         app.router.add_get("/api/usage/plan", self.handle_usage_plan)
         app.router.add_post("/api/sessions", self.handle_new_session)
+        app.router.add_patch("/api/sessions/{id}", self.handle_rename_session)
+        app.router.add_delete("/api/sessions/{id}", self.handle_delete_session)
         app.router.add_post("/api/sessions/{id}/load", self.handle_load_session)
         app.router.add_post("/api/sessions/{id}/attach", self.handle_attach_session)
         app.router.add_post("/api/admin/reset-turn", self.handle_reset_turn)
@@ -655,8 +750,60 @@ class Hub:
         )
 
     async def handle_sessions(self, request: web.Request) -> web.Response:
-        items = scan_sessions(self.config.sessions_root, limit=self.config.max_sessions)
+        items = self._scan_sessions()
         return web.json_response({"items": [s.to_dict() for s in items]})
+
+    async def handle_rename_session(self, request: web.Request) -> web.Response:
+        session_id = request.match_info["id"]
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "invalid json"}, status=400)
+        title = body.get("title")
+        if not isinstance(title, str) or not title.strip():
+            return web.json_response({"error": "title required"}, status=400)
+        updated = await asyncio.to_thread(
+            rename_session, self.config.sessions_root, session_id, title
+        )
+        if not updated:
+            return web.json_response({"error": "session not found"}, status=404)
+        items = self._scan_sessions()
+        await self.broadcast({"type": "sessions", "items": [s.to_dict() for s in items]})
+        return web.json_response({"item": updated.to_dict()})
+
+    async def handle_delete_session(self, request: web.Request) -> web.Response:
+        session_id = request.match_info["id"]
+        ok = await asyncio.to_thread(
+            delete_session, self.config.sessions_root, session_id
+        )
+        if not ok:
+            return web.json_response({"error": "session not found"}, status=404)
+
+        self.acp_created_sessions.discard(session_id)
+        removed_keys = [
+            key
+            for key, sid in list(self.remote_agent_session.items())
+            if sid == session_id
+        ]
+        for key in removed_keys:
+            self.remote_agent_session.pop(key, None)
+        if removed_keys:
+            self._persist_remote_sessions_map()
+
+        try:
+            if LAST_REMOTE_SESSION_FILE.is_file():
+                last = LAST_REMOTE_SESSION_FILE.read_text(encoding="utf-8").strip()
+                if last == session_id:
+                    LAST_REMOTE_SESSION_FILE.write_text("", encoding="utf-8")
+        except OSError as exc:
+            log.debug("failed to clear last-remote-session.txt: %s", exc)
+
+        items = self._scan_sessions()
+        await self.broadcast({"type": "sessions", "items": [s.to_dict() for s in items]})
+        await self.broadcast(self.status_payload())
+        return web.json_response({"ok": True})
 
     async def handle_history(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]
@@ -728,7 +875,7 @@ class Hub:
         )
 
     async def handle_projects(self, request: web.Request) -> web.Response:
-        sessions = scan_sessions(self.config.sessions_root, limit=self.config.max_sessions)
+        sessions = self._scan_sessions()
         items = list_projects(self.config.projects_root, sessions)
         return web.json_response({"items": items})
 
@@ -853,11 +1000,12 @@ class Hub:
         try:
             session_id = await self.acp.session_new(cwd)
             self._record_hub_session(session_id, cwd)
+            asyncio.create_task(self._stamp_origin_with_retry(session_id, "user"))
         except Exception as exc:
             log.exception("session/new failed")
             return web.json_response({"error": str(exc)}, status=500)
         await self.broadcast(self.status_payload())
-        items = scan_sessions(self.config.sessions_root, limit=self.config.max_sessions)
+        items = self._scan_sessions()
         await self.broadcast({"type": "sessions", "items": [s.to_dict() for s in items]})
         return web.json_response({"sessionId": session_id, "cwd": cwd})
 
@@ -998,7 +1146,7 @@ class Hub:
         self.clients.add(ws)
         self.subscriptions[ws] = set()
         await ws.send_str(json.dumps(self.status_payload()))
-        items = scan_sessions(self.config.sessions_root, limit=self.config.max_sessions)
+        items = self._scan_sessions()
         await ws.send_str(json.dumps({"type": "sessions", "items": [s.to_dict() for s in items]}))
         # Push cached agent slash commands so reconnect/new clients get real list
         # without waiting for attach or a later available_commands_update.
@@ -1100,6 +1248,9 @@ class Hub:
             )
             self._bg_tasks.add(task)
             task.add_done_callback(self._bg_tasks.discard)
+            return
+        if typ == "user_question_answer":
+            await self._ws_user_question_answer(ws, payload)
             return
         await ws.send_str(json.dumps({"type": "error", "message": f"unknown type: {typ}"}))
 
@@ -1365,6 +1516,7 @@ class Hub:
                 try:
                     fresh = await self.acp.session_new(cwd)
                     self._record_hub_session(fresh, cwd)
+                    asyncio.create_task(self._stamp_origin_with_retry(fresh, "attach"))
                     switch = {
                         "type": "session_switch",
                         "from": session_id,
@@ -1376,9 +1528,7 @@ class Hub:
                     await self.broadcast(switch)
                     if ws is not None:
                         self.subscriptions.setdefault(ws, set()).add(fresh)
-                    items = scan_sessions(
-                        self.config.sessions_root, limit=self.config.max_sessions
-                    )
+                    items = self._scan_sessions()
                     await self.broadcast(
                         {"type": "sessions", "items": [s.to_dict() for s in items]}
                     )
@@ -1451,19 +1601,31 @@ class Hub:
         await self.broadcast({"type": "queue", "queueLength": 0, "sessionId": session_id})
         try:
             await self.acp.session_cancel(session_id)
-            await self.broadcast(
-                {"type": "turn", "sessionId": session_id, "state": "idle", "error": None},
-                session_id=session_id,
-            )
         except Exception as exc:
-            await ws.send_str(
-                json.dumps(
-                    {
-                        "type": "error",
-                        "message": f"Cancel failed: {exc}. Wait for the turn to finish.",
-                    }
+            log.warning("session_cancel raised session=%s: %s — force-clearing", session_id, exc)
+            try:
+                self.acp.force_clear_turn(f"user cancel fallback: {exc}")
+            except Exception:
+                log.exception("force_clear_turn after cancel failure")
+            try:
+                await ws.send_str(
+                    json.dumps(
+                        {
+                            "type": "error",
+                            "message": (
+                                f"Stop: agent cancel failed ({exc}); "
+                                "turn force-cleared locally."
+                            ),
+                        }
+                    )
                 )
-            )
+            except Exception:
+                pass
+        # Always broadcast idle + status so clients unlock (turnRunning: false).
+        await self.broadcast(
+            {"type": "turn", "sessionId": session_id, "state": "idle", "error": None},
+            session_id=session_id,
+        )
         await self.broadcast(self.status_payload())
 
 

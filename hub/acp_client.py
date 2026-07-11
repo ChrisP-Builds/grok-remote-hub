@@ -9,6 +9,11 @@ from urllib.parse import quote
 
 from websockets.asyncio.client import connect as ws_connect
 
+from hub.acp_ask_user import (
+    build_accepted_result,
+    build_cancelled_result,
+    normalize_questions,
+)
 from hub.acp_fs import read_text_file, write_text_file
 from hub.acp_permissions import pick_permission_option
 from hub.acp_terminal import TerminalManager
@@ -78,6 +83,10 @@ class AcpClient:
         self.disconnect_turn_session_id: str | None = None
         # Client-side terminal/* processes for advertised terminal capability.
         self._terminals = TerminalManager()
+        # Pending _x.ai/ask_user_question futures keyed by str(msg_id).
+        self._pending_user_questions: dict[str, asyncio.Future] = {}
+        # Hub sets this to fan out user_question events to the web UI.
+        self.on_user_question: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None
 
     def turn_age_seconds(self) -> float | None:
         if self.turn_started_at is None:
@@ -115,7 +124,12 @@ class AcpClient:
         Also fails any pending ACP request futures so a blocked session_prompt
         can exit its lock and allow a subsequent prompt.
         """
-        if not self.turn_running and self.turn_session_id is None and not self._pending:
+        if (
+            not self.turn_running
+            and self.turn_session_id is None
+            and not self._pending
+            and not self._pending_user_questions
+        ):
             return False
         age = self.turn_age_seconds()
         cleared_sid = self.turn_session_id
@@ -133,6 +147,7 @@ class AcpClient:
             if not fut.done():
                 fut.set_exception(TimeoutError(f"Turn force-cleared: {reason}"))
             self._pending.pop(req_id, None)
+        self._cancel_all_pending_user_questions()
         self.turn_running = False
         self.turn_session_id = None
         self.turn_started_at = None
@@ -199,6 +214,7 @@ class AcpClient:
             if not fut.done():
                 fut.set_exception(ConnectionError("ACP connection closed"))
         self._pending.clear()
+        self._cancel_all_pending_user_questions()
         try:
             await self._terminals.close_all()
         except Exception:
@@ -226,6 +242,7 @@ class AcpClient:
                 if not fut.done():
                     fut.set_exception(ConnectionError(f"ACP recv ended: {exc}"))
             self._pending.clear()
+            self._cancel_all_pending_user_questions()
 
     async def _maintain(self) -> None:
         backoff = 1.0
@@ -250,7 +267,12 @@ class AcpClient:
             finally:
                 self._ws = None
                 self.loaded_session_id = None
-                if self.turn_running or self.turn_session_id or self._pending:
+                if (
+                    self.turn_running
+                    or self.turn_session_id
+                    or self._pending
+                    or self._pending_user_questions
+                ):
                     self.force_clear_turn("acp disconnected")
                 else:
                     self.turn_running = False
@@ -270,6 +292,7 @@ class AcpClient:
                     if not fut.done():
                         fut.set_exception(ConnectionError("ACP connection closed"))
                 self._pending.clear()
+                self._cancel_all_pending_user_questions()
                 if self.connected:
                     await self._set_connected(False)
             if self._stop.is_set():
@@ -357,6 +380,14 @@ class AcpClient:
                 await self._handle_permission(msg_id, params)
                 return
 
+            # Spawn task so the ACP recv loop keeps processing while the UI answers.
+            if "ask_user_question" in method_l:
+                asyncio.create_task(
+                    self._handle_ask_user_question(msg_id, params),
+                    name=f"acp-ask-user-{msg_id!s}"[:48],
+                )
+                return
+
             if method in ("fs/read_text_file", "fs/readTextFile"):
                 result = await asyncio.to_thread(read_text_file, params)
                 await self._reply_result(msg_id, result)
@@ -439,6 +470,94 @@ class AcpClient:
             msg_id,
             {"outcome": {"outcome": "selected", "optionId": option_id}},
         )
+
+    def answer_user_question(self, request_id: str, result: dict[str, Any]) -> bool:
+        """Resolve a pending ask_user_question with an ACP result dict."""
+        key = str(request_id or "")
+        if not key:
+            return False
+        fut = self._pending_user_questions.get(key)
+        if fut is None or fut.done():
+            return False
+        fut.set_result(result)
+        return True
+
+    def cancel_user_question(self, request_id: str) -> bool:
+        """Resolve a pending ask_user_question as cancelled."""
+        return self.answer_user_question(request_id, build_cancelled_result())
+
+    def _cancel_all_pending_user_questions(self) -> None:
+        """Complete all pending user questions with cancelled (disconnect/force-clear)."""
+        for key, fut in list(self._pending_user_questions.items()):
+            if not fut.done():
+                fut.set_result(build_cancelled_result())
+            self._pending_user_questions.pop(key, None)
+
+    async def _handle_ask_user_question(
+        self, msg_id: Any, params: dict[str, Any]
+    ) -> None:
+        """Wait for web UI answer, then reply to the agent (runs off the recv path)."""
+        questions = normalize_questions(params)
+        if not questions:
+            try:
+                await self._reply_result(msg_id, build_accepted_result({}))
+            except Exception as exc:
+                log.warning("ask_user_question empty reply failed: %s", exc)
+            return
+
+        key = str(msg_id)
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._pending_user_questions[key] = fut
+
+        session_id = (
+            params.get("sessionId")
+            or params.get("session_id")
+            or self.turn_session_id
+            or self.loaded_session_id
+        )
+        tool_call_id = (
+            params.get("toolCallId")
+            or params.get("tool_call_id")
+            or ""
+        )
+        payload: dict[str, Any] = {
+            "requestId": key,
+            "sessionId": str(session_id) if session_id else None,
+            "questions": questions,
+            "toolCallId": str(tool_call_id) if tool_call_id else None,
+        }
+        log.info(
+            "ask_user_question request id=%s session=%s n=%d",
+            key,
+            payload.get("sessionId") or "?",
+            len(questions),
+        )
+        try:
+            if self.on_user_question:
+                cb = self.on_user_question(payload)
+                if asyncio.iscoroutine(cb):
+                    await cb
+            result = await asyncio.wait_for(fut, timeout=1800.0)
+            await self._reply_result(msg_id, result)
+            log.info("ask_user_question answered id=%s", key)
+        except asyncio.TimeoutError:
+            log.warning("ask_user_question timed out id=%s", key)
+            try:
+                await self._reply_result(msg_id, build_cancelled_result())
+            except Exception as exc:
+                log.warning("ask_user_question timeout reply failed: %s", exc)
+        except Exception as exc:
+            log.exception("ask_user_question failed id=%s: %s", key, exc)
+            try:
+                await self._reply_result(msg_id, build_cancelled_result())
+            except Exception:
+                pass
+        finally:
+            pending = self._pending_user_questions.pop(key, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
+
 
     async def _track_update(self, msg: dict[str, Any]) -> None:
         method = msg.get("method") or ""
@@ -628,16 +747,34 @@ class AcpClient:
                 self.turn_saw_update = False
 
     async def session_cancel(self, session_id: str) -> None:
-        for method in ("session/cancel", "session/prompt/cancel", "x.ai/session/cancel"):
+        """Cancel agent turn and always unlock local hub turn state.
+
+        Pending user questions are resolved as cancelled. Agent cancel methods
+        are best-effort; local force-clear always runs so Stop never leaves
+        the UI stuck on Running.
+        """
+        self._cancel_all_pending_user_questions()
+        agent_ok = False
+        last_exc: Exception | None = None
+        for method in (
+            "session/cancel",
+            "session/prompt/cancel",
+            "x.ai/session/cancel",
+            "_x.ai/session/cancel",
+        ):
             try:
                 await self.request(method, {"sessionId": session_id}, timeout=10.0)
-                self.turn_running = False
-                self.turn_session_id = None
-                self.turn_started_at = None
-                self.last_activity_at = None
-                self.turn_saw_update = False
-                self._cancel_stall_watchdog()
-                return
+                agent_ok = True
+                break
             except Exception as exc:
+                last_exc = exc
                 log.debug("Cancel via %s failed: %s", method, exc)
-        raise RuntimeError("Cancel not supported by agent")
+        cleared = self.force_clear_turn("user cancel")
+        if not agent_ok:
+            log.warning(
+                "Agent cancel unsupported/failed session=%s force_cleared=%s: %s",
+                session_id,
+                cleared,
+                last_exc or "no method succeeded",
+            )
+        # Never raise after local force-clear: UI must unlock on Stop.
