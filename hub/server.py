@@ -15,8 +15,10 @@ from hub.agent_supervisor import AgentSupervisor
 from hub.config import Config, PROJECT_ROOT, TAILSCALE_EXE
 from hub.fs_browser import (
     FsBrowserError,
+    content_type_for,
     list_dir as fs_list_dir,
     read_text as fs_read_text,
+    resolve_file_for_read,
     write_text as fs_write_text,
 )
 from hub.history import load_session_history
@@ -468,6 +470,7 @@ class Hub:
         app.router.add_post("/api/projects", self.handle_create_project)
         app.router.add_get("/api/fs/list", self.handle_fs_list)
         app.router.add_get("/api/fs/read", self.handle_fs_read)
+        app.router.add_get("/api/fs/raw", self.handle_fs_raw)
         app.router.add_put("/api/fs/write", self.handle_fs_write)
         app.router.add_get("/ws", self.handle_ws)
         static_dir = Path(self.config.static_dir)
@@ -692,6 +695,35 @@ class Hub:
             log.exception("fs read failed")
             return web.json_response({"error": "internal error"}, status=500)
         return web.json_response(result)
+
+    async def handle_fs_raw(self, request: web.Request) -> web.Response:
+        root = (request.query.get("root") or "").strip()
+        if not root:
+            return web.json_response({"error": "root required"}, status=400)
+        path = request.query.get("path") or ""
+        if not str(path).strip():
+            return web.json_response({"error": "path required"}, status=400)
+        try:
+            file_path = resolve_file_for_read(
+                self.config.projects_root, root, path
+            )
+            size = file_path.stat().st_size
+            if size > 15_000_000:
+                return web.json_response({"error": "file too large"}, status=413)
+            ctype = content_type_for(file_path)
+            return web.FileResponse(
+                path=file_path,
+                headers={
+                    "Content-Type": ctype,
+                    "Cache-Control": "private, max-age=60",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+        except FsBrowserError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception:
+            log.exception("fs raw failed")
+            return web.json_response({"error": "internal error"}, status=500)
 
     async def handle_fs_write(self, request: web.Request) -> web.Response:
         try:

@@ -8,8 +8,11 @@ import pytest
 
 from hub.fs_browser import (
     FsBrowserError,
+    content_type_for,
+    is_image_path,
     list_dir,
     read_text,
+    resolve_file_for_read,
     resolve_sandbox,
     write_text,
 )
@@ -112,15 +115,47 @@ def test_absolute_rel_400(tmp_path: Path) -> None:
     assert exc.value.status == 400
 
 
-def test_root_outside_projects_root_400(tmp_path: Path) -> None:
+def test_root_outside_projects_root_ok(tmp_path: Path) -> None:
+    """Session cwd may live outside projects_root; sandbox is the root itself."""
     projects = tmp_path / "Projects"
     projects.mkdir()
     outside = tmp_path / "Elsewhere"
     outside.mkdir()
+    (outside / "note.txt").write_text("hi", encoding="utf-8")
+
+    assert resolve_sandbox(projects, outside, "") == outside.resolve()
+
+    listed = list_dir(projects, outside)
+    assert any(e["name"] == "note.txt" for e in listed["entries"])
+    assert Path(listed["root"]) == outside.resolve()
+
+    read = read_text(projects, outside, "note.txt")
+    assert read["content"] == "hi"
+
+    write_text(projects, outside, "note.txt", "updated")
+    assert (outside / "note.txt").read_text(encoding="utf-8") == "updated"
+
+
+def test_outside_projects_root_still_sandboxed(tmp_path: Path) -> None:
+    """Paths must still stay under the session root even when outside projects_root."""
+    projects = tmp_path / "Projects"
+    projects.mkdir()
+    outside = tmp_path / "Elsewhere"
+    outside.mkdir()
+    (tmp_path / "secret.txt").write_text("nope", encoding="utf-8")
+
     with pytest.raises(FsBrowserError) as exc:
-        resolve_sandbox(projects, outside, "")
+        resolve_sandbox(projects, outside, "..")
     assert exc.value.status == 400
-    assert "projects" in exc.value.message.lower() or "escape" in exc.value.message.lower()
+    assert "escape" in exc.value.message.lower() or ".." in exc.value.message
+
+    with pytest.raises(FsBrowserError) as exc2:
+        list_dir(projects, outside, "../secret.txt")
+    assert exc2.value.status == 400
+
+    with pytest.raises(FsBrowserError) as exc3:
+        read_text(projects, outside, "../secret.txt")
+    assert exc3.value.status == 400
 
 
 def test_missing_404(tmp_path: Path) -> None:
@@ -201,3 +236,46 @@ def test_resolve_sandbox_root_equal_projects(tmp_path: Path) -> None:
     projects.mkdir()
     got = resolve_sandbox(projects, projects, "")
     assert got == projects.resolve()
+
+
+def test_is_image_path() -> None:
+    assert is_image_path("shot.png")
+    assert is_image_path("photo.JPG")
+    assert is_image_path("a/b/c.webp")
+    assert is_image_path("icon.ICO")
+    assert not is_image_path("notes.txt")
+    assert not is_image_path("readme.md")
+    assert not is_image_path("")
+
+
+def test_resolve_file_for_read_png(tmp_path: Path) -> None:
+    projects, root = _projects_and_root(tmp_path)
+    png = root / "pic.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    got = resolve_file_for_read(projects, root, "pic.png")
+    assert got == png.resolve()
+    assert content_type_for(got) in ("image/png", "application/octet-stream")
+
+
+def test_resolve_file_for_read_escape_blocked(tmp_path: Path) -> None:
+    projects, root = _projects_and_root(tmp_path)
+    with pytest.raises(FsBrowserError) as exc:
+        resolve_file_for_read(projects, root, "../secret.png")
+    assert exc.value.status == 400
+    assert "escape" in exc.value.message.lower() or ".." in exc.value.message
+
+
+def test_resolve_file_for_read_missing_404(tmp_path: Path) -> None:
+    projects, root = _projects_and_root(tmp_path)
+    with pytest.raises(FsBrowserError) as exc:
+        resolve_file_for_read(projects, root, "nope.png")
+    assert exc.value.status == 404
+
+
+def test_resolve_file_for_read_dir_400(tmp_path: Path) -> None:
+    projects, root = _projects_and_root(tmp_path)
+    (root / "imgs").mkdir()
+    with pytest.raises(FsBrowserError) as exc:
+        resolve_file_for_read(projects, root, "imgs")
+    assert exc.value.status == 400
+    assert "file" in exc.value.message.lower()

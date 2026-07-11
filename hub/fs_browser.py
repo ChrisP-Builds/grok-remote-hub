@@ -1,10 +1,13 @@
-"""Sandboxed filesystem browser: list, read, and write under a project root."""
+"""Sandboxed filesystem browser: list, read, and write under a session root."""
 
 from __future__ import annotations
 
+import mimetypes
 import os
 from pathlib import Path
 from typing import Any
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"}
 
 
 class FsBrowserError(Exception):
@@ -12,6 +15,29 @@ class FsBrowserError(Exception):
         super().__init__(message)
         self.message = message
         self.status = status
+
+
+def is_image_path(rel_or_name: str) -> bool:
+    return Path(str(rel_or_name)).suffix.lower() in IMAGE_EXTS
+
+
+def resolve_file_for_read(
+    projects_root: Path, root: str | Path, rel: str
+) -> Path:
+    """Resolve sandboxed path and ensure it is an existing file."""
+    path = resolve_sandbox(projects_root, root, rel)
+    if not path.exists():
+        raise FsBrowserError("not found", 404)
+    if path.is_dir():
+        raise FsBrowserError("not a file", 400)
+    return path
+
+
+def content_type_for(path: Path) -> str:
+    ctype, _ = mimetypes.guess_type(str(path))
+    if ctype:
+        return ctype
+    return "application/octet-stream"
 
 
 def _under(path: Path, root: Path) -> bool:
@@ -38,12 +64,17 @@ def _normalize_rel(rel: str) -> str:
 
 
 def resolve_sandbox(projects_root: Path, root: str | Path, rel: str = "") -> Path:
-    """Resolve a path under root, ensuring root stays under projects_root."""
-    projects_resolved = Path(projects_root).expanduser().resolve()
+    """Resolve a path under session root (cwd).
+
+    Primary sandbox is ``root`` itself: all paths must stay under the resolved
+    session root. ``projects_root`` is kept for call-site compatibility and is
+    not used as a boundary check (session cwd may be outside projects_root).
+    """
+    del projects_root  # API compatibility only; sandbox is session root
     root_resolved = Path(root).expanduser().resolve()
 
-    if not _under(root_resolved, projects_resolved):
-        raise FsBrowserError("root escapes projects root", 400)
+    if not root_resolved.is_absolute():
+        raise FsBrowserError("root must be absolute", 400)
 
     rel_str = "" if rel is None else str(rel)
     if rel_str:
@@ -63,10 +94,10 @@ def resolve_sandbox(projects_root: Path, root: str | Path, rel: str = "") -> Pat
 
 
 def _resolved_root(projects_root: Path, root: str | Path) -> Path:
-    projects_resolved = Path(projects_root).expanduser().resolve()
+    del projects_root  # API compatibility only
     root_resolved = Path(root).expanduser().resolve()
-    if not _under(root_resolved, projects_resolved):
-        raise FsBrowserError("root escapes projects root", 400)
+    if not root_resolved.is_absolute():
+        raise FsBrowserError("root must be absolute", 400)
     return root_resolved
 
 
