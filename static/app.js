@@ -26,6 +26,81 @@
     return true;
   }
 
+  /* UX helpers (mirror hub/ui_ux.py) */
+  function topbarBubbleLines(project, model, path) {
+    const p = String(project || "").trim() || "—";
+    const m = String(model || "").trim() || "—";
+    const pathS = String(path || "").trim() || "—";
+    return [`Project: ${p}`, `Model: ${m}`, `Path: ${pathS}`];
+  }
+
+  function topbarBubbleText(project, model, path) {
+    return topbarBubbleLines(project, model, path).join("\n");
+  }
+
+  function shouldScrollToBottom(stickToBottom, force) {
+    return !!(force || stickToBottom);
+  }
+
+  function residualStatusParts(opts) {
+    const o = opts || {};
+    const pp = Math.max(0, Number(o.plan_pending) || 0);
+    const pr = Math.max(0, Number(o.plan_running) || 0);
+    const pf = Math.max(0, Number(o.plan_failed) || 0);
+    const tp = Math.max(0, Number(o.tool_pending) || 0);
+    const tr = Math.max(0, Number(o.tool_running) || 0);
+    const tf = Math.max(0, Number(o.tool_failed) || 0);
+    const parts = [];
+    const planOpen = pp + pr;
+    const toolOpen = tp + tr;
+    if (planOpen) parts.push("plan " + planOpen + " open");
+    if (pf) parts.push("plan " + pf + " failed");
+    if (toolOpen) parts.push("tool " + toolOpen + " open");
+    if (tf) parts.push("tool " + tf + " failed");
+    return parts;
+  }
+
+  function idleTurnLabel(opts) {
+    const o = opts || {};
+    const parts = ["idle"];
+    const residual = residualStatusParts(o);
+    for (const r of residual) parts.push(r);
+    const model = String(o.model || "").trim();
+    if (model && !residual.length) parts.push(model);
+    return parts.join(" · ");
+  }
+
+  function turnProgressLabel(opts) {
+    const o = opts || {};
+    const running = !!o.running;
+    const model = String(o.model || "").trim();
+    if (!running) {
+      return idleTurnLabel(o);
+    }
+    const parts = o.quiet ? ["quiet"] : ["running"];
+    if (o.elapsed_s != null && o.elapsed_s >= 0) {
+      parts.push(`${Math.floor(o.elapsed_s)}s`);
+    }
+    const q = Number(o.queue) || 0;
+    if (q > 0) parts.push("queue " + q);
+    const tool = String(o.tool || "").trim();
+    if (tool) parts.push(tool);
+    if (model) parts.push(model);
+    return parts.join(" · ");
+  }
+
+  function sessionListProgressHint(opts) {
+    const o = opts || {};
+    if (!o.is_live_turn) return "";
+    const t = String(o.tool || "").trim();
+    return t || "running";
+  }
+
+  function shouldMarkPlanStale(opts) {
+    const o = opts || {};
+    return !o.turn_running && !!o.has_open_or_failed;
+  }
+
   const BUILTIN_SLASH = [
     { name: "new", description: "Start a new session" },
     { name: "compact", description: "Compact conversation history" },
@@ -166,6 +241,9 @@
     wsState: "connecting", // connecting | open | reconnecting | closed
     reconnectAttempt: 0,
     reconnectTimer: null,
+    healthProbeTimer: null,
+    hubReachable: null, // null | true | false (from /health while reconnecting)
+
     status: {
       agent: "down",
       bind: "local",
@@ -181,9 +259,11 @@
     hubSessionIds: [],
     sessionMode: "none", // none | history | live-remote
     attachSwitched: false, // true when live id != viewed foreign history id
+    /** Hub-owned session id for prompts when viewing a different history id */
+    livePromptSessionId: null,
     sessions: [],
     filter: "",
-    sessionKindFilter: "all", // all | standard | subagent
+    sessionKindFilter: "working", // working | subagent | all
     pinnedSessions: [],
     selectedId: null,
     selectedMeta: null,
@@ -201,6 +281,12 @@
     usagePopoverSeg: null,
     usagePopoverPinned: false,
     usageHideTimer: null,
+    /** @type {Map<string, {pane: HTMLElement, stickToBottom: boolean, historyFingerprint: string|null, historyLoaded: boolean, streamBuffers: object, lastToolTitle: string}>} */
+    sessionViews: new Map(),
+    liveTurnSessionId: null,
+    activePane: null,
+    metaPopoverPinned: false,
+    metaHideTimer: null,
     streamBuffers: {
       assistantEl: null,
       thoughtEl: null,
@@ -221,6 +307,7 @@
     _skillsLoaded: false,
     _skillsFetching: false,
     projects: [],
+    pendingUserQuestion: null, // { requestId, sessionId, questions, toolCallId }
     turnStartedAt: 0,
     lastTermLineAt: 0,
     stallTimer: null,
@@ -279,6 +366,7 @@
     btnJumpLatest: $("#btn-jump-latest"),
     emptyMain: $("#empty-main"),
     chatTitle: $("#chat-title"),
+    btnRenameSession: $("#btn-rename-session"),
     chatProject: $("#chat-project"),
     chatModel: $("#chat-model"),
     chatCwd: $("#chat-cwd"),
@@ -300,6 +388,10 @@
     btnEmptyNew: $("#btn-empty-new"),
     app: $("#app"),
     modalNew: $("#modal-new"),
+    modalAskUser: $("#modal-ask-user"),
+    askUserBody: $("#ask-user-body"),
+    btnAskUserSubmit: $("#btn-ask-user-submit"),
+    btnAskUserCancel: $("#btn-ask-user-cancel"),
     projectList: $("#project-list"),
     projectSearch: $("#project-search"),
     projectEmpty: $("#project-empty"),
@@ -321,6 +413,7 @@
     usagePopover: $("#usage-popover"),
     usageSegContext: document.querySelector('[data-usage-seg="context"]'),
     usageSegPlan: document.querySelector('[data-usage-seg="plan"]'),
+    metaPopover: $("#meta-popover"),
   };
 
   function tokenFromQuery() {
@@ -372,52 +465,388 @@
     return parts[parts.length - 1] || p;
   }
 
+  function buildTopbarBubbleText(meta) {
+    meta = meta || {};
+    const cwd = meta.cwd || "";
+    const project = basename(cwd) || (meta.project || "");
+    const model = meta.modelId || meta.model || "";
+    return topbarBubbleText(project, model, cwd);
+  }
+
   function setTopbarSessionMeta(meta) {
     meta = meta || {};
     const title = meta.title || "Remote session";
     if (els.chatTitle) els.chatTitle.textContent = title;
+    if (els.btnRenameSession) {
+      if (state.selectedId) els.btnRenameSession.classList.remove("hidden");
+      else els.btnRenameSession.classList.add("hidden");
+    }
 
     const cwd = meta.cwd || "";
     const project = basename(cwd);
     if (els.chatProject) {
       if (project) {
         els.chatProject.textContent = project;
-        els.chatProject.title = cwd;
         els.chatProject.classList.remove("hidden");
       } else {
         els.chatProject.textContent = "";
-        els.chatProject.removeAttribute("title");
         els.chatProject.classList.add("hidden");
       }
     }
     if (els.chatCwd) {
       els.chatCwd.textContent = cwd;
-      els.chatCwd.title = cwd;
     }
     if (els.chatModel) {
       if (meta.modelId) {
         els.chatModel.textContent = meta.modelId;
-        els.chatModel.title = meta.modelId;
         els.chatModel.classList.remove("hidden");
       } else {
         els.chatModel.textContent = "";
         els.chatModel.classList.add("hidden");
       }
     }
+    if (state.metaPopoverPinned || (els.metaPopover && !els.metaPopover.classList.contains("hidden"))) {
+      refreshMetaPopoverContent();
+    }
   }
 
   function clearTopbarSessionMeta() {
     if (els.chatTitle) els.chatTitle.textContent = "Select a session";
+    if (els.btnRenameSession) els.btnRenameSession.classList.add("hidden");
     if (els.chatProject) {
       els.chatProject.textContent = "";
       els.chatProject.classList.add("hidden");
-      els.chatProject.removeAttribute("title");
     }
     if (els.chatCwd) els.chatCwd.textContent = "";
     if (els.chatModel) {
       els.chatModel.textContent = "";
       els.chatModel.classList.add("hidden");
     }
+    hideMetaPopover();
+  }
+
+  function clearMetaHideTimer() {
+    if (state.metaHideTimer) {
+      clearTimeout(state.metaHideTimer);
+      state.metaHideTimer = null;
+    }
+  }
+
+  function setMetaChipExpanded(on) {
+    for (const el of [els.chatProject, els.chatModel, els.chatCwd]) {
+      if (!el) continue;
+      el.setAttribute("aria-expanded", on ? "true" : "false");
+    }
+  }
+
+  function refreshMetaPopoverContent() {
+    if (!els.metaPopover) return;
+    const meta = state.selectedMeta || {};
+    const cwd = meta.cwd || "";
+    const project = basename(cwd) || meta.project || "—";
+    const model = meta.modelId || meta.model || "—";
+    const path = cwd || "—";
+    // Structured HTML for clearer bubble (still plain text-safe via textContent)
+    els.metaPopover.innerHTML = "";
+    const rows = [
+      ["Project", project],
+      ["Model", model],
+      ["Path", path],
+    ];
+    for (const [k, v] of rows) {
+      const line = document.createElement("div");
+      line.className = "meta-pop-line";
+      const keyEl = document.createElement("span");
+      keyEl.className = "meta-pop-k";
+      keyEl.textContent = k + ":";
+      const valEl = document.createElement("span");
+      valEl.className = "meta-pop-v";
+      valEl.textContent = v;
+      line.append(keyEl, valEl);
+      els.metaPopover.appendChild(line);
+    }
+  }
+
+  function positionMetaPopover(anchorEl) {
+    if (!els.metaPopover || !anchorEl) return;
+    const pad = 8;
+    const maxW = Math.min(380, window.innerWidth * 0.92);
+    els.metaPopover.style.maxWidth = `${maxW}px`;
+    els.metaPopover.classList.remove("hidden");
+    // Force layout so size is real (was 0 while display:none)
+    const popW = Math.min(Math.max(els.metaPopover.offsetWidth || 0, 160), maxW);
+    const popH = els.metaPopover.offsetHeight || 48;
+    const anchorRect = anchorEl.getBoundingClientRect();
+    let left = anchorRect.left;
+    if (left + popW > window.innerWidth - pad) left = window.innerWidth - pad - popW;
+    if (left < pad) left = pad;
+    let top = anchorRect.bottom + 6;
+    if (top + popH > window.innerHeight - pad && anchorRect.top > popH + pad) {
+      top = anchorRect.top - popH - 6;
+    }
+    els.metaPopover.style.left = `${Math.round(left)}px`;
+    els.metaPopover.style.top = `${Math.round(top)}px`;
+  }
+
+  function showMetaPopover(anchorEl) {
+    if (!els.metaPopover) {
+      els.metaPopover = document.getElementById("meta-popover");
+    }
+    if (!els.metaPopover) return;
+    const meta = state.selectedMeta || {};
+    if (!state.selectedId && !(meta.cwd || meta.modelId)) return;
+    clearMetaHideTimer();
+    refreshMetaPopoverContent();
+    setMetaChipExpanded(true);
+    const anchor =
+      anchorEl ||
+      (els.chatProject && !els.chatProject.classList.contains("hidden") && els.chatProject) ||
+      (els.chatModel && !els.chatModel.classList.contains("hidden") && els.chatModel) ||
+      els.chatCwd;
+    if (!anchor) return;
+    positionMetaPopover(anchor);
+  }
+
+  function hideMetaPopover() {
+    clearMetaHideTimer();
+    state.metaPopoverPinned = false;
+    setMetaChipExpanded(false);
+    if (els.metaPopover) {
+      els.metaPopover.classList.add("hidden");
+      els.metaPopover.innerHTML = "";
+    }
+  }
+
+  function toggleMetaPopover(anchorEl) {
+    const open =
+      state.metaPopoverPinned &&
+      els.metaPopover &&
+      !els.metaPopover.classList.contains("hidden");
+    if (open) {
+      hideMetaPopover();
+      return;
+    }
+    state.metaPopoverPinned = true;
+    showMetaPopover(anchorEl);
+  }
+
+  function scheduleHideMetaPopover() {
+    clearMetaHideTimer();
+    if (state.metaPopoverPinned) return;
+    state.metaHideTimer = setTimeout(() => {
+      state.metaHideTimer = null;
+      if (!state.metaPopoverPinned) hideMetaPopover();
+    }, 220);
+  }
+
+  function bindMetaPopoverEvents() {
+    // Re-resolve in case DOM moved
+    if (!els.metaPopover) els.metaPopover = document.getElementById("meta-popover");
+    const chips = [els.chatProject, els.chatModel, els.chatCwd].filter(Boolean);
+    for (const el of chips) {
+      el.addEventListener("mouseenter", () => {
+        if (state.metaPopoverPinned) return;
+        showMetaPopover(el);
+      });
+      el.addEventListener("mouseleave", () => {
+        scheduleHideMetaPopover();
+      });
+      el.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleMetaPopover(el);
+      });
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          toggleMetaPopover(el);
+        }
+      });
+      el.addEventListener("focus", () => {
+        if (state.metaPopoverPinned) return;
+        showMetaPopover(el);
+      });
+    }
+    if (els.metaPopover) {
+      els.metaPopover.addEventListener("mouseenter", () => {
+        clearMetaHideTimer();
+      });
+      els.metaPopover.addEventListener("mouseleave", () => {
+        scheduleHideMetaPopover();
+      });
+    }
+    document.addEventListener("click", (e) => {
+      if (!els.metaPopover || els.metaPopover.classList.contains("hidden")) return;
+      const t = e.target;
+      if (chips.some((c) => c && c.contains(t))) return;
+      if (els.metaPopover.contains(t)) return;
+      hideMetaPopover();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && els.metaPopover && !els.metaPopover.classList.contains("hidden")) {
+        hideMetaPopover();
+      }
+    });
+    window.addEventListener("resize", () => {
+      if (!els.metaPopover || els.metaPopover.classList.contains("hidden")) return;
+      const anchor =
+        (els.chatProject && !els.chatProject.classList.contains("hidden") && els.chatProject) ||
+        (els.chatModel && !els.chatModel.classList.contains("hidden") && els.chatModel) ||
+        els.chatCwd;
+      if (anchor) positionMetaPopover(anchor);
+    });
+  }
+
+  function sessionTooltip(s) {
+    const lines = [
+      `Project: ${basename(s.cwd) || "—"}`,
+      `Model: ${s.modelId || "—"}`,
+      `Path: ${s.cwd || "—"}`,
+    ];
+    if (s.agentName) {
+      lines.splice(1, 0, `Agent: ${s.agentName}`);
+    }
+    return lines.join("\n");
+  }
+
+  let renameInFlight = false;
+
+  function applyLocalRename(sessionId, item) {
+    const title = (item && item.title) || "";
+    const idx = state.sessions.findIndex((s) => s.sessionId === sessionId);
+    if (idx >= 0) {
+      state.sessions[idx] = { ...state.sessions[idx], ...item, title };
+    }
+    if (state.selectedId === sessionId) {
+      if (state.selectedMeta) {
+        state.selectedMeta = { ...state.selectedMeta, ...item, title };
+      }
+      if (els.chatTitle && !els.chatTitle.querySelector("input")) {
+        els.chatTitle.textContent = title || "Untitled session";
+      }
+    }
+    renderSessions();
+  }
+
+  async function commitRenameSession(sessionId, nextTitle, prevTitle) {
+    const cleaned = String(nextTitle || "").trim();
+    if (!cleaned) {
+      toast("Title cannot be empty", "danger");
+      return false;
+    }
+    if (cleaned === String(prevTitle || "").trim()) return true;
+    if (renameInFlight) return false;
+    renameInFlight = true;
+    try {
+      const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}`), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: cleaned }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(data.error || "Rename failed", "danger");
+        return false;
+      }
+      if (data.item) applyLocalRename(sessionId, data.item);
+      else applyLocalRename(sessionId, { title: cleaned });
+      return true;
+    } catch (err) {
+      toast("Rename failed: " + err, "danger");
+      return false;
+    } finally {
+      renameInFlight = false;
+    }
+  }
+
+  function startRenameSession(sessionId, currentTitle, anchorEl) {
+    if (!sessionId || !anchorEl) return;
+    if (anchorEl.querySelector && anchorEl.querySelector(".session-rename-input")) return;
+    if (anchorEl.classList && anchorEl.classList.contains("session-rename-input")) return;
+
+    const isTitleNode =
+      anchorEl.classList &&
+      (anchorEl.classList.contains("title") || anchorEl.id === "chat-title");
+    const host = isTitleNode ? anchorEl : anchorEl;
+    const prev = String(currentTitle || "").trim() || "Untitled session";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "session-rename-input";
+    input.value = prev;
+    input.setAttribute("aria-label", "Rename session");
+    input.maxLength = 200;
+
+    let finished = false;
+    const row = host.closest ? host.closest(".session-row") : null;
+    if (row) row.classList.add("renaming");
+
+    const restore = (text) => {
+      if (host.id === "chat-title") {
+        host.textContent = text;
+        if (els.btnRenameSession) els.btnRenameSession.classList.remove("hidden");
+      } else if (host.classList && host.classList.contains("title")) {
+        host.textContent = text;
+      } else if (input.parentNode) {
+        input.replaceWith(document.createTextNode(text));
+      }
+      if (row) row.classList.remove("renaming");
+    };
+
+    const finish = async (save) => {
+      if (finished) return;
+      finished = true;
+      const next = input.value;
+      input.removeEventListener("keydown", onKey);
+      input.removeEventListener("blur", onBlur);
+      if (!save) {
+        restore(prev);
+        return;
+      }
+      const cleaned = String(next || "").trim();
+      if (!cleaned) {
+        restore(prev);
+        toast("Title cannot be empty", "danger");
+        return;
+      }
+      restore(cleaned);
+      const ok = await commitRenameSession(sessionId, cleaned, prev);
+      if (!ok) restore(prev);
+    };
+
+    const onKey = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(true);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        finish(false);
+      }
+      e.stopPropagation();
+    };
+    const onBlur = () => {
+      finish(true);
+    };
+
+    input.addEventListener("keydown", onKey);
+    input.addEventListener("blur", onBlur);
+    input.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+
+    if (host.id === "chat-title" || (host.classList && host.classList.contains("title"))) {
+      host.textContent = "";
+      host.appendChild(input);
+      if (host.id === "chat-title" && els.btnRenameSession) {
+        els.btnRenameSession.classList.add("hidden");
+      }
+    } else {
+      host.replaceWith(input);
+    }
+    input.focus();
+    input.select();
   }
 
   function truncate(s, limit = 120) {
@@ -573,7 +1002,14 @@
     els.sessionBanner.classList.remove("hidden");
     els.sessionBanner.dataset.mode = mode;
     if (mode === "live-remote") {
-      if (state.attachSwitched) {
+      if (
+        state.attachSwitched &&
+        state.livePromptSessionId &&
+        state.livePromptSessionId !== state.selectedId
+      ) {
+        els.sessionBannerText.textContent =
+          "Viewing this session’s history. Chat sends to the project’s live hub session (TUI stays separate).";
+      } else if (state.attachSwitched) {
         els.sessionBannerText.textContent =
           "Live remote session for this project. Desktop TUI history is separate.";
       } else {
@@ -581,8 +1017,20 @@
       }
     } else {
       els.sessionBannerText.textContent =
-        "Viewing saved history. Attach starts a live remote session (desktop TUI stays separate).";
+        "Viewing saved history. Sending a message uses a live hub session for this project.";
     }
+  }
+
+  /** Session id used for prompts (may differ from selected when attach remapped). */
+  function promptSessionId() {
+    if (
+      state.livePromptSessionId &&
+      state.selectedId &&
+      state.livePromptSessionId !== state.selectedId
+    ) {
+      return state.livePromptSessionId;
+    }
+    return state.selectedId;
   }
 
   function isHubCreatedSession(sessionId) {
@@ -598,8 +1046,20 @@
     let text = "Connecting";
 
     if (state.wsState === "reconnecting" || state.wsState === "connecting") {
-      stateKey = state.wsState === "reconnecting" ? "reconnecting" : "connecting";
-      text = state.wsState === "reconnecting" ? "Reconnecting" : "Connecting";
+      // After several failed WS opens (or /health says down), stop saying only "Reconnecting".
+      const hubDown =
+        state.wsState === "reconnecting" &&
+        (state.reconnectAttempt >= 3 || state.hubReachable === false);
+      if (hubDown) {
+        stateKey = "hub-down";
+        text =
+          state.hubReachable === false
+            ? "Hub unreachable: run start-hub.ps1"
+            : "Hub down";
+      } else {
+        stateKey = state.wsState === "reconnecting" ? "reconnecting" : "connecting";
+        text = state.wsState === "reconnecting" ? "Reconnecting" : "Connecting";
+      }
     } else if (state.wsState === "open") {
       if (state.status.agent !== "up") {
         stateKey = "agent-down";
@@ -625,35 +1085,142 @@
   // Auto unlock/reset-turn is disabled (CLIENT_STALL_UNLOCK_SECONDS = 0).
   const CLIENT_STALL_WARN_MS = 120000;
 
+  function liveTurnId() {
+    return (
+      state.liveTurnSessionId ||
+      (state.status && state.status.turnSessionId) ||
+      null
+    );
+  }
+
+  function turnRunningOnSelected() {
+    if (!state.turnRunning || !state.selectedId) return false;
+    const live = liveTurnId();
+    return !live || live === state.selectedId;
+  }
+
+  function toolTitleForSession(sessionId) {
+    if (!sessionId) return "";
+    if (sessionId === state.selectedId && state.streamBuffers) {
+      return state.streamBuffers.lastToolTitle || "";
+    }
+    const v = state.sessionViews.get(sessionId);
+    if (v && v.streamBuffers) return v.streamBuffers.lastToolTitle || "";
+    if (v) return v.lastToolTitle || "";
+    return "";
+  }
+
+  function countResidualInPane(pane) {
+    const counts = {
+      plan_pending: 0,
+      plan_running: 0,
+      plan_failed: 0,
+      tool_pending: 0,
+      tool_running: 0,
+      tool_failed: 0,
+    };
+    if (!pane) return counts;
+    const planItems = pane.querySelectorAll(".plan-item");
+    for (const li of planItems) {
+      const st = normalizeStatus(li.dataset.status || "");
+      if (st === "pending" || st === "in_progress") counts.plan_pending += 1;
+      else if (st === "running") counts.plan_running += 1;
+      else if (st === "failed" || st === "error") counts.plan_failed += 1;
+    }
+    const tools = pane.querySelectorAll("details.term-line.tool, .term-line.tool");
+    for (const row of tools) {
+      const st = normalizeStatus(row.dataset.status || "");
+      if (st === "pending" || st === "in_progress") counts.tool_pending += 1;
+      else if (st === "running") counts.tool_running += 1;
+      else if (st === "failed" || st === "error") counts.tool_failed += 1;
+    }
+    return counts;
+  }
+
+  function markStalePlanItems(pane, stale) {
+    if (!pane) return;
+    const items = pane.querySelectorAll(".plan-item");
+    for (const li of items) {
+      const st = normalizeStatus(li.dataset.status || "");
+      const open =
+        st === "pending" ||
+        st === "running" ||
+        st === "in_progress" ||
+        st === "failed" ||
+        st === "error";
+      if (stale && open) li.classList.add("stale");
+      else li.classList.remove("stale");
+    }
+    const tools = pane.querySelectorAll("details.term-line.tool, .term-line.tool");
+    for (const row of tools) {
+      const st = normalizeStatus(row.dataset.status || "");
+      const open =
+        st === "pending" ||
+        st === "running" ||
+        st === "in_progress" ||
+        st === "failed" ||
+        st === "error";
+      if (stale && open) row.classList.add("stale");
+      else row.classList.remove("stale");
+    }
+  }
+
   function updateTurnStrip() {
     if (!els.turnStrip || !els.turnStripText) return;
-    const running = !!state.turnRunning && !!state.selectedId;
+    const running = turnRunningOnSelected();
     const model =
       (state.selectedMeta && state.selectedMeta.modelId) ||
       (els.chatModel && !els.chatModel.classList.contains("hidden") ? els.chatModel.textContent : "") ||
       "";
-    const tool = (state.streamBuffers && state.streamBuffers.lastToolTitle) || "";
+    // Always label from the selected session (not a temporary offscreen target).
+    const tool = toolTitleForSession(state.selectedId);
     const idleMs = running
       ? Date.now() - (state.lastTermLineAt || state.turnStartedAt || Date.now())
       : 0;
     // Visual quiet cue only — never unlocks or ends the turn.
     const quietVisual = running && idleMs >= CLIENT_STALL_WARN_MS;
+    const elapsedS = running
+      ? Math.floor((Date.now() - (state.turnStartedAt || Date.now())) / 1000)
+      : 0;
+
+    const pane =
+      (state.activePane && !state.activePane.hidden && state.activePane) ||
+      (state.selectedId && state.sessionViews.get(state.selectedId)
+        ? state.sessionViews.get(state.selectedId).pane
+        : null);
+    const residual = countResidualInPane(pane);
+    const hasResidual =
+      residual.plan_pending +
+        residual.plan_running +
+        residual.plan_failed +
+        residual.tool_pending +
+        residual.tool_running +
+        residual.tool_failed >
+      0;
 
     if (running) {
       els.turnStrip.dataset.state = quietVisual ? "stalled" : "running";
-      const parts = ["running"];
-      const q = state.promptQueueLength || 0;
-      if (q > 0) parts.push("queue " + q);
-      if (tool) parts.push(tool);
-      if (model) parts.push(model);
-      els.turnStripText.textContent = parts.join(" · ");
+      els.turnStripText.textContent = turnProgressLabel({
+        running: true,
+        tool,
+        queue: state.promptQueueLength || 0,
+        model,
+        quiet: quietVisual,
+        elapsed_s: elapsedS,
+      });
       if (els.turnStripCursor) els.turnStripCursor.classList.remove("hidden");
+      markStalePlanItems(pane, false);
     } else {
-      els.turnStrip.dataset.state = "idle";
-      const parts = ["idle"];
-      if (model && state.selectedId) parts.push(model);
-      els.turnStripText.textContent = parts.join(" · ");
+      els.turnStrip.dataset.state = hasResidual ? "residual" : "idle";
+      els.turnStripText.textContent = idleTurnLabel({
+        model: state.selectedId ? model : "",
+        ...residual,
+      });
       if (els.turnStripCursor) els.turnStripCursor.classList.add("hidden");
+      markStalePlanItems(
+        pane,
+        shouldMarkPlanStale({ turn_running: false, has_open_or_failed: hasResidual })
+      );
     }
   }
 
@@ -693,16 +1260,19 @@
       if (allowType) els.btnSend.removeAttribute("disabled");
     }
     if (els.btnStop) {
-      els.btnStop.classList.toggle("hidden", !state.turnRunning || !state.selectedId);
+      els.btnStop.classList.toggle("hidden", !turnRunningOnSelected());
     }
     if (!state.selectedId) {
       els.composerHint.textContent =
         "Remote agent stream. Load a session to chat; desktop TUI stays separate.";
-    } else if (state.turnRunning) {
+    } else if (turnRunningOnSelected()) {
       const q = state.promptQueueLength || 0;
       els.composerHint.textContent = q
         ? `Turn running · ${q} queued. Send adds to queue.`
         : "Turn running · Send queues your next message.";
+    } else if (state.turnRunning && liveTurnId() && liveTurnId() !== state.selectedId) {
+      els.composerHint.textContent =
+        "Another session has a live turn. You can switch back anytime.";
     } else if (state.sessionMode === "history") {
       els.composerHint.textContent =
         "History view. Opening attaches a live remote session (not the desktop TUI).";
@@ -742,7 +1312,7 @@
       const idleMs = Date.now() - (state.lastTermLineAt || state.turnStartedAt || Date.now());
       updateTurnStrip();
       // Soft warn only (TUI-aligned): never reset-turn or unlock the client.
-      if (!state.stallWarned && idleMs >= CLIENT_STALL_WARN_MS) {
+      if (!state.stallWarned && idleMs >= CLIENT_STALL_WARN_MS && turnRunningOnSelected()) {
         state.stallWarned = true;
         toast(
           "Still working (like desktop TUI). Use Stop to cancel.",
@@ -750,7 +1320,15 @@
         );
         setComposerEnabled(composerConnected());
       }
-    }, 2000);
+    }, 1000);
+  }
+
+  function markThoughtComplete(buffers) {
+    if (!buffers || !buffers.thoughtEl) return;
+    const el = buffers.thoughtEl;
+    // Leave open so user can still read; only update the label.
+    const label = el.querySelector && el.querySelector(".thought-summary-label");
+    if (label) label.textContent = "thinking";
   }
 
   function setTurnRunning(running) {
@@ -759,15 +1337,60 @@
       startStallWatch();
     } else {
       clearStallWatch();
-      if (state.streamBuffers) state.streamBuffers.lastToolTitle = "";
+      if (state.streamBuffers) {
+        state.streamBuffers.lastToolTitle = "";
+        markThoughtComplete(state.streamBuffers);
+      }
+      const live = liveTurnId();
+      if (live) {
+        const v = state.sessionViews.get(live);
+        if (v) {
+          v.lastToolTitle = "";
+          if (v.streamBuffers) {
+            v.streamBuffers.lastToolTitle = "";
+            markThoughtComplete(v.streamBuffers);
+          }
+        }
+      }
+      state.liveTurnSessionId = null;
     }
     setComposerEnabled(composerConnected());
     forceComposerUnlocked();
+    updateTurnStrip();
+    renderSessions();
   }
 
   async function applySessionSwitch(fromId, toId, reason, message) {
     if (!toId) return;
     const from = fromId || state.selectedId;
+    if (state.hubSessionIds.indexOf(toId) < 0) {
+      state.hubSessionIds = [toId, ...state.hubSessionIds].slice(0, 50);
+    }
+
+    // User is viewing a session they chose: do not steal focus to empty live id.
+    // Map prompts to the live hub session while keeping history on screen.
+    if (
+      state.selectedId &&
+      from &&
+      from !== toId &&
+      state.selectedId === from &&
+      reason !== "force_ui_switch"
+    ) {
+      state.livePromptSessionId = toId;
+      setSessionMode("live-remote", { attachSwitched: true });
+      subscribeSessionIds(state.selectedId, toId, liveTurnId());
+      toast(message || "Live hub session ready — still showing this session’s history", "");
+      updateSessionBanner();
+      renderSessions();
+      return;
+    }
+    // Already on a different session than the switch source — only record live id.
+    if (state.selectedId && from && state.selectedId !== from && state.selectedId !== toId) {
+      state.livePromptSessionId = toId;
+      subscribeSessionIds(state.selectedId, toId, liveTurnId());
+      return;
+    }
+
     toast(message || "Remote session started for live streaming", "");
     // Prefer meta from list; fall back to previous cwd
     let meta = state.sessions.find((s) => s.sessionId === toId);
@@ -779,19 +1402,24 @@
         updatedAt: new Date().toISOString(),
         modelId: (state.selectedMeta && state.selectedMeta.modelId) || "",
         path: "",
+        isWorking: true,
       };
       state.sessions = [meta, ...state.sessions.filter((s) => s.sessionId !== toId)];
     }
+    if (from && from !== toId) {
+      cacheSessionView(from);
+    }
     state.selectedId = toId;
     state.selectedMeta = meta;
+    state.livePromptSessionId = toId;
     // Keep prior commands until agent sends a fresh list; builtins fill gaps.
-    state.streamBuffers = emptyStreamBuffers();
+    const v = showSessionPane(toId);
+    v.streamBuffers = emptyStreamBuffers();
+    state.streamBuffers = v.streamBuffers;
     state.historyLoadedFor = null;
     state.historyFingerprint = null;
-    // Hub-created remote session is live stream, not disk history
-    if (state.hubSessionIds.indexOf(toId) < 0) {
-      state.hubSessionIds = [toId, ...state.hubSessionIds].slice(0, 50);
-    }
+    v.historyFingerprint = null;
+    v.historyLoaded = false;
     setSessionMode("live-remote", {
       attachSwitched: !!(from && from !== toId),
     });
@@ -900,12 +1528,74 @@
     renderSessions();
   }
 
+  function unpinSession(id) {
+    const pins = (state.pinnedSessions || []).slice();
+    const i = pins.indexOf(id);
+    if (i < 0) return;
+    pins.splice(i, 1);
+    state.pinnedSessions = pins;
+    savePins(pins);
+  }
+
+  async function deleteSessionFromList(session) {
+    if (!session || !session.sessionId) return;
+    const id = session.sessionId;
+    const title = session.title || "Untitled session";
+    if (
+      !window.confirm(
+        `Delete session "${title}"? This removes it from disk and cannot be undone.`
+      )
+    ) {
+      return;
+    }
+    try {
+      const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(id)}`), {
+        method: "DELETE",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(data.error || "Delete failed", "danger");
+        return;
+      }
+      state.sessions = (state.sessions || []).filter((s) => s.sessionId !== id);
+      unpinSession(id);
+      const view = state.sessionViews.get(id);
+      if (view && view.pane && view.pane.parentNode) {
+        view.pane.parentNode.removeChild(view.pane);
+      }
+      state.sessionViews.delete(id);
+      if (state.selectedId === id) {
+        state.selectedId = null;
+        state.selectedMeta = null;
+        state.activePane = null;
+        state.historyLoadedFor = null;
+        state.historyFingerprint = null;
+        setSessionMode("none");
+        clearTopbarSessionMeta();
+        showEmptyMain(true);
+      }
+      renderSessions();
+      toast("Session deleted", "");
+    } catch (err) {
+      toast("Delete failed: " + err, "danger");
+    }
+  }
+
+  function isWorkingSession(s) {
+    if (s.isWorking === false) return false;
+    if (s.isWorking === true) return true;
+    // Old payloads without isWorking: treat as working when not subagent
+    return !s.isSubagent;
+  }
+
   function renderSessions() {
     const q = state.filter.trim().toLowerCase();
     const items = state.sessions
       .filter((s) => {
         if (state.sessionKindFilter === "subagent" && !s.isSubagent) return false;
-        if (state.sessionKindFilter === "standard" && s.isSubagent) return false;
+        if (state.sessionKindFilter === "working" && !isWorkingSession(s)) return false;
+        // "standard" legacy storage maps to working in init
+        if (state.sessionKindFilter === "standard" && !isWorkingSession(s)) return false;
         if (!q) return true;
         return (
           (s.title || "").toLowerCase().includes(q) ||
@@ -947,8 +1637,15 @@
       btn.type = "button";
       btn.className = "session-row" + (pinned ? " pinned" : "");
       btn.setAttribute("role", "listitem");
+      btn.title = sessionTooltip(s);
       if (s.sessionId === state.selectedId) btn.classList.add("active");
       if (s.sessionId === state.status.loadedSessionId) btn.classList.add("live");
+      const isLiveTurn =
+        !!state.turnRunning &&
+        !!s.sessionId &&
+        (s.sessionId === liveTurnId() ||
+          s.sessionId === state.status.turnSessionId);
+      if (isLiveTurn) btn.classList.add("turn-live");
 
       const bar = document.createElement("span");
       bar.className = "live-bar";
@@ -968,6 +1665,16 @@
         pill.className = "session-pill subagent";
         pill.textContent = "subagent";
         titleRow.appendChild(pill);
+      } else if (s.isHubRemote) {
+        const pill = document.createElement("span");
+        pill.className = "session-pill live";
+        pill.textContent = "live";
+        titleRow.appendChild(pill);
+      } else if (s.isNoise && state.sessionKindFilter === "all") {
+        const pill = document.createElement("span");
+        pill.className = "session-pill noise";
+        pill.textContent = "noise";
+        titleRow.appendChild(pill);
       }
 
       const meta = document.createElement("span");
@@ -975,16 +1682,49 @@
       const proj = document.createElement("span");
       proj.textContent = basename(s.cwd) || "project";
       meta.appendChild(proj);
-      if (s.isSubagent && s.agentName) {
+      if (s.agentName) {
         const agent = document.createElement("span");
         agent.textContent = s.agentName;
         meta.appendChild(agent);
+      }
+      const hint = sessionListProgressHint({
+        is_live_turn: isLiveTurn,
+        tool: toolTitleForSession(s.sessionId),
+      });
+      if (hint) {
+        const turnHint = document.createElement("span");
+        turnHint.className = "turn-hint";
+        turnHint.textContent = hint;
+        meta.appendChild(turnHint);
       }
       const time = document.createElement("span");
       time.textContent = relativeTime(s.updatedAt);
       meta.appendChild(time);
 
       body.append(titleRow, meta);
+
+      const actions = document.createElement("span");
+      actions.className = "session-actions";
+
+      const renameBtn = document.createElement("span");
+      renameBtn.className = "session-rename-btn";
+      renameBtn.setAttribute("role", "button");
+      renameBtn.tabIndex = 0;
+      renameBtn.setAttribute("aria-label", "Rename session");
+      renameBtn.title = "Rename";
+      renameBtn.textContent = "✎";
+      renameBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        startRenameSession(s.sessionId, s.title || "Untitled session", title);
+      });
+      renameBtn.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          startRenameSession(s.sessionId, s.title || "Untitled session", title);
+        }
+      });
 
       const pin = document.createElement("span");
       pin.className = "session-pin";
@@ -1006,8 +1746,41 @@
         }
       });
 
-      btn.append(bar, body, pin);
-      btn.addEventListener("click", () => openSession(s));
+      const delBtn = document.createElement("span");
+      delBtn.className = "session-delete-btn";
+      delBtn.setAttribute("role", "button");
+      delBtn.tabIndex = 0;
+      delBtn.setAttribute("aria-label", "Delete session");
+      delBtn.title = "Delete";
+      delBtn.textContent = "🗑";
+      delBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        deleteSessionFromList(s);
+      });
+      delBtn.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          deleteSessionFromList(s);
+        }
+      });
+
+      actions.append(renameBtn, pin, delBtn);
+      btn.append(bar, body, actions);
+      btn.addEventListener("click", (e) => {
+        if (btn.classList.contains("renaming")) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        if (e.target && e.target.closest && e.target.closest(".session-rename-input")) {
+          e.preventDefault();
+          e.stopPropagation();
+          return;
+        }
+        openSession(s);
+      });
       els.sessionList.appendChild(btn);
     }
   }
@@ -1024,22 +1797,155 @@
     };
   }
 
+  function transcriptRoot() {
+    return state.activePane || els.transcript;
+  }
+
+  function getSessionPane(sessionId) {
+    let v = state.sessionViews.get(sessionId);
+    if (!v) {
+      const pane = document.createElement("div");
+      pane.className = "session-pane";
+      pane.dataset.sessionId = sessionId;
+      v = {
+        pane,
+        stickToBottom: true,
+        historyFingerprint: null,
+        historyLoaded: false,
+        streamBuffers: emptyStreamBuffers(),
+        lastToolTitle: "",
+      };
+      state.sessionViews.set(sessionId, v);
+    }
+    return v;
+  }
+
+  function rebuildToolsFromPane(v) {
+    if (!v || !v.pane || !v.streamBuffers) return;
+    const tools = new Map();
+    const rows = v.pane.querySelectorAll("[data-tool-call-id]");
+    for (const row of rows) {
+      const id = row.getAttribute("data-tool-call-id");
+      if (id) tools.set(id, row);
+    }
+    v.streamBuffers.tools = tools;
+    // Recover live stream refs when possible
+    const lastAssistant = v.pane.querySelector(".term-line.assistant:last-of-type");
+    if (lastAssistant) v.streamBuffers.assistantEl = lastAssistant;
+    const lastThought = v.pane.querySelector("details.term-line.thought:last-of-type");
+    if (lastThought) v.streamBuffers.thoughtEl = lastThought;
+    const lastPlan = v.pane.querySelector("details.term-line.plan:last-of-type");
+    if (lastPlan) v.streamBuffers.planEl = lastPlan;
+  }
+
+  function cacheSessionView(sessionId) {
+    if (!sessionId) return;
+    const v = getSessionPane(sessionId);
+    if (state.activePane === v.pane || state.selectedId === sessionId) {
+      v.stickToBottom = !!state.stickToBottom;
+      v.historyFingerprint = state.historyFingerprint;
+      v.historyLoaded = state.historyLoadedFor === sessionId;
+      if (state.streamBuffers) {
+        v.streamBuffers = state.streamBuffers;
+        v.lastToolTitle = state.streamBuffers.lastToolTitle || "";
+      }
+    } else if (v.streamBuffers) {
+      v.lastToolTitle = v.streamBuffers.lastToolTitle || v.lastToolTitle || "";
+    }
+  }
+
+  function showSessionPane(sessionId) {
+    const wrap = els.transcript;
+    if (!wrap) return getSessionPane(sessionId);
+    const em = $("#empty-main", wrap);
+    if (em) em.hidden = true;
+    for (const child of [...wrap.querySelectorAll(".session-pane")]) {
+      child.hidden = child.dataset.sessionId !== sessionId;
+    }
+    const v = getSessionPane(sessionId);
+    if (!v.pane.parentNode) wrap.appendChild(v.pane);
+    v.pane.hidden = false;
+    rebuildToolsFromPane(v);
+    state.streamBuffers = v.streamBuffers;
+    state.activePane = v.pane;
+    state.stickToBottom = v.stickToBottom !== false;
+    // Pane swap changes layout width; pin X so the view does not lurch sideways.
+    wrap.scrollLeft = 0;
+    clampHorizontalScroll();
+    return v;
+  }
+
+  function withSessionTarget(sessionId, fn) {
+    if (!sessionId) return fn(null);
+    if (sessionId === state.selectedId && state.activePane) {
+      return fn(getSessionPane(sessionId));
+    }
+    const v = getSessionPane(sessionId);
+    if (!v.pane.parentNode && els.transcript) {
+      els.transcript.appendChild(v.pane);
+      v.pane.hidden = sessionId !== state.selectedId;
+    }
+    const prevPane = state.activePane;
+    const prevBuf = state.streamBuffers;
+    const prevStick = state.stickToBottom;
+    state.activePane = v.pane;
+    state.streamBuffers = v.streamBuffers;
+    // Never scroll the visible transcript while writing an offscreen pane.
+    state.stickToBottom = false;
+    try {
+      return fn(v);
+    } finally {
+      v.lastToolTitle =
+        (v.streamBuffers && v.streamBuffers.lastToolTitle) || v.lastToolTitle || "";
+      state.activePane = prevPane;
+      state.streamBuffers = prevBuf;
+      state.stickToBottom = prevStick;
+    }
+  }
+
   function clearTranscript() {
-    els.transcript.innerHTML = "";
-    state.streamBuffers = emptyStreamBuffers();
+    const root = transcriptRoot();
+    if (root && root.classList && root.classList.contains("session-pane")) {
+      root.innerHTML = "";
+    } else if (els.transcript) {
+      // Preserve session panes; clear only non-pane nodes.
+      for (const child of [...els.transcript.childNodes]) {
+        if (child.nodeType === 1 && child.classList && child.classList.contains("session-pane")) {
+          continue;
+        }
+        child.remove();
+      }
+    }
+    if (state.selectedId) {
+      const v = getSessionPane(state.selectedId);
+      v.streamBuffers = emptyStreamBuffers();
+      state.streamBuffers = v.streamBuffers;
+      v.historyFingerprint = null;
+      v.historyLoaded = false;
+    } else {
+      state.streamBuffers = emptyStreamBuffers();
+    }
   }
 
   function showEmptyMain(show) {
     if (show) {
-      if (!$("#empty-main", els.transcript)) {
-        const wrap = document.createElement("div");
+      // Hide panes; show empty card in transcript shell
+      if (els.transcript) {
+        for (const pane of els.transcript.querySelectorAll(".session-pane")) {
+          pane.hidden = true;
+        }
+      }
+      state.activePane = null;
+      let wrap = $("#empty-main", els.transcript);
+      if (!wrap) {
+        wrap = document.createElement("div");
         wrap.id = "empty-main";
         wrap.className = "empty-main";
         wrap.innerHTML = `
           <div class="empty-card">
-            <h2>$ attach stream</h2>
-            <p class="empty-sub">Remote agent stream over Tailscale</p>
-            <p>Open a session to attach the stream, or start a new one in a project folder.</p>
+            <h2>No session selected</h2>
+            <p class="empty-sub">Pick a chat from the sidebar, or start a new one.</p>
+            <p>Your project sessions appear under Working. Subagent runs are under Subagent.</p>
             <div class="empty-actions">
               <button type="button" id="btn-empty-sessions" class="btn btn-ghost">Browse sessions</button>
               <button type="button" id="btn-empty-new" class="btn btn-accent">New session</button>
@@ -1049,11 +1955,12 @@
         $("#btn-empty-sessions", wrap).addEventListener("click", openRail);
         $("#btn-empty-new", wrap).addEventListener("click", openNewModal);
       }
+      wrap.hidden = false;
       setSessionMode("none");
       syncBrowseSessionsVisibility();
     } else {
       const em = $("#empty-main", els.transcript);
-      if (em) em.remove();
+      if (em) em.hidden = true;
     }
   }
 
@@ -1062,16 +1969,51 @@
     return el.scrollHeight - el.scrollTop - el.clientHeight;
   }
 
+  /** Kill horizontal scroll jump when swapping session panes / focusing composer. */
+  function clampHorizontalScroll() {
+    const nodes = [
+      els.transcript,
+      els.sessionList,
+      document.scrollingElement,
+      document.documentElement,
+      document.body,
+      $("#app"),
+      $(".main"),
+      $(".chat-panel"),
+      $(".transcript-wrap"),
+    ];
+    for (const el of nodes) {
+      if (!el) continue;
+      try {
+        if (el.scrollLeft) el.scrollLeft = 0;
+      } catch (_) {
+        /* ignore */
+      }
+    }
+    try {
+      if (window.scrollX) window.scrollTo(0, window.scrollY || 0);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+
+  let _scrollRaf = 0;
   function scrollTranscriptToBottom() {
-    const el = els.transcript;
-    if (!el) return;
-    state._ignoreScroll = true;
-    el.scrollTop = el.scrollHeight;
-    // release after layout so mid-scroll frames don't flip stickToBottom
-    requestAnimationFrame(() => {
+    if (_scrollRaf) return;
+    _scrollRaf = requestAnimationFrame(() => {
+      _scrollRaf = 0;
+      const el = els.transcript;
+      if (!el) return;
+      // Hold _ignoreScroll across the paint so layout/scroll events do not
+      // flip stickToBottom mid-frame (composer grow / history batch).
+      state._ignoreScroll = true;
+      el.scrollLeft = 0;
+      el.scrollTop = el.scrollHeight;
       requestAnimationFrame(() => {
+        el.scrollLeft = 0;
+        el.scrollTop = el.scrollHeight;
+        clampHorizontalScroll();
         state._ignoreScroll = false;
-        if (state.stickToBottom) el.scrollTop = el.scrollHeight;
         updateJumpLatestUiOnly();
       });
     });
@@ -1100,8 +2042,12 @@
     updateJumpLatestUiOnly();
   }
 
-  function scrollIfSticky() {
-    if (!state.stickToBottom) {
+  function scrollIfSticky(force) {
+    // Batch history rebuilds suppress intermediate scrolls.
+    if (state._suppressStickyScroll && !force) return;
+    // Offscreen session panes must not move the visible scroll position.
+    if (state.activePane && state.activePane.hidden) return;
+    if (!shouldScrollToBottom(state.stickToBottom, !!force)) {
       updateJumpLatestUiOnly();
       return;
     }
@@ -1222,7 +2168,9 @@
       const planEl = body.closest("details.term-line.plan");
       if (planEl && planEl.open) {
         try {
-          activeLi.scrollIntoView({ block: "nearest", inline: "nearest" });
+          // block only — inline scroll shifts the whole transcript horizontally
+          activeLi.scrollIntoView({ block: "nearest", inline: "start" });
+          clampHorizontalScroll();
         } catch (_) {
           /* ignore */
         }
@@ -1248,7 +2196,7 @@
     renderPlanBody(body, entries);
     details.append(summary, body);
     details._planEntries = entries;
-    els.transcript.appendChild(details);
+    transcriptRoot().appendChild(details);
     scrollIfSticky();
     return details;
   }
@@ -1271,6 +2219,17 @@
     return el;
   }
 
+  function toolOneLinerRedundant(nameText, summary) {
+    const name = String(nameText || "").trim();
+    const snip = String(summary || "").trim();
+    if (!snip) return true;
+    if (!name) return false;
+    // Hide when equal or already baked into the name (avoids double path/title).
+    if (snip === name) return true;
+    if (name.includes(snip)) return true;
+    return false;
+  }
+
   function createToolLine({ title, status, summary, toolCallId }) {
     const row = document.createElement("details");
     row.className = "term-line tool";
@@ -1285,9 +2244,10 @@
     prefix.className = "term-prefix";
     prefix.textContent = formatTermPrefix("tool");
 
+    const displayTitle = (title || "tool").trim() || "tool";
     const name = document.createElement("span");
     name.className = "tool-name";
-    name.textContent = title || "tool";
+    name.textContent = displayTitle;
 
     const pill = document.createElement("span");
     pill.className = `term-status ${statusClass(st)}`;
@@ -1296,8 +2256,9 @@
     const oneLiner = document.createElement("span");
     oneLiner.className = "tool-one-liner muted";
     const snip = (summary || "").trim();
-    oneLiner.textContent = snip ? truncate(snip, 80) : "";
-    if (!snip) oneLiner.hidden = true;
+    const hideOne = toolOneLinerRedundant(displayTitle, snip);
+    oneLiner.textContent = snip && !hideOne ? truncate(snip, 80) : "";
+    oneLiner.hidden = hideOne;
 
     sum.append(prefix, name, pill, oneLiner);
 
@@ -1306,14 +2267,14 @@
     detail.textContent = snip || "No detail";
 
     row.append(sum, detail);
-    row._toolTitle = title || "tool";
+    row._toolTitle = displayTitle;
     row._toolSummary = snip;
     return row;
   }
 
   function updateToolLine(row, { title, status, summary }) {
     if (!row) return;
-    // Never force open/close — preserve user expand state.
+    // Never force open on tools — preserve user expand state; stay closed by default.
     if (status != null) {
       const st = normalizeStatus(status);
       row.dataset.status = st;
@@ -1332,21 +2293,38 @@
     if (summary != null) {
       const full = String(summary).trim();
       row._toolSummary = full;
+      const nameText = String(row._toolTitle || "").trim();
       const oneLiner = row.querySelector(".tool-one-liner");
       if (oneLiner) {
-        oneLiner.textContent = full ? truncate(full, 80) : "";
-        oneLiner.hidden = !full;
+        const hideOne = toolOneLinerRedundant(nameText, full);
+        oneLiner.textContent = full && !hideOne ? truncate(full, 80) : "";
+        oneLiner.hidden = hideOne;
       }
       const detail = row.querySelector(".tool-detail") || row.querySelector(".term-body");
       if (detail) detail.textContent = full || "No detail";
+    } else if (title) {
+      // Title-only update: re-evaluate one-liner redundancy against stored summary.
+      const full = String(row._toolSummary || "").trim();
+      const oneLiner = row.querySelector(".tool-one-liner");
+      if (oneLiner) {
+        const hideOne = toolOneLinerRedundant(title, full);
+        oneLiner.textContent = full && !hideOne ? truncate(full, 80) : "";
+        oneLiner.hidden = hideOne;
+      }
     }
   }
 
   function appendToolLine(meta, text) {
     if (!shouldShowToolLine()) return null;
     noteTermLineActivity();
-    const title = text || meta.label || "tool";
-    const summary = meta.summary || meta.detail || "";
+    // Prefer short label for the name; path/command lives in the one-liner.
+    const label = String(meta.label || "").trim();
+    const textStr = String(text || "").trim();
+    const title = label || textStr || "tool";
+    let summary = String(meta.summary || meta.detail || "").trim();
+    if (!summary && textStr && textStr !== title) {
+      summary = textStr;
+    }
     const st = meta.status || "pending";
     const id = meta.toolCallId || "";
 
@@ -1368,7 +2346,7 @@
       summary,
       toolCallId: id,
     });
-    els.transcript.appendChild(row);
+    transcriptRoot().appendChild(row);
     if (id) state.streamBuffers.tools.set(id, row);
     state.streamBuffers.lastToolTitle = title;
     updateTurnStrip();
@@ -1385,20 +2363,21 @@
     if (role === "thought") {
       const details = document.createElement("details");
       details.className = "term-line thought";
-      details.open = !!opts.open;
+      // Default open for live progress; allow explicit close via opts.open === false
+      details.open = opts.open !== false;
       const summary = document.createElement("summary");
       const prefix = document.createElement("span");
       prefix.className = "term-prefix";
       prefix.textContent = formatTermPrefix("thought");
       const label = document.createElement("span");
       label.className = "thought-summary-label";
-      label.textContent = text ? "thinking…" : "thinking…";
+      label.textContent = "thinking…";
       summary.append(prefix, label);
       const body = document.createElement("div");
       body.className = "term-body";
       body.textContent = text;
       details.append(summary, body);
-      els.transcript.appendChild(details);
+      transcriptRoot().appendChild(details);
       if (opts.stream) state.streamBuffers.thoughtEl = details;
       scrollIfSticky();
       return details;
@@ -1430,7 +2409,7 @@
     }
 
     div.append(prefix, body);
-    els.transcript.appendChild(div);
+    transcriptRoot().appendChild(div);
     if (opts.stream && role === "assistant") state.streamBuffers.assistantEl = div;
     scrollIfSticky();
     return div;
@@ -1448,8 +2427,8 @@
   }
 
   function applyHistoryMessages(messages, opts = {}) {
-    // Live stream owns the transcript while a turn is running (unless forced open)
-    if (state.turnRunning && !opts.force) return false;
+    // Live stream owns the transcript while a turn is running on this session
+    if (state.turnRunning && !opts.force && turnRunningOnSelected()) return false;
     const list = messages || [];
     const fp = historyFingerprint(list);
     const sessionId = state.selectedId;
@@ -1461,33 +2440,48 @@
       return false;
     }
     const wasNearBottom = state.stickToBottom || distanceFromBottom() < 120;
-    renderHistory(list);
+    renderHistory(list, { skipScroll: true });
     state.historyLoadedFor = sessionId;
     state.historyFingerprint = fp;
+    if (sessionId) {
+      const v = getSessionPane(sessionId);
+      v.historyFingerprint = fp;
+      v.historyLoaded = true;
+    }
     if (wasNearBottom || opts.jump) {
       jumpToLatest();
     }
     return true;
   }
 
-  function renderHistory(messages) {
-    clearTranscript();
-    showEmptyMain(false);
-    if (!messages || !messages.length) {
-      appendMessage({ role: "system", text: "No prior transcript on disk for this session." });
-      return;
+  function renderHistory(messages, opts = {}) {
+    // Suppress per-line scrollIfSticky during rebuild; one pass after batch.
+    const prevSuppress = !!state._suppressStickyScroll;
+    state._suppressStickyScroll = true;
+    try {
+      clearTranscript();
+      showEmptyMain(false);
+      if (state.selectedId) showSessionPane(state.selectedId);
+      if (!messages || !messages.length) {
+        appendMessage({ role: "system", text: "No prior transcript on disk for this session." });
+      } else {
+        for (const m of messages) {
+          appendMessage(m);
+        }
+      }
+      state.streamBuffers.assistantEl = null;
+      state.streamBuffers.thoughtEl = null;
+      state.streamBuffers.planEl = null;
+      state.streamBuffers.activityEl = null;
+      state.streamBuffers.tools = new Map();
+      state.streamBuffers.lastToolTitle = "";
+      state.stickToBottom = true;
+    } finally {
+      state._suppressStickyScroll = prevSuppress;
     }
-    for (const m of messages) {
-      appendMessage(m);
+    if (!opts.skipScroll) {
+      scrollIfSticky(true);
     }
-    state.streamBuffers.assistantEl = null;
-    state.streamBuffers.thoughtEl = null;
-    state.streamBuffers.planEl = null;
-    state.streamBuffers.activityEl = null;
-    state.streamBuffers.tools = new Map();
-    state.streamBuffers.lastToolTitle = "";
-    state.stickToBottom = true;
-    scrollIfSticky();
     updateTurnStrip();
   }
 
@@ -1530,70 +2524,17 @@
     }
   }
 
-  function handleAcpMessage(sessionId, message) {
-    const method = message.method || "";
-    if (method !== "session/update" && method !== "_x.ai/session/update") {
-      return;
-    }
-    const update = (message.params && message.params.update) || {};
-    const kind = update.sessionUpdate || "";
+  function shouldApplyAcpToSession(sessionId) {
+    if (!sessionId) return !!state.selectedId;
+    if (sessionId === state.selectedId) return true;
+    const live = liveTurnId();
+    if (sessionId === live) return true;
+    if (state.sessionViews.has(sessionId)) return true;
+    if (state.turnRunning && sessionId === state.status.loadedSessionId) return true;
+    return false;
+  }
 
-    // Agent command lists are session-global cache; apply even if selectedId lags
-    // (view id vs live id during attach) or message is for another session.
-    if (kind === "available_commands_update") {
-      const cmds = update.availableCommands || update.available_commands || [];
-      applyCommands(Array.isArray(cmds) ? cmds : []);
-      return;
-    }
-
-    // Queued user echoes may use view id while selection is live (or vice versa).
-    // Accept user_message_chunk when selected and session matches OR turn is running.
-    if (kind === "user_message_chunk") {
-      const acceptUserEcho =
-        !!state.selectedId &&
-        (!sessionId ||
-          sessionId === state.selectedId ||
-          state.turnRunning ||
-          isHubCreatedSession(sessionId));
-      if (!acceptUserEcho) return;
-      const text = extractText(update.content);
-      if (!text) return;
-      const last = els.transcript.lastElementChild;
-      if (last && last.classList.contains("user") && last.classList.contains("term-line")) {
-        const body = last.querySelector(".term-body");
-        if (!body) return;
-        const existing = body._rawText != null ? String(body._rawText) : String(body.textContent || "");
-        // Exact duplicate (hub echo + ACP full message)
-        if (existing === text) {
-          scrollIfSticky();
-          return;
-        }
-        // Already have this text as prefix (ACP re-sends shorter/same)
-        if (existing.startsWith(text)) {
-          scrollIfSticky();
-          return;
-        }
-        // Replacement with longer full message that extends existing stream
-        if (text.startsWith(existing)) {
-          setTermBodyContent(body, text);
-          body._rawText = text;
-          scrollIfSticky();
-          return;
-        }
-        // True streaming chunk
-        appendToBody(last, text);
-      } else {
-        beginNewUserTurn();
-        const el = appendMessage({ role: "user", text }, { stream: true });
-        const body = el && el.querySelector(".term-body");
-        if (body) body._rawText = text;
-      }
-      scrollIfSticky();
-      return;
-    }
-
-    if (!sessionId || sessionId !== state.selectedId) return;
-
+  function processAcpSessionUpdate(kind, update) {
     if (kind === "agent_message_chunk") {
       const text = extractText(update.content);
       if (!text) return;
@@ -1646,10 +2587,7 @@
       const id = update.toolCallId || "";
       const label = toolLabelFromUpdate(update);
       const summary = toolSummaryFromUpdate(update);
-      const title =
-        summary && label && !summary.toLowerCase().includes(label.toLowerCase())
-          ? truncate(`${label} ${summary}`, 160)
-          : summary || label;
+      // Name = short label only; path/command goes in one-liner (not label+summary title).
       const status = update.status != null ? normalizeStatus(update.status) : "pending";
       const row = appendToolLine(
         {
@@ -1659,11 +2597,11 @@
           detail: summary,
           label,
         },
-        title
+        label
       );
       if (id && row) state.streamBuffers.tools.set(id, row);
       state.streamBuffers.assistantEl = null;
-      state.streamBuffers.lastToolTitle = title;
+      state.streamBuffers.lastToolTitle = label;
       updateTurnStrip();
       return;
     }
@@ -1671,7 +2609,8 @@
     if (kind === "tool_call_update") {
       const id = update.toolCallId || "";
       const status = normalizeStatus(update.status);
-      const title = update.title || toolLabelFromUpdate(update);
+      // Prefer short tool label for the name; keep path/snippet in one-liner/detail.
+      const label = toolLabelFromUpdate(update);
       const snippet = extractToolContentSnippet(update) || toolSummaryFromUpdate(update);
       noteTermLineActivity();
       let row = id ? state.streamBuffers.tools.get(id) : null;
@@ -1682,27 +2621,131 @@
             status,
             summary: snippet,
             detail: snippet,
-            label: title,
+            label,
           },
-          title
+          label
         );
         if (id && row) state.streamBuffers.tools.set(id, row);
       } else {
-        updateToolLine(row, { title, status, summary: snippet });
+        updateToolLine(row, { title: label, status, summary: snippet });
       }
-      state.streamBuffers.lastToolTitle = title;
+      // Tools stay closed by default; never auto-open on completion.
+      state.streamBuffers.lastToolTitle = label;
       updateTurnStrip();
       scrollIfSticky();
+    }
+  }
+
+  function processUserMessageChunk(update) {
+    const text = extractText(update.content);
+    if (!text) return;
+    const root = transcriptRoot();
+    const last = root && root.lastElementChild;
+    if (last && last.classList.contains("user") && last.classList.contains("term-line")) {
+      const body = last.querySelector(".term-body");
+      if (!body) return;
+      const existing = body._rawText != null ? String(body._rawText) : String(body.textContent || "");
+      // Exact duplicate (hub echo + ACP full message)
+      if (existing === text) {
+        scrollIfSticky();
+        return;
+      }
+      // Already have this text as prefix (ACP re-sends shorter/same)
+      if (existing.startsWith(text)) {
+        scrollIfSticky();
+        return;
+      }
+      // Replacement with longer full message that extends existing stream
+      if (text.startsWith(existing)) {
+        setTermBodyContent(body, text);
+        body._rawText = text;
+        scrollIfSticky();
+        return;
+      }
+      // True streaming chunk
+      appendToBody(last, text);
+    } else {
+      beginNewUserTurn();
+      const el = appendMessage({ role: "user", text }, { stream: true });
+      const body = el && el.querySelector(".term-body");
+      if (body) body._rawText = text;
+    }
+    scrollIfSticky();
+  }
+
+  function handleAcpMessage(sessionId, message) {
+    const method = message.method || "";
+    if (method !== "session/update" && method !== "_x.ai/session/update") {
+      return;
+    }
+    const update = (message.params && message.params.update) || {};
+    const kind = update.sessionUpdate || "";
+
+    // Agent command lists are session-global cache; apply even if selectedId lags
+    // (view id vs live id during attach) or message is for another session.
+    if (kind === "available_commands_update") {
+      const cmds = update.availableCommands || update.available_commands || [];
+      applyCommands(Array.isArray(cmds) ? cmds : []);
       return;
     }
 
+    const targetId = sessionId || state.selectedId;
+    if (!targetId) return;
+
+    // Queued user echoes may use view id while selection is live (or vice versa).
+    if (kind === "user_message_chunk") {
+      const acceptUserEcho =
+        !!state.selectedId &&
+        (!sessionId ||
+          sessionId === state.selectedId ||
+          state.turnRunning ||
+          isHubCreatedSession(sessionId) ||
+          shouldApplyAcpToSession(sessionId));
+      if (!acceptUserEcho) return;
+      if (targetId !== state.selectedId) {
+        withSessionTarget(targetId, () => processUserMessageChunk(update));
+      } else {
+        processUserMessageChunk(update);
+      }
+      return;
+    }
+
+    if (!shouldApplyAcpToSession(targetId)) return;
+
+    const after = () => {
+      if (kind === "tool_call" || kind === "tool_call_update") {
+        const v = state.sessionViews.get(targetId);
+        if (v && v.streamBuffers) v.lastToolTitle = v.streamBuffers.lastToolTitle || "";
+        renderSessions();
+        updateTurnStrip();
+      }
+    };
+
+    if (targetId !== state.selectedId) {
+      // Ensure pane exists for live/offscreen streaming
+      getSessionPane(targetId);
+      withSessionTarget(targetId, () => {
+        processAcpSessionUpdate(kind, update);
+        after();
+      });
+      return;
+    }
+
+    processAcpSessionUpdate(kind, update);
+    after();
+  }
+
+  function subscribeSessionIds(...ids) {
+    const seen = new Set();
+    for (const id of ids) {
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      sendWs({ type: "subscribe", sessionId: id });
+    }
   }
 
   async function openSession(session) {
-    if (state.turnRunning && state.selectedId && state.selectedId !== session.sessionId) {
-      toast("Wait for the current turn to finish before switching sessions.", "danger");
-      return;
-    }
+    // Mid-turn switch is allowed; live turn keeps streaming into its session pane.
     if (
       state.fs.dirty &&
       state.selectedId &&
@@ -1712,15 +2755,42 @@
       state.fs.dirty = false;
     }
 
+    const prevId = state.selectedId;
     const viewId = session.sessionId;
+    const liveKeep = liveTurnId();
+
+    if (prevId && prevId !== viewId) {
+      cacheSessionView(prevId);
+      // Keep WS subscription on the live turn session while it runs
+      if (!(state.turnRunning && prevId === liveKeep)) {
+        sendWs({ type: "unsubscribe", sessionId: prevId });
+      }
+    }
+
     state.selectedId = viewId;
     state.selectedMeta = session;
-    state.promptQueueLength = 0;
-    // Keep prior agent commands until a new list arrives; builtins cover empty.
-    state.streamBuffers = emptyStreamBuffers();
+    // Reset live prompt target until attach reports (or same-id hub session).
+    state.livePromptSessionId = isHubCreatedSession(viewId) ? viewId : null;
+    if (!(state.turnRunning && viewId === liveKeep)) {
+      state.promptQueueLength = 0;
+    }
     state.attachSwitched = false;
+
+    const existing = state.sessionViews.get(viewId);
+    const isLiveTurnHere =
+      !!state.turnRunning &&
+      (viewId === liveKeep || viewId === state.status.turnSessionId);
+    const hasCachedContent =
+      !!(existing && existing.pane && existing.pane.childElementCount > 0);
+
+    showEmptyMain(false);
+    const paneView = showSessionPane(viewId);
+    state.historyLoadedFor = paneView.historyLoaded ? viewId : null;
+    state.historyFingerprint = paneView.historyFingerprint;
+    state.stickToBottom = paneView.stickToBottom !== false;
+
     // Disk open = history until attach promotes to live-remote
-    if (isHubCreatedSession(viewId)) {
+    if (isHubCreatedSession(viewId) || isLiveTurnHere) {
       setSessionMode("live-remote", { attachSwitched: false });
     } else {
       setSessionMode("history", { attachSwitched: false });
@@ -1739,112 +2809,164 @@
     updateTurnStrip();
     refreshUsage();
 
-    // History for the viewed session first (catch-up / TUI context)
-    try {
-      const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(viewId)}/history`));
-      const data = await res.json();
-      applyHistoryMessages(data.messages || [], { force: true, jump: true });
-    } catch (err) {
-      clearTranscript();
-      showEmptyMain(false);
-      appendMessage({ role: "system", text: "Failed to load history: " + err });
-      state.historyLoadedFor = null;
-      state.historyFingerprint = null;
+    // Restore live/cached pane without wiping the in-flight stream
+    const reusePane = hasCachedContent && (isLiveTurnHere || paneView.historyLoaded);
+    if (reusePane) {
+      rebuildToolsFromPane(paneView);
+      state.streamBuffers = paneView.streamBuffers;
+      if (state.stickToBottom) scrollTranscriptToBottom();
+    } else {
+      // History for the viewed session first (catch-up / TUI context)
+      try {
+        const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(viewId)}/history`));
+        const data = await res.json();
+        if (state.selectedId !== viewId) return;
+        applyHistoryMessages(data.messages || [], { force: true, jump: true });
+      } catch (err) {
+        if (state.selectedId !== viewId) return;
+        clearTranscript();
+        showEmptyMain(false);
+        showSessionPane(viewId);
+        appendMessage({ role: "system", text: "Failed to load history: " + err });
+        state.historyLoadedFor = null;
+        state.historyFingerprint = null;
+      }
     }
 
-    // Attach-on-open: ensure live hub session for cwd (no foreign session/load)
+    // Attach-on-open: ensure live hub session for cwd (no foreign session/load).
+    // While a turn is running on another session, attach takes the ACP lock and
+    // hangs openSession for the whole tool run — skip it (history/pane only).
     let liveId = viewId;
     let switched = false;
-    try {
-      const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(viewId)}/attach`), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd: session.cwd || "" }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        // Agent down or attach failed: stay on history view + subscribe view
-        toast(data.error || "Attach failed — history only until agent is up", "danger");
-        sendWs({ type: "subscribe", sessionId: viewId });
+    const skipAttachMidTurn =
+      !!state.turnRunning &&
+      !isLiveTurnHere &&
+      !!liveKeep &&
+      liveKeep !== viewId;
+    if (skipAttachMidTurn) {
+      setSessionMode("history", { attachSwitched: false });
+      subscribeSessionIds(viewId, liveKeep);
+      if (state.stickToBottom) scrollIfSticky();
+      // Do not focus-steal from long turn; still unlock composer for queue/view.
+      forceComposerUnlocked();
+      return;
+    }
+    if (!(isLiveTurnHere && reusePane)) {
+      try {
+        const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(viewId)}/attach`), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cwd: session.cwd || "" }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (state.selectedId !== viewId && state.selectedId !== (data.liveSessionId || viewId)) {
+          return;
+        }
+        if (!res.ok) {
+          // Agent down or attach failed: stay on history view + subscribe view
+          toast(data.error || "Attach failed — history only until agent is up", "danger");
+          subscribeSessionIds(viewId, liveKeep);
+          els.input.focus();
+          return;
+        }
+        liveId = data.liveSessionId || viewId;
+        switched = !!data.switched && liveId !== viewId;
+        const cwd = data.cwd || session.cwd || "";
+        if (Array.isArray(data.commands) && data.commands.length) {
+          applyCommands(data.commands);
+        }
+
+        if (state.hubSessionIds.indexOf(liveId) < 0) {
+          state.hubSessionIds = [liveId, ...state.hubSessionIds].slice(0, 50);
+        }
+
+        // Always remember where prompts should go
+        state.livePromptSessionId = liveId;
+
+        if (switched) {
+          // Keep the session the user clicked (history on screen). Do not jump to
+          // an empty/new hub remote id — that felt like "back to main".
+          if (state.selectedId !== viewId) {
+            // User navigated away during attach; do not steal focus back.
+          } else {
+            setSessionMode("live-remote", { attachSwitched: true });
+            if (data.message) {
+              appendMessage({
+                role: "system",
+                text:
+                  data.message +
+                  " (Still showing this session’s transcript; sends use the live hub session.)",
+              });
+            }
+            updateSessionBanner();
+            renderSessions();
+          }
+        } else {
+          setSessionMode("live-remote", { attachSwitched: false });
+          state.livePromptSessionId = liveId;
+        }
+      } catch (err) {
+        toast("Attach failed: " + err, "danger");
+        subscribeSessionIds(viewId, liveKeep);
         els.input.focus();
         return;
       }
-      liveId = data.liveSessionId || viewId;
-      switched = !!data.switched && liveId !== viewId;
-      const cwd = data.cwd || session.cwd || "";
-      if (Array.isArray(data.commands) && data.commands.length) {
-        applyCommands(data.commands);
-      }
-
-      if (state.hubSessionIds.indexOf(liveId) < 0) {
-        state.hubSessionIds = [liveId, ...state.hubSessionIds].slice(0, 50);
-      }
-
-      if (switched) {
-        let meta = state.sessions.find((s) => s.sessionId === liveId);
-        if (!meta) {
-          meta = {
-            sessionId: liveId,
-            title: "Remote session",
-            cwd,
-            updatedAt: new Date().toISOString(),
-            modelId: (session && session.modelId) || "",
-            path: "",
-          };
-          state.sessions = [meta, ...state.sessions.filter((s) => s.sessionId !== liveId)];
-        }
-        state.selectedId = liveId;
-        state.selectedMeta = meta;
-        setTopbarSessionMeta({
-          title: meta.title || "Remote session",
-          cwd: meta.cwd || cwd || "",
-          modelId: meta.modelId || (session && session.modelId) || "",
-        });
-        setSessionMode("live-remote", { attachSwitched: true });
-        syncFsForSession();
-        if (data.message) {
-          appendMessage({ role: "system", text: data.message });
-        }
-        // Pull live session history after switch so remote thread is visible
-        try {
-          const hres = await fetch(
-            apiUrl(`/api/sessions/${encodeURIComponent(liveId)}/history`)
-          );
-          const hdata = await hres.json();
-          if (Array.isArray(hdata.messages) && hdata.messages.length) {
-            applyHistoryMessages(hdata.messages, { force: true, jump: true });
-          }
-        } catch (_) {
-          /* keep view history */
-        }
-        renderSessions();
-      } else {
-        setSessionMode("live-remote", { attachSwitched: false });
-      }
-    } catch (err) {
-      toast("Attach failed: " + err, "danger");
-      sendWs({ type: "subscribe", sessionId: viewId });
-      els.input.focus();
-      return;
     }
 
-    sendWs({ type: "subscribe", sessionId: liveId });
-    if (switched && viewId !== liveId) {
-      // Optional: keep view subscription briefly; prefer live only
-      sendWs({ type: "unsubscribe", sessionId: viewId });
-    }
+    // Always keep selected + live prompt + turn sessions subscribed
+    const turnId = liveTurnId();
+    subscribeSessionIds(liveId, state.selectedId, turnId, state.livePromptSessionId);
+    // Do not unsubscribe the session the user clicked — they are viewing it.
 
     setComposerEnabled(composerConnected());
     forceComposerUnlocked();
     updateTurnStrip();
     refreshUsage();
-    els.input.focus();
+    if (state.stickToBottom) scrollTranscriptToBottom();
+    clampHorizontalScroll();
+    els.input.focus({ preventScroll: true });
+    // Focus can still nudge layout on some mobile browsers
+    requestAnimationFrame(() => clampHorizontalScroll());
   }
 
   function sendWs(obj) {
     if (state.ws && state.ws.readyState === WebSocket.OPEN) {
       state.ws.send(JSON.stringify(obj));
     }
+  }
+
+  function probeHubHealth() {
+    fetch("/health", { method: "GET", cache: "no-store" })
+      .then((r) => {
+        if (!r.ok) throw new Error("health " + r.status);
+        return r.json();
+      })
+      .then((j) => {
+        state.hubReachable = !!(j && j.ok === true);
+        if (state.wsState === "reconnecting" || state.wsState === "connecting") {
+          updateStatusPill();
+        }
+      })
+      .catch(() => {
+        state.hubReachable = false;
+        if (state.wsState === "reconnecting" || state.wsState === "connecting") {
+          updateStatusPill();
+        }
+      });
+  }
+
+  function startHealthProbe() {
+    if (state.healthProbeTimer) return;
+    probeHubHealth();
+    state.healthProbeTimer = setInterval(probeHubHealth, 4000);
+  }
+
+  function stopHealthProbe() {
+    if (state.healthProbeTimer) {
+      clearInterval(state.healthProbeTimer);
+      state.healthProbeTimer = null;
+    }
+    state.hubReachable = null;
   }
 
   function connectWs() {
@@ -1861,11 +2983,16 @@
     ws.addEventListener("open", () => {
       state.wsState = "open";
       state.reconnectAttempt = 0;
+      stopHealthProbe();
       updateStatusPill();
       sendWs({ type: "hello" });
       if (state.selectedId) {
-        sendWs({ type: "subscribe", sessionId: state.selectedId });
-        refreshHistory(state.selectedId);
+        subscribeSessionIds(state.selectedId, liveTurnId());
+        if (!turnRunningOnSelected()) {
+          refreshHistory(state.selectedId);
+        }
+      } else {
+        subscribeSessionIds(liveTurnId());
       }
       setComposerEnabled(true);
     });
@@ -1882,6 +3009,7 @@
 
     ws.addEventListener("close", () => {
       state.wsState = "reconnecting";
+      startHealthProbe();
       updateStatusPill();
       setComposerEnabled(false);
       scheduleReconnect();
@@ -1896,6 +3024,9 @@
 
   function scheduleReconnect() {
     state.reconnectAttempt += 1;
+    if (state.reconnectAttempt >= 3) {
+      updateStatusPill();
+    }
     const delay = Math.min(1000 * Math.pow(1.6, state.reconnectAttempt), 12000);
     state.reconnectTimer = setTimeout(connectWs, delay);
   }
@@ -1911,6 +3042,11 @@
         turnRunning: !!msg.turnRunning,
         turnSessionId: msg.turnSessionId || null,
       };
+      if (msg.turnSessionId) {
+        state.liveTurnSessionId = msg.turnSessionId;
+      } else if (!msg.turnRunning) {
+        state.liveTurnSessionId = null;
+      }
       if (msg.hubVersion != null) state.hubVersion = msg.hubVersion;
       if (msg.cliVersion != null) state.cliVersion = msg.cliVersion;
       if (msg.compatOk != null) state.compatOk = !!msg.compatOk;
@@ -1929,24 +3065,21 @@
           setSessionMode("live-remote");
         }
       }
-      // Server is source of truth for turnRunning (prevents client/server desync).
-      // Match view id, live hub id, or missing turnSessionId — never gate composer.
+      // Server is source of truth for turnRunning (single-agent hub).
+      // Track globally so mid-turn session switches keep streaming into the live pane.
       if (msg.turnRunning != null) {
         const serverRunning = !!msg.turnRunning;
-        const forMe =
-          !msg.turnSessionId ||
-          msg.turnSessionId === state.selectedId ||
-          (state.selectedId && isHubCreatedSession(msg.turnSessionId));
-        if (forMe) {
-          if (serverRunning && !state.turnRunning) {
-            setTurnRunning(true);
-            toast("Turn still running on server…", "");
-          } else if (serverRunning !== state.turnRunning) {
-            setTurnRunning(serverRunning);
-          } else {
-            state.turnRunning = serverRunning;
-            updateTurnStrip();
-          }
+        if (serverRunning && msg.turnSessionId) {
+          subscribeSessionIds(msg.turnSessionId);
+        }
+        if (serverRunning && !state.turnRunning) {
+          setTurnRunning(true);
+          toast("Turn still running on server…", "");
+        } else if (serverRunning !== state.turnRunning) {
+          setTurnRunning(serverRunning);
+        } else {
+          state.turnRunning = serverRunning;
+          updateTurnStrip();
         }
       }
       updateVersionBadge();
@@ -1989,34 +3122,44 @@
     if (type === "system") {
       if (!msg.sessionId || msg.sessionId === state.selectedId) {
         appendMessage({ role: "system", text: msg.text || "" });
+      } else if (shouldApplyAcpToSession(msg.sessionId)) {
+        withSessionTarget(msg.sessionId, () => {
+          appendMessage({ role: "system", text: msg.text || "" });
+        });
       }
       return;
     }
     if (type === "session_switch") {
       const fromId = msg.from || null;
       const toId = msg.to || null;
-      // Only react if we were on the old session or already mid-prompt without selection match
-      if (
-        toId &&
-        (!state.selectedId ||
-          state.selectedId === fromId ||
-          state.selectedId === toId ||
-          state.turnRunning)
-      ) {
-        // Attach-on-open may already have selected live id
-        if (state.selectedId === toId && !state.turnRunning) {
-          if (state.hubSessionIds.indexOf(toId) < 0) {
-            state.hubSessionIds = [toId, ...state.hubSessionIds].slice(0, 50);
-          }
-          const switched = !!(fromId && fromId !== toId);
-          setSessionMode("live-remote", { attachSwitched: switched });
-          return;
-        }
+      if (!toId) return;
+      // Prefer soft-map: keep UI on the session the user clicked.
+      if (state.selectedId && state.selectedId === fromId && fromId !== toId) {
         applySessionSwitch(fromId, toId, msg.reason || "", msg.message || "");
-        // Keep turn running on the new session while prompt is in flight
         if (state.turnRunning || msg.reason === "cli_or_foreign_session") {
           setTurnRunning(true);
         }
+        return;
+      }
+      if (state.selectedId === toId) {
+        if (state.hubSessionIds.indexOf(toId) < 0) {
+          state.hubSessionIds = [toId, ...state.hubSessionIds].slice(0, 50);
+        }
+        state.livePromptSessionId = toId;
+        setSessionMode("live-remote", {
+          attachSwitched: !!(fromId && fromId !== toId),
+        });
+        return;
+      }
+      // Selected something else: only remember live id for this project
+      if (state.hubSessionIds.indexOf(toId) < 0) {
+        state.hubSessionIds = [toId, ...state.hubSessionIds].slice(0, 50);
+      }
+      if (!state.selectedId) {
+        applySessionSwitch(fromId, toId, msg.reason || "", msg.message || "");
+      } else {
+        state.livePromptSessionId = state.livePromptSessionId || toId;
+        subscribeSessionIds(state.selectedId, toId, liveTurnId());
       }
       return;
     }
@@ -2026,27 +3169,31 @@
       return;
     }
     if (type === "turn") {
-      const turnForMe =
-        !msg.sessionId ||
-        msg.sessionId === state.selectedId ||
-        (state.selectedId && isHubCreatedSession(msg.sessionId));
-      if (turnForMe) {
-        const busyIdle =
-          msg.state === "idle" && msg.error && /busy/i.test(String(msg.error));
-        // Old hub "busy" idle+error: keep turnRunning (server still mid-turn) and unlock composer.
-        if (busyIdle) {
-          if (msg.error) toast(msg.error, "danger");
-        } else {
-          setTurnRunning(msg.state === "running");
-          if (msg.error && msg.state === "idle") {
-            toast(msg.error, "danger");
-          }
-          if (msg.state === "idle") {
-            refreshUsage();
-          }
+      if (msg.state === "running" && msg.sessionId) {
+        state.liveTurnSessionId = msg.sessionId;
+        subscribeSessionIds(msg.sessionId);
+      } else if (msg.state === "idle") {
+        if (!msg.sessionId || msg.sessionId === state.liveTurnSessionId) {
+          state.liveTurnSessionId = null;
         }
-        updateStatusPill();
       }
+      // Track turn globally so session list + offscreen pane stay live during switches.
+      const busyIdle =
+        msg.state === "idle" && msg.error && /busy/i.test(String(msg.error));
+      // Old hub "busy" idle+error: keep turnRunning (server still mid-turn) and unlock composer.
+      if (busyIdle) {
+        if (msg.error) toast(msg.error, "danger");
+      } else {
+        setTurnRunning(msg.state === "running");
+        if (msg.error && msg.state === "idle") {
+          toast(msg.error, "danger");
+        }
+        if (msg.state === "idle" && (!msg.sessionId || msg.sessionId === state.selectedId)) {
+          refreshUsage();
+        }
+      }
+      updateStatusPill();
+      renderSessions();
       // Always re-enable composer after turn events (never leave disabled).
       setComposerEnabled(composerConnected());
       forceComposerUnlocked();
@@ -2073,6 +3220,245 @@
       updateStatusPill();
       return;
     }
+    if (type === "user_question") {
+      onUserQuestion(msg);
+      return;
+    }
+    if (type === "user_question_resolved") {
+      onUserQuestionResolved(msg);
+      return;
+    }
+  }
+
+  function onUserQuestion(msg) {
+    const requestId = String(msg.requestId || "");
+    if (!requestId) return;
+    const sessionId = msg.sessionId ? String(msg.sessionId) : null;
+    // Prefer matching selected session; always open if no session or live turn matches.
+    const forMe =
+      !sessionId ||
+      sessionId === state.selectedId ||
+      (state.selectedId && isHubCreatedSession(sessionId)) ||
+      sessionId === (state.status && state.status.turnSessionId) ||
+      sessionId === (state.status && state.status.loadedSessionId);
+    if (!forMe) {
+      // Still store so phone can answer even if sub lag; open anyway for always-broadcast.
+    }
+    state.pendingUserQuestion = {
+      requestId,
+      sessionId,
+      questions: Array.isArray(msg.questions) ? msg.questions : [],
+      toolCallId: msg.toolCallId || null,
+    };
+    openAskUserModal();
+    toast("Agent is asking a question", "");
+  }
+
+  function onUserQuestionResolved(msg) {
+    const requestId = String(msg.requestId || "");
+    if (
+      state.pendingUserQuestion &&
+      String(state.pendingUserQuestion.requestId) === requestId
+    ) {
+      closeAskUserModal();
+    }
+  }
+
+  function openAskUserModal() {
+    if (!els.modalAskUser || !els.askUserBody) return;
+    renderAskUserQuestions();
+    els.modalAskUser.classList.remove("hidden");
+  }
+
+  function closeAskUserModal() {
+    if (els.modalAskUser) els.modalAskUser.classList.add("hidden");
+    if (els.askUserBody) els.askUserBody.innerHTML = "";
+    state.pendingUserQuestion = null;
+  }
+
+  function renderAskUserQuestions() {
+    const body = els.askUserBody;
+    if (!body) return;
+    body.innerHTML = "";
+    const pq = state.pendingUserQuestion;
+    const questions = (pq && pq.questions) || [];
+    if (!questions.length) {
+      const p = document.createElement("p");
+      p.className = "muted";
+      p.textContent = "No questions provided.";
+      body.appendChild(p);
+      return;
+    }
+    for (const q of questions) {
+      const qid = String(q.id || "");
+      const multi = !!q.multiSelect;
+      const fieldset = document.createElement("fieldset");
+      fieldset.className = "ask-user-q";
+      fieldset.dataset.qid = qid;
+      fieldset.dataset.multi = multi ? "1" : "0";
+
+      const legend = document.createElement("legend");
+      legend.textContent = q.text || "Question";
+      fieldset.appendChild(legend);
+
+      const optsWrap = document.createElement("div");
+      optsWrap.className = "ask-user-opts";
+
+      const options = Array.isArray(q.options) ? q.options : [];
+      for (const opt of options) {
+        const oid = String(opt.id || "");
+        const labelEl = document.createElement("label");
+        labelEl.className = "ask-user-opt";
+
+        const input = document.createElement("input");
+        input.type = multi ? "checkbox" : "radio";
+        input.name = multi ? `ask-${qid}-${oid}` : `ask-${qid}`;
+        input.value = oid;
+        input.dataset.optionId = oid;
+        input.dataset.optionLabel = opt.label || oid;
+        if (!multi) {
+          input.addEventListener("change", () => {
+            // Clear "Other" selection visual when picking a listed option
+            const otherCheck = fieldset.querySelector(".ask-user-other-toggle");
+            if (otherCheck) otherCheck.checked = false;
+          });
+        }
+        const bodyCol = document.createElement("span");
+        bodyCol.className = "ask-user-opt-body";
+        const lab = document.createElement("span");
+        lab.className = "ask-user-opt-label";
+        lab.textContent = opt.label || oid;
+        bodyCol.appendChild(lab);
+        if (opt.description) {
+          const desc = document.createElement("span");
+          desc.className = "ask-user-opt-desc";
+          desc.textContent = opt.description;
+          bodyCol.appendChild(desc);
+        }
+        if (opt.preview) {
+          const prev = document.createElement("span");
+          prev.className = "ask-user-opt-desc";
+          prev.textContent = opt.preview;
+          bodyCol.appendChild(prev);
+        }
+        labelEl.append(input, bodyCol);
+        optsWrap.appendChild(labelEl);
+      }
+
+      // Always include Other with free-text input
+      const otherWrap = document.createElement("div");
+      otherWrap.className = "ask-user-other";
+      const otherLabel = document.createElement("label");
+      otherLabel.className = "ask-user-opt";
+      const otherToggle = document.createElement("input");
+      otherToggle.type = multi ? "checkbox" : "radio";
+      otherToggle.name = multi ? `ask-${qid}-other` : `ask-${qid}`;
+      otherToggle.value = "__other__";
+      otherToggle.className = "ask-user-other-toggle";
+      const otherBody = document.createElement("span");
+      otherBody.className = "ask-user-opt-body";
+      const otherLab = document.createElement("span");
+      otherLab.className = "ask-user-opt-label";
+      otherLab.textContent = "Other";
+      otherBody.appendChild(otherLab);
+      otherLabel.append(otherToggle, otherBody);
+      const otherInput = document.createElement("input");
+      otherInput.type = "text";
+      otherInput.className = "input ask-user-other-input";
+      otherInput.placeholder = "Type your answer…";
+      otherInput.autocomplete = "off";
+      otherInput.addEventListener("focus", () => {
+        otherToggle.checked = true;
+        if (!multi) {
+          fieldset.querySelectorAll('input[type="radio"]').forEach((r) => {
+            if (r !== otherToggle) r.checked = false;
+          });
+          otherToggle.checked = true;
+        }
+      });
+      otherInput.addEventListener("input", () => {
+        if ((otherInput.value || "").trim()) otherToggle.checked = true;
+      });
+      otherWrap.append(otherLabel, otherInput);
+      optsWrap.appendChild(otherWrap);
+
+      fieldset.appendChild(optsWrap);
+      body.appendChild(fieldset);
+    }
+  }
+
+  function collectAskUserAnswers() {
+    const answers = {};
+    if (!els.askUserBody) return answers;
+    const fieldsets = els.askUserBody.querySelectorAll(".ask-user-q");
+    fieldsets.forEach((fs) => {
+      const qid = fs.dataset.qid || "";
+      if (!qid) return;
+      const multi = fs.dataset.multi === "1";
+      const values = [];
+      if (multi) {
+        fs.querySelectorAll('input[type="checkbox"]:checked').forEach((inp) => {
+          if (inp.classList.contains("ask-user-other-toggle")) {
+            const text = (
+              fs.querySelector(".ask-user-other-input")?.value || ""
+            ).trim();
+            if (text) values.push(text);
+          } else {
+            const id = inp.dataset.optionId || inp.value;
+            // Prefer option id, fall back to label
+            values.push(id || inp.dataset.optionLabel || "");
+          }
+        });
+      } else {
+        const checked = fs.querySelector('input[type="radio"]:checked');
+        if (checked) {
+          if (checked.classList.contains("ask-user-other-toggle")) {
+            const text = (
+              fs.querySelector(".ask-user-other-input")?.value || ""
+            ).trim();
+            if (text) values.push(text);
+          } else {
+            const id = checked.dataset.optionId || checked.value;
+            values.push(id || checked.dataset.optionLabel || "");
+          }
+        }
+      }
+      answers[qid] = values.filter(Boolean);
+    });
+    return answers;
+  }
+
+  function submitAskUserAnswers() {
+    const pq = state.pendingUserQuestion;
+    if (!pq || !pq.requestId) {
+      closeAskUserModal();
+      return;
+    }
+    const answers = collectAskUserAnswers();
+    sendWs({
+      type: "user_question_answer",
+      requestId: pq.requestId,
+      outcome: "accepted",
+      answers,
+    });
+    // Keep modal until user_question_resolved; close optimistically if WS down
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      closeAskUserModal();
+      toast("Not connected; answer not sent", "danger");
+    }
+  }
+
+  function cancelAskUserQuestion() {
+    const pq = state.pendingUserQuestion;
+    if (pq && pq.requestId) {
+      sendWs({
+        type: "user_question_answer",
+        requestId: pq.requestId,
+        outcome: "cancelled",
+        answers: {},
+      });
+    }
+    closeAskUserModal();
   }
 
   function autoGrow() {
@@ -2097,6 +3483,8 @@
     ta.style.overflowY = scrollH > maxPx ? "auto" : "hidden";
     // Keep scroll at top so caret/text stay top-aligned when growing
     ta.scrollTop = 0;
+    // Composer height changes #transcript clientHeight — re-stick same turn.
+    if (state.stickToBottom) scrollIfSticky();
   }
 
   function setRailTab(tab) {
@@ -2767,9 +4155,15 @@
       toast("Not connected to agent", "danger");
       return;
     }
+    const sid = promptSessionId() || state.selectedId;
     // Successful hub prompt path: if already hub-created, mark live immediately
-    if (isHubCreatedSession(state.selectedId)) {
-      setSessionMode("live-remote");
+    if (isHubCreatedSession(sid) || isHubCreatedSession(state.selectedId)) {
+      setSessionMode("live-remote", {
+        attachSwitched: !!(
+          state.livePromptSessionId &&
+          state.livePromptSessionId !== state.selectedId
+        ),
+      });
     }
     const alreadyRunning = !!state.turnRunning;
     // Do not reset stream buffers when only queuing behind an active turn
@@ -2778,7 +4172,7 @@
     }
     sendWs({
       type: "prompt",
-      sessionId: state.selectedId,
+      sessionId: sid,
       text,
       cwd: (state.selectedMeta && state.selectedMeta.cwd) || "",
     });
@@ -3056,7 +4450,7 @@
 
   function onComposerInput() {
     forceComposerUnlocked();
-    autoGrow();
+    autoGrow(); // re-sticks when stickToBottom (composer shrinks transcript)
     maybeOpenSlashFromValue();
   }
 
@@ -3219,7 +4613,7 @@
         const chip = e.target.closest(".kind-chip");
         if (!chip || !kindFilter.contains(chip)) return;
         const kind = chip.getAttribute("data-kind");
-        if (kind !== "all" && kind !== "standard" && kind !== "subagent") return;
+        if (kind !== "all" && kind !== "working" && kind !== "subagent") return;
         state.sessionKindFilter = kind;
         try {
           sessionStorage.setItem("grh.sessionKindFilter", kind);
@@ -3296,9 +4690,15 @@
         if (els.imageLightbox && !els.imageLightbox.classList.contains("hidden")) {
           e.preventDefault();
           closeLightbox();
+          return;
+        }
+        if (els.modalAskUser && !els.modalAskUser.classList.contains("hidden")) {
+          e.preventDefault();
+          cancelAskUserQuestion();
         }
       }
     });
+
 
     els.btnMenu.addEventListener("click", openRail);
     els.backdrop.addEventListener("click", closeRail);
@@ -3308,13 +4708,36 @@
     els.btnNew.addEventListener("click", openNewModal);
     if (els.btnEmptyNew) els.btnEmptyNew.addEventListener("click", openNewModal);
     if (els.btnEmptySessions) els.btnEmptySessions.addEventListener("click", openRail);
+    if (els.btnRenameSession) {
+      els.btnRenameSession.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!state.selectedId) return;
+        const title =
+          (state.selectedMeta && state.selectedMeta.title) ||
+          (els.chatTitle && els.chatTitle.textContent) ||
+          "Untitled session";
+        startRenameSession(state.selectedId, title, els.chatTitle);
+      });
+    }
 
     $$("[data-close]").forEach((el) => {
       el.addEventListener("click", () => {
         const id = el.getAttribute("data-close");
         if (id === "modal-new") closeNewModal();
+        if (id === "modal-ask-user") cancelAskUserQuestion();
       });
     });
+    if (els.btnAskUserSubmit) {
+      els.btnAskUserSubmit.addEventListener("click", () => {
+        submitAskUserAnswers();
+      });
+    }
+    if (els.btnAskUserCancel) {
+      els.btnAskUserCancel.addEventListener("click", () => {
+        cancelAskUserQuestion();
+      });
+    }
 
     els.projectSearch.addEventListener("input", renderProjects);
     if (els.btnCreateProject) {
@@ -3460,7 +4883,26 @@
 
     els.btnStop.addEventListener("click", () => {
       if (!state.selectedId) return;
-      sendWs({ type: "cancel", sessionId: state.selectedId });
+      const sid = state.selectedId;
+      sendWs({ type: "cancel", sessionId: sid });
+      // Fallback if hub/agent cancel leaves turn stuck (older hubs without force-clear).
+      setTimeout(async () => {
+        if (!state.turnRunning) return;
+        if (state.selectedId !== sid) return;
+        try {
+          const res = await fetch("/api/admin/reset-turn", { method: "POST" });
+          if (res.ok) {
+            toast("Turn force-cleared (Stop fallback)", "");
+          } else {
+            toast(
+              "Stop did not clear the turn. Try Stop again or reload.",
+              "danger"
+            );
+          }
+        } catch (err) {
+          toast("Stop fallback failed: " + err, "danger");
+        }
+      }, 1500);
     });
 
     els.transcript.addEventListener("scroll", () => {
@@ -3483,14 +4925,14 @@
 
   async function refreshHistory(sessionId) {
     if (!sessionId || sessionId !== state.selectedId) return;
-    // Live stream owns the transcript while a turn is running
-    if (state.turnRunning) return;
+    // Live stream owns the transcript while a turn is running on this session
+    if (turnRunningOnSelected()) return;
     try {
       const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/history`));
       if (!res.ok) return;
       const data = await res.json();
       if (sessionId !== state.selectedId) return;
-      if (state.turnRunning) return;
+      if (turnRunningOnSelected()) return;
       applyHistoryMessages(data.messages || []);
     } catch (_) {
       // keep current transcript on transient failures
@@ -3922,6 +5364,7 @@
   async function bootstrap() {
     bindEvents();
     bindUsageBarEvents();
+    bindMetaPopoverEvents();
     setupViewport();
     updateStatusPill();
     updateVersionBadge();
@@ -3945,9 +5388,15 @@
       state.pinnedSessions = [];
     }
     try {
-      const kind = sessionStorage.getItem("grh.sessionKindFilter");
-      if (kind === "all" || kind === "standard" || kind === "subagent") {
+      let kind = sessionStorage.getItem("grh.sessionKindFilter");
+      if (kind === "standard") kind = "working";
+      if (kind === "all" || kind === "working" || kind === "subagent") {
         state.sessionKindFilter = kind;
+        if (kind !== sessionStorage.getItem("grh.sessionKindFilter")) {
+          try {
+            sessionStorage.setItem("grh.sessionKindFilter", kind);
+          } catch (_) {}
+        }
       }
     } catch (_) {}
     const kindFilter = document.querySelector(".session-kind-filter");
