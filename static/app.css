@@ -830,6 +830,80 @@ a {
   overflow: hidden;
 }
 
+/* Context / usage bar under topbar */
+.usage-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 12px 4px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  min-width: 0;
+  max-width: 100%;
+  flex-shrink: 0;
+  font-family: var(--font);
+}
+
+.usage-bar.hidden {
+  display: none;
+}
+
+.usage-bar-track {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.usage-bar-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 1px;
+  transition: width 0.25s ease, background-color 0.2s ease;
+  background: var(--ok);
+}
+
+.usage-bar-fill[data-level="ok"] {
+  background: var(--ok);
+}
+
+.usage-bar-fill[data-level="warn"] {
+  background: var(--warn);
+}
+
+.usage-bar-fill[data-level="danger"] {
+  background: var(--danger);
+}
+
+.usage-bar-label {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 2.5em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-bar-monthly {
+  flex: 0 0 auto;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 5px;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.usage-bar-monthly.hidden {
+  display: none;
+}
+
 #btn-menu {
   display: none;
 }
@@ -1481,10 +1555,10 @@ a {
   border-top: 1px solid var(--border);
   background: var(--surface);
   padding: 8px 12px calc(8px + var(--safe-b));
-  z-index: 20;
+  z-index: 40;
   min-width: 0;
   max-width: 100%;
-  overflow-x: hidden;
+  overflow: visible; /* was overflow-x: hidden — clips slash palette */
 }
 
 .composer {
@@ -1558,18 +1632,18 @@ a {
 
 .slash-palette {
   position: absolute;
-  left: 12px;
-  right: 12px;
-  bottom: calc(100% - 4px);
+  left: 0;
+  right: 0;
+  bottom: 100%;
   max-width: 100%;
-  max-height: 240px;
+  max-height: min(240px, 40dvh);
   overflow-x: hidden;
   overflow-y: auto;
   background: var(--surface-2);
   border: 1px solid var(--border);
   border-radius: 4px;
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
-  z-index: 30;
+  z-index: 50;
   font-family: var(--font);
 }
 
@@ -2057,9 +2131,13 @@ a {
   }
 
   .slash-palette {
-    left: 10px;
-    right: 10px;
-    max-width: calc(100% - 20px);
+    left: 0;
+    right: 0;
+    max-width: 100%;
+  }
+
+  .usage-bar {
+    padding: 3px 10px 4px;
   }
 
   .modal {
