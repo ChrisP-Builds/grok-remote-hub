@@ -208,6 +208,9 @@
     slashIndex: 0,
     slashItems: [],
     slashStrongMatch: false,
+    _slashListSig: null,
+    _slashSig: null,
+    _slashTouching: false,
     skills: [],
     _skillsLoaded: false,
     _skillsFetching: false,
@@ -2632,6 +2635,7 @@
   // Slash palette (position: fixed so chat-panel overflow does not clip it)
   function positionSlashPalette() {
     if (!els.slash || els.slash.classList.contains("hidden")) return;
+    if (state._slashTouching) return;
     const shell = els.form && els.form.closest(".composer-shell");
     const anchor = shell || els.form || els.input;
     if (!anchor) return;
@@ -2671,6 +2675,23 @@
     }
   }
 
+  function slashItemsSignature(items) {
+    return (items || [])
+      .map((c) => (c.name || "") + ":" + (c._slashScore || 0))
+      .join("|");
+  }
+
+  function updateSlashActiveOnly() {
+    if (!els.slash) return;
+    const nodes = els.slash.querySelectorAll(".slash-item");
+    nodes.forEach((el, i) => {
+      const isActive = i === state.slashIndex;
+      el.classList.toggle("active", isActive);
+      if (isActive) el.setAttribute("aria-selected", "true");
+      else el.removeAttribute("aria-selected");
+    });
+  }
+
   function openSlash(filter) {
     if (!els.slash) return;
     // Fetch skills once on first open if bootstrap has not finished.
@@ -2681,9 +2702,16 @@
           state._skillsFetching = false;
         })
         .then(() => {
-          if (state.slashOpen) openSlash(filter);
+          if (!state.slashOpen) return;
+          const val = els.input.value || "";
+          const nextFilter = val.startsWith("/")
+            ? val.split("\n")[0].slice(1)
+            : "";
+          openSlash(nextFilter);
         });
     }
+    const wasOpen = state.slashOpen;
+    const prevListSig = state._slashListSig;
     const q = (filter || "").toLowerCase();
     const source = slashCommandSource();
     const ranked = source
@@ -2724,22 +2752,50 @@
     state.slashIndex = state.slashItems.length ? idx : 0;
     state.slashStrongMatch = Boolean(strong && q && state.slashItems.length);
 
+    const listSig = slashItemsSignature(state.slashItems);
+    const fullSig = listSig + "#" + state.slashIndex + "#" + q;
+
     if (!state.slashItems.length) {
+      const emptySig = "empty#" + q;
+      if (wasOpen && state._slashSig === emptySig) return;
+      state._slashSig = emptySig;
+      state._slashListSig = "empty";
       // Always show palette when typing /; builtins keep it non-empty.
       els.slash.innerHTML = `<div class="slash-item"><span class="desc">No matching commands</span></div>`;
       els.slash.classList.remove("hidden");
       state.slashOpen = true;
-      positionSlashPalette();
+      if (!wasOpen) positionSlashPalette();
       return;
     }
-    renderSlash();
+
+    // Identical list + index + filter: skip DOM work (keyup/input spam).
+    if (wasOpen && state._slashSig === fullSig) {
+      return;
+    }
+
+    // Same items, only active index changed: update classes, keep scroll.
+    if (wasOpen && listSig === prevListSig) {
+      state._slashSig = fullSig;
+      updateSlashActiveOnly();
+      return;
+    }
+
+    state._slashListSig = listSig;
+    state._slashSig = fullSig;
+    renderSlash({
+      preserveScroll: wasOpen,
+      scrollActive: false,
+    });
     els.slash.classList.remove("hidden");
     state.slashOpen = true;
-    positionSlashPalette();
+    if (!wasOpen) positionSlashPalette();
   }
 
-  function renderSlash() {
+  function renderSlash(opts) {
     if (!els.slash) return;
+    const preserveScroll = opts && opts.preserveScroll;
+    const scrollActive = opts && opts.scrollActive;
+    const prevScroll = preserveScroll ? els.slash.scrollTop : 0;
     els.slash.innerHTML = "";
     const q = (() => {
       const val = els.input.value || "";
@@ -2770,8 +2826,14 @@
       desc.textContent = c.description || "";
       btn.append(name, desc);
       let picked = false;
+      let startY = 0;
+      btn.addEventListener("pointerdown", (e) => {
+        startY = e.clientY;
+      });
       const pick = (e) => {
         if (picked) return;
+        // Ignore pointerup/click that ends a scroll gesture on the item.
+        if (Math.abs(e.clientY - startY) > 8) return;
         picked = true;
         e.preventDefault();
         selectSlash(c);
@@ -2780,14 +2842,21 @@
       btn.addEventListener("click", pick);
       els.slash.appendChild(btn);
     });
-    const active = els.slash.querySelector(".slash-item.active");
-    if (active && typeof active.scrollIntoView === "function") {
-      active.scrollIntoView({ block: "nearest" });
+    if (scrollActive) {
+      const active = els.slash.querySelector(".slash-item.active");
+      if (active && typeof active.scrollIntoView === "function") {
+        active.scrollIntoView({ block: "nearest" });
+      }
+    } else if (preserveScroll) {
+      els.slash.scrollTop = prevScroll;
     }
   }
 
   function closeSlash() {
     state.slashOpen = false;
+    state._slashListSig = null;
+    state._slashSig = null;
+    state._slashTouching = false;
     if (!els.slash) return;
     els.slash.classList.add("hidden");
     els.slash.innerHTML = "";
@@ -2950,23 +3019,28 @@
   }
 
   function setupViewport() {
-    const apply = () => {
+    const applyOffset = () => {
       const vv = window.visualViewport;
       if (vv) {
         const offset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
         document.documentElement.style.setProperty("--vv-offset", offset + "px");
       }
+    };
+    const applyLayout = () => {
+      applyOffset();
       autoGrow();
       if (state.slashOpen) positionSlashPalette();
       if (state.stickToBottom) scrollIfSticky();
     };
     const vv = window.visualViewport;
     if (vv) {
-      vv.addEventListener("resize", apply);
-      vv.addEventListener("scroll", apply);
+      vv.addEventListener("resize", applyLayout);
+      // scroll: keyboard chrome offset only — do not re-pin slash palette
+      // (iOS fires visualViewport scroll while the palette itself is scrolled).
+      vv.addEventListener("scroll", applyOffset);
     }
-    window.addEventListener("resize", apply);
-    apply();
+    window.addEventListener("resize", applyLayout);
+    applyLayout();
   }
 
   function bindEvents() {
@@ -3109,18 +3183,71 @@
         if (state.slashOpen) positionSlashPalette();
       }, 50);
     });
+
+    // Isolate palette scrolling from viewport reposition thrash on mobile.
+    if (els.slash) {
+      els.slash.addEventListener(
+        "touchstart",
+        () => {
+          state._slashTouching = true;
+        },
+        { passive: true }
+      );
+      els.slash.addEventListener(
+        "touchend",
+        () => {
+          state._slashTouching = false;
+        },
+        { passive: true }
+      );
+      els.slash.addEventListener(
+        "touchcancel",
+        () => {
+          state._slashTouching = false;
+        },
+        { passive: true }
+      );
+      els.slash.addEventListener(
+        "scroll",
+        (e) => {
+          e.stopPropagation();
+        },
+        { passive: true }
+      );
+    }
+
     els.input.addEventListener("keydown", (e) => {
       if (state.slashOpen) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
           state.slashIndex = Math.min(state.slashIndex + 1, state.slashItems.length - 1);
-          renderSlash();
+          state._slashSig =
+            slashItemsSignature(state.slashItems) +
+            "#" +
+            state.slashIndex +
+            "#" +
+            ((els.input.value || "").split("\n")[0].slice(1) || "").toLowerCase();
+          updateSlashActiveOnly();
+          const active = els.slash && els.slash.querySelector(".slash-item.active");
+          if (active && typeof active.scrollIntoView === "function") {
+            active.scrollIntoView({ block: "nearest" });
+          }
           return;
         }
         if (e.key === "ArrowUp") {
           e.preventDefault();
           state.slashIndex = Math.max(state.slashIndex - 1, 0);
-          renderSlash();
+          state._slashSig =
+            slashItemsSignature(state.slashItems) +
+            "#" +
+            state.slashIndex +
+            "#" +
+            ((els.input.value || "").split("\n")[0].slice(1) || "").toLowerCase();
+          updateSlashActiveOnly();
+          const active = els.slash && els.slash.querySelector(".slash-item.active");
+          if (active && typeof active.scrollIntoView === "function") {
+            active.scrollIntoView({ block: "nearest" });
+          }
           return;
         }
         if (e.key === "Escape") {

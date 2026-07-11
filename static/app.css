@@ -1652,6 +1652,8 @@ a {
   max-height: min(240px, 40dvh);
   overflow-x: hidden;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
   -webkit-overflow-scrolling: touch;
   background: var(--surface-2);
   border: 1px solid var(--border);
@@ -1677,6 +1679,7 @@ a {
   border-bottom: 1px solid var(--border);
   overflow-wrap: anywhere;
   word-break: break-word;
+  touch-action: manipulation;
 }
 
 .slash-item:last-child {
