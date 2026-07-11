@@ -794,6 +794,8 @@ a {
   align-items: center;
   gap: 8px;
   min-height: 16px;
+  flex-wrap: nowrap;
+  overflow: hidden;
 }
 
 .cwd {
@@ -820,6 +822,13 @@ a {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.chip-project {
+  color: var(--text);
+  border-color: var(--accent-dim);
+  max-width: min(42vw, 160px);
+  flex-shrink: 1;
 }
 
 .status-pill {
@@ -1930,6 +1939,19 @@ a {
 
   .chat-sub .cwd {
     display: none;
+  }
+
+  .chip-project {
+    max-width: min(50vw, 140px);
+    display: inline-flex;
+  }
+
+  .chip-project.hidden {
+    display: none;
+  }
+
+  #chat-model {
+    max-width: min(40vw, 120px);
   }
 
   .status-pill {

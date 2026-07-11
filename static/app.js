@@ -176,6 +176,7 @@
     btnJumpLatest: $("#btn-jump-latest"),
     emptyMain: $("#empty-main"),
     chatTitle: $("#chat-title"),
+    chatProject: $("#chat-project"),
     chatModel: $("#chat-model"),
     chatCwd: $("#chat-cwd"),
     statusPill: $("#status-pill"),
@@ -254,6 +255,54 @@
     if (!p) return "";
     const parts = p.replace(/[\\/]+$/, "").split(/[/\\]/);
     return parts[parts.length - 1] || p;
+  }
+
+  function setTopbarSessionMeta(meta) {
+    meta = meta || {};
+    const title = meta.title || "Remote session";
+    if (els.chatTitle) els.chatTitle.textContent = title;
+
+    const cwd = meta.cwd || "";
+    const project = basename(cwd);
+    if (els.chatProject) {
+      if (project) {
+        els.chatProject.textContent = project;
+        els.chatProject.title = cwd;
+        els.chatProject.classList.remove("hidden");
+      } else {
+        els.chatProject.textContent = "";
+        els.chatProject.removeAttribute("title");
+        els.chatProject.classList.add("hidden");
+      }
+    }
+    if (els.chatCwd) {
+      els.chatCwd.textContent = cwd;
+      els.chatCwd.title = cwd;
+    }
+    if (els.chatModel) {
+      if (meta.modelId) {
+        els.chatModel.textContent = meta.modelId;
+        els.chatModel.title = meta.modelId;
+        els.chatModel.classList.remove("hidden");
+      } else {
+        els.chatModel.textContent = "";
+        els.chatModel.classList.add("hidden");
+      }
+    }
+  }
+
+  function clearTopbarSessionMeta() {
+    if (els.chatTitle) els.chatTitle.textContent = "Select a session";
+    if (els.chatProject) {
+      els.chatProject.textContent = "";
+      els.chatProject.classList.add("hidden");
+      els.chatProject.removeAttribute("title");
+    }
+    if (els.chatCwd) els.chatCwd.textContent = "";
+    if (els.chatModel) {
+      els.chatModel.textContent = "";
+      els.chatModel.classList.add("hidden");
+    }
   }
 
   function truncate(s, limit = 120) {
@@ -592,12 +641,7 @@
       attachSwitched: !!(from && from !== toId),
     });
 
-    els.chatTitle.textContent = meta.title || "Remote session";
-    if (meta.modelId) {
-      els.chatModel.textContent = meta.modelId;
-      els.chatModel.classList.remove("hidden");
-    }
-    els.chatCwd.textContent = meta.cwd || "";
+    setTopbarSessionMeta(meta);
     renderSessions();
 
     // Fresh stream view for the hub-owned session (system line may arrive via type:system)
@@ -1362,14 +1406,11 @@
       setSessionMode("history", { attachSwitched: false });
     }
 
-    els.chatTitle.textContent = session.title || "Untitled session";
-    if (session.modelId) {
-      els.chatModel.textContent = session.modelId;
-      els.chatModel.classList.remove("hidden");
-    } else {
-      els.chatModel.classList.add("hidden");
-    }
-    els.chatCwd.textContent = session.cwd || "";
+    setTopbarSessionMeta({
+      title: session.title || "Untitled session",
+      cwd: session.cwd || "",
+      modelId: session.modelId || "",
+    });
     renderSessions();
     syncFsForSession();
     closeRail();
@@ -1429,8 +1470,11 @@
         }
         state.selectedId = liveId;
         state.selectedMeta = meta;
-        els.chatTitle.textContent = meta.title || "Remote session";
-        els.chatCwd.textContent = meta.cwd || cwd || "";
+        setTopbarSessionMeta({
+          title: meta.title || "Remote session",
+          cwd: meta.cwd || cwd || "",
+          modelId: meta.modelId || (session && session.modelId) || "",
+        });
         setSessionMode("live-remote", { attachSwitched: true });
         syncFsForSession();
         if (data.message) {
