@@ -10,8 +10,9 @@ bind_port = 8787
 hub_token = ""
 
 sessions_root = "~/.grok/sessions"
-projects_root = "D:\\Projects"
-# grok_bin = "C:\\Users\\YOU\\.grok\\bin\\grok.exe"
+# Folder that contains your project directories (New Session picker).
+projects_root = "~/Projects"
+# grok_bin = "~/.grok/bin/grok.exe"
 # max_sessions = 80
 # max_history_messages = 800
 

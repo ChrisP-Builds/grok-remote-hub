@@ -19,7 +19,8 @@ else:
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.toml"
 DEFAULT_SESSIONS_ROOT = Path.home() / ".grok" / "sessions"
-DEFAULT_PROJECTS_ROOT = Path(r"D:\Projects")
+# Portable default; override in config.toml (see config.example.toml).
+DEFAULT_PROJECTS_ROOT = Path.home() / "Projects"
 DEFAULT_AGENT_SECRET_PATH = PROJECT_ROOT / "data" / "agent.secret"
 DEFAULT_GROK_BIN_CANDIDATES = (
     Path.home() / ".grok" / "bin" / "grok.exe",

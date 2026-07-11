@@ -2,7 +2,7 @@
 # Usage:
 #   .\follow.ps1
 #   .\follow.ps1 --session 019f493c-af12-7652-a6d8-bf645c10921c
-#   .\follow.ps1 --cwd "D:\Projects\Circana Connections"
+#   .\follow.ps1 --cwd "C:\path\to\your\project"
 #   .\follow.ps1 -v --max-seconds 2
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
