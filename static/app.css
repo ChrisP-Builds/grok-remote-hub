@@ -1314,14 +1314,16 @@ a {
   color: var(--muted);
 }
 
-/* Collapsible thought / plan (still term-line look) */
+/* Collapsible thought / plan / tool (still term-line look) */
 .term-line.thought,
-.term-line.plan {
+.term-line.plan,
+.term-line.tool {
   /* details element */
 }
 
 .term-line.thought > summary,
-.term-line.plan > summary {
+.term-line.plan > summary,
+.term-line.tool > summary {
   cursor: pointer;
   color: var(--muted);
   font-family: var(--font);
@@ -1335,24 +1337,31 @@ a {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: 0 0.4ch;
+  gap: 0.35ch 0.5ch;
 }
 
 .term-line.thought > summary::-webkit-details-marker,
 .term-line.plan > summary::-webkit-details-marker,
+.term-line.tool > summary::-webkit-details-marker,
 .tool-row summary::-webkit-details-marker {
   display: none;
 }
 
 .term-line.thought > summary::before,
-.term-line.plan > summary::before {
+.term-line.plan > summary::before,
+.term-line.tool > summary::before {
   content: "▸ ";
   color: var(--accent);
 }
 
 .term-line.thought[open] > summary::before,
-.term-line.plan[open] > summary::before {
+.term-line.plan[open] > summary::before,
+.term-line.tool[open] > summary::before {
   content: "▾ ";
+}
+
+.term-line.tool > summary::before {
+  color: var(--muted);
 }
 
 .term-line.thought .term-body {
@@ -1360,6 +1369,22 @@ a {
   margin-left: 1.5ch;
   color: var(--muted);
   font-size: 12px;
+}
+
+.tool-one-liner {
+  color: var(--muted);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: min(70vw, 480px);
+}
+
+.tool-detail {
+  margin-top: 4px;
+  margin-left: 1.5ch;
+  font-size: 11.5px;
+  white-space: pre-wrap;
 }
 
 /* Plan checklist */
@@ -1385,6 +1410,14 @@ a {
   font-size: 12px;
   min-width: 0;
   color: var(--muted);
+}
+
+.plan-item[data-status="running"],
+.plan-item.active {
+  color: var(--text);
+  background: rgba(230, 184, 77, 0.08);
+  border-radius: 3px;
+  padding: 2px 4px;
 }
 
 .plan-item-text {

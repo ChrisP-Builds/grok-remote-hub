@@ -60,6 +60,21 @@ def test_js_term_line_structure() -> None:
     assert "shouldShowToolLine" in js
     # Tools always visible path
     assert "shouldShowToolLine" in js
+    # Collapsible tool rows + plan auto-expand
+    assert "createToolLine" in js
+    assert "tool-one-liner" in js
+    assert "tool-detail" in js
+    assert "planHasActiveWork" in js
+    assert 'createElement("details")' in js
+
+
+def test_css_tool_plan_expand() -> None:
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    assert ".term-line.tool > summary" in css
+    assert ".tool-one-liner" in css
+    assert ".tool-detail" in css
+    assert '.plan-item[data-status="running"]' in css
+    assert ".plan-item.active" in css
 
 
 def test_format_term_prefix() -> None:

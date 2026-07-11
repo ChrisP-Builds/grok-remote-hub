@@ -1089,15 +1089,31 @@
     }
   }
 
+  function planHasActiveWork(entries) {
+    return (entries || []).some((e) => {
+      const st = normalizeStatus(e && e.status);
+      return st === "running" || st === "pending" || st === "in_progress";
+    });
+  }
+
+  function planHasRunning(entries) {
+    return (entries || []).some((e) => normalizeStatus(e && e.status) === "running");
+  }
+
   function renderPlanBody(body, entries) {
     body.innerHTML = "";
     const ul = document.createElement("ul");
     ul.className = "plan-list";
+    let activeLi = null;
     for (const e of entries || []) {
       const li = document.createElement("li");
       li.className = "plan-item";
       const st = normalizeStatus(e.status);
       li.dataset.status = st;
+      if (st === "running") {
+        li.classList.add("active", "current");
+        activeLi = li;
+      }
       const dot = document.createElement("span");
       dot.className = `status-dot plan-dot ${statusClass(st)}`;
       dot.setAttribute("aria-hidden", "true");
@@ -1108,13 +1124,23 @@
       ul.appendChild(li);
     }
     body.appendChild(ul);
+    if (activeLi) {
+      const planEl = body.closest("details.term-line.plan");
+      if (planEl && planEl.open) {
+        try {
+          activeLi.scrollIntoView({ block: "nearest", inline: "nearest" });
+        } catch (_) {
+          /* ignore */
+        }
+      }
+    }
   }
 
   function appendPlanMessage(msg) {
     const entries = (msg.meta && msg.meta.entries) || [];
     const details = document.createElement("details");
     details.className = "term-line plan";
-    details.open = false;
+    details.open = planHasActiveWork(entries);
     const summary = document.createElement("summary");
     const prefix = document.createElement("span");
     prefix.className = "term-prefix";
@@ -1144,26 +1170,26 @@
       if (label) label.textContent = formatPlanSummary(entries);
       const body = el.querySelector(".plan-body") || el.querySelector(".term-body");
       if (body) renderPlanBody(body, entries);
+      // Auto-open while work is in progress; leave open as-is when all done.
+      if (planHasActiveWork(entries)) el.open = true;
     }
-    el.open = false;
     scrollIfSticky();
     return el;
   }
 
   function createToolLine({ title, status, summary, toolCallId }) {
-    const row = document.createElement("div");
+    const row = document.createElement("details");
     row.className = "term-line tool";
+    row.open = false;
     const st = normalizeStatus(status || "pending");
     row.dataset.status = st;
     if (st === "running" || st === "pending") row.classList.add("running");
     if (toolCallId) row.dataset.toolCallId = toolCallId;
 
+    const sum = document.createElement("summary");
     const prefix = document.createElement("span");
     prefix.className = "term-prefix";
     prefix.textContent = formatTermPrefix("tool");
-
-    const body = document.createElement("span");
-    body.className = "term-body";
 
     const name = document.createElement("span");
     name.className = "tool-name";
@@ -1173,13 +1199,19 @@
     pill.className = `term-status ${statusClass(st)}`;
     pill.textContent = st;
 
-    body.append(name, document.createTextNode(" "), pill);
+    const oneLiner = document.createElement("span");
+    oneLiner.className = "tool-one-liner muted";
     const snip = (summary || "").trim();
-    if (snip && !String(title || "").includes(snip)) {
-      body.append(document.createTextNode(" " + truncate(snip)));
-    }
+    oneLiner.textContent = snip ? truncate(snip, 80) : "";
+    if (!snip) oneLiner.hidden = true;
 
-    row.append(prefix, body);
+    sum.append(prefix, name, pill, oneLiner);
+
+    const detail = document.createElement("div");
+    detail.className = "term-body tool-detail";
+    detail.textContent = snip || "No detail";
+
+    row.append(sum, detail);
     row._toolTitle = title || "tool";
     row._toolSummary = snip;
     return row;
@@ -1187,6 +1219,7 @@
 
   function updateToolLine(row, { title, status, summary }) {
     if (!row) return;
+    // Never force open/close — preserve user expand state.
     if (status != null) {
       const st = normalizeStatus(status);
       row.dataset.status = st;
@@ -1202,28 +1235,16 @@
       if (name) name.textContent = title;
       row._toolTitle = title;
     }
-    if (summary != null && String(summary).trim()) {
-      row._toolSummary = String(summary).trim();
-      // Rebuild body text after name/status
-      const body = row.querySelector(".term-body");
-      if (body) {
-        const nameEl = body.querySelector(".tool-name");
-        const pillEl = body.querySelector(".term-status");
-        const nameText = (nameEl && nameEl.textContent) || row._toolTitle || "tool";
-        const stText = (pillEl && pillEl.textContent) || row.dataset.status || "";
-        body.innerHTML = "";
-        const name = document.createElement("span");
-        name.className = "tool-name";
-        name.textContent = nameText;
-        const pill = document.createElement("span");
-        pill.className = `term-status ${statusClass(row.dataset.status)}`;
-        pill.textContent = stText;
-        body.append(name, document.createTextNode(" "), pill);
-        const snip = truncate(row._toolSummary);
-        if (snip && !nameText.includes(snip)) {
-          body.append(document.createTextNode(" " + snip));
-        }
+    if (summary != null) {
+      const full = String(summary).trim();
+      row._toolSummary = full;
+      const oneLiner = row.querySelector(".tool-one-liner");
+      if (oneLiner) {
+        oneLiner.textContent = full ? truncate(full, 80) : "";
+        oneLiner.hidden = !full;
       }
+      const detail = row.querySelector(".tool-detail") || row.querySelector(".term-body");
+      if (detail) detail.textContent = full || "No detail";
     }
   }
 
