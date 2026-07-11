@@ -34,9 +34,9 @@
           <input type="search" id="session-search" class="input" placeholder="Search sessions" autocomplete="off" />
         </div>
         <div class="session-kind-filter" role="group" aria-label="Session type">
-          <button type="button" class="kind-chip active" data-kind="all">All</button>
-          <button type="button" class="kind-chip" data-kind="standard">Standard</button>
+          <button type="button" class="kind-chip active" data-kind="working">Working</button>
           <button type="button" class="kind-chip" data-kind="subagent">Subagent</button>
+          <button type="button" class="kind-chip" data-kind="all">All</button>
         </div>
         <div id="session-list" class="session-list" role="list"></div>
         <div id="session-empty" class="empty-rail hidden">
@@ -64,11 +64,14 @@
       <header class="topbar">
         <button type="button" id="btn-menu" class="btn btn-ghost btn-icon" aria-label="Open sidebar" title="Browse sessions">☰</button>
         <div class="topbar-meta">
-          <h1 id="chat-title" class="chat-title">Select a session</h1>
-          <div class="chat-sub">
-            <span id="chat-project" class="chip chip-project hidden"></span>
-            <span id="chat-model" class="chip hidden"></span>
-            <span id="chat-cwd" class="cwd muted"></span>
+          <div class="topbar-title-row">
+            <h1 id="chat-title" class="chat-title">Select a session</h1>
+            <button type="button" id="btn-rename-session" class="session-rename-btn topbar-rename hidden" aria-label="Rename session" title="Rename session">✎</button>
+          </div>
+          <div class="chat-sub" id="chat-sub">
+            <span id="chat-project" class="chip chip-project meta-chip hidden" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Project details"></span>
+            <span id="chat-model" class="chip meta-chip hidden" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Model details"></span>
+            <span id="chat-cwd" class="cwd muted meta-chip" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Project path"></span>
           </div>
         </div>
         <div id="status-pill" class="status-pill" data-state="connecting" title="Connection status">
@@ -112,9 +115,9 @@
           <div id="transcript" class="transcript" aria-live="polite">
             <div id="empty-main" class="empty-main">
               <div class="empty-card">
-                <h2>$ attach stream</h2>
-                <p class="empty-sub">Remote agent stream over Tailscale</p>
-                <p>Open a session to attach the stream, or start a new one in a project folder.</p>
+                <h2>No session selected</h2>
+                <p class="empty-sub">Pick a chat from the sidebar, or start a new one.</p>
+                <p>Your project sessions appear under Working. Subagent runs are under Subagent.</p>
                 <div class="empty-actions">
                   <button type="button" id="btn-empty-sessions" class="btn btn-ghost">Browse sessions</button>
                   <button type="button" id="btn-empty-new" class="btn btn-accent">New session</button>
@@ -138,6 +141,10 @@
               placeholder="Message… (/ for commands)"
               disabled
               enterkeyhint="send"
+              spellcheck="true"
+              autocorrect="on"
+              autocapitalize="sentences"
+              autocomplete="on"
             ></textarea>
             <div class="composer-actions">
               <button type="button" id="btn-stop" class="btn btn-danger btn-sm hidden">Stop</button>
@@ -190,6 +197,25 @@
       <p id="project-empty" class="muted hidden">No projects found under the configured root.</p>
     </div>
   </div>
+
+  <div id="modal-ask-user" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-ask-user-title">
+    <div class="modal-backdrop" data-close="modal-ask-user"></div>
+    <div class="modal-card modal-card-ask">
+      <header class="modal-header">
+        <h2 id="modal-ask-user-title">Agent question</h2>
+        <button type="button" class="btn btn-ghost btn-icon" data-close="modal-ask-user" aria-label="Close">×</button>
+      </header>
+      <p class="muted modal-help">The agent needs your input to continue.</p>
+      <div id="ask-user-body" class="ask-user-body"></div>
+      <div class="modal-actions ask-user-actions">
+        <button type="button" id="btn-ask-user-cancel" class="btn btn-ghost">Cancel</button>
+        <button type="button" id="btn-ask-user-submit" class="btn btn-accent">Submit</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Fixed outside topbar so overflow:hidden does not clip the bubble -->
+  <div id="meta-popover" class="meta-popover hidden" role="tooltip" aria-live="polite"></div>
 
   <div id="toast-host" class="toast-host" aria-live="assertive"></div>
 
