@@ -195,6 +195,10 @@
     historyPollTimer: null,
     usagePollTimer: null,
     usage: null,
+    usageTitles: { context: "", monthly: "" },
+    usagePopoverSeg: null,
+    usagePopoverPinned: false,
+    usageHideTimer: null,
     streamBuffers: {
       assistantEl: null,
       thoughtEl: null,
@@ -307,8 +311,13 @@
     sessionBannerText: $("#session-banner-text"),
     usageBar: $("#usage-bar"),
     usageBarFill: $("#usage-bar-fill"),
+    usageBarFillMonthly: $("#usage-bar-fill-monthly"),
     usageBarLabel: $("#usage-bar-label"),
+    usageBarTokens: $("#usage-bar-tokens"),
     usageBarMonthly: $("#usage-bar-monthly"),
+    usagePopover: $("#usage-popover"),
+    usageSegContext: document.querySelector('[data-usage-seg="context"]'),
+    usageSegMonthly: document.querySelector('[data-usage-seg="monthly"]'),
   };
 
   function tokenFromQuery() {
@@ -3402,87 +3411,264 @@
     return "ok";
   }
 
-  function setUsageBarTitles(title) {
-    if (els.usageBar) {
-      els.usageBar.title = title;
-      if (title) els.usageBar.setAttribute("aria-label", title.replace(/\n/g, " "));
-      else els.usageBar.setAttribute("aria-label", "Context usage");
+  function formatTokenCompact(n) {
+    n = Number(n);
+    if (!Number.isFinite(n) || n < 0) return "—";
+    if (n < 1000) return String(Math.round(n));
+    if (n < 1_000_000) {
+      const k = n / 1000;
+      return (k >= 100 ? Math.round(k) : Math.round(k * 10) / 10).toString().replace(/\.0$/, "") + "K";
     }
-    if (els.usageBarFill) els.usageBarFill.title = title;
-    if (els.usageBarLabel) els.usageBarLabel.title = title;
-    const track = els.usageBar && els.usageBar.querySelector(".usage-bar-track");
-    if (track) track.title = title;
+    const m = n / 1_000_000;
+    return (m >= 10 ? Math.round(m) : Math.round(m * 10) / 10).toString().replace(/\.0$/, "") + "M";
+  }
+
+  function clearUsageHideTimer() {
+    if (state.usageHideTimer) {
+      clearTimeout(state.usageHideTimer);
+      state.usageHideTimer = null;
+    }
+  }
+
+  function setUsageSegActive(seg) {
+    if (els.usageSegContext) {
+      els.usageSegContext.classList.toggle("usage-seg-active", seg === "context");
+      els.usageSegContext.setAttribute("aria-expanded", seg === "context" ? "true" : "false");
+    }
+    if (els.usageSegMonthly) {
+      els.usageSegMonthly.classList.toggle("usage-seg-active", seg === "monthly");
+      els.usageSegMonthly.setAttribute("aria-expanded", seg === "monthly" ? "true" : "false");
+    }
+  }
+
+  function positionUsagePopover(anchorEl) {
+    if (!els.usagePopover || !els.usageBar || !anchorEl) return;
+    const barRect = els.usageBar.getBoundingClientRect();
+    const anchorRect = anchorEl.getBoundingClientRect();
+    const pad = 8;
+    const maxW = Math.min(320, window.innerWidth * 0.92);
+    els.usagePopover.style.maxWidth = `${maxW}px`;
+    // Measure after content set
+    els.usagePopover.classList.remove("hidden");
+    const popW = Math.min(els.usagePopover.offsetWidth || maxW, maxW);
+    const popH = els.usagePopover.offsetHeight || 0;
+    let left = anchorRect.left;
+    if (left + popW > window.innerWidth - pad) left = window.innerWidth - pad - popW;
+    if (left < pad) left = pad;
+    let top = barRect.bottom + 4;
+    if (top + popH > window.innerHeight - pad && barRect.top > popH + pad) {
+      top = barRect.top - popH - 4;
+    }
+    els.usagePopover.style.left = `${Math.round(left)}px`;
+    els.usagePopover.style.top = `${Math.round(top)}px`;
+  }
+
+  function showUsagePopover(seg, anchorEl) {
+    if (!els.usagePopover) return;
+    clearUsageHideTimer();
+    const text = (state.usageTitles && state.usageTitles[seg]) || "";
+    els.usagePopover.textContent = text || "—";
+    state.usagePopoverSeg = seg;
+    setUsageSegActive(seg);
+    positionUsagePopover(anchorEl || (seg === "monthly" ? els.usageSegMonthly : els.usageSegContext));
+  }
+
+  function hideUsagePopover() {
+    clearUsageHideTimer();
+    state.usagePopoverSeg = null;
+    state.usagePopoverPinned = false;
+    setUsageSegActive(null);
+    if (els.usagePopover) {
+      els.usagePopover.classList.add("hidden");
+      els.usagePopover.textContent = "";
+    }
+  }
+
+  function toggleUsagePopover(seg, el) {
+    if (state.usagePopoverSeg === seg && state.usagePopoverPinned) {
+      hideUsagePopover();
+      return;
+    }
+    state.usagePopoverPinned = true;
+    showUsagePopover(seg, el);
+  }
+
+  function scheduleHideUsagePopover() {
+    clearUsageHideTimer();
+    if (state.usagePopoverPinned) return;
+    state.usageHideTimer = setTimeout(() => {
+      state.usageHideTimer = null;
+      if (!state.usagePopoverPinned) hideUsagePopover();
+    }, 160);
   }
 
   function hideUsageBar() {
     state.usage = null;
+    state.usageTitles = { context: "", monthly: "" };
+    hideUsagePopover();
     if (els.usageBar) els.usageBar.classList.add("hidden");
     if (els.usageBarFill) {
       els.usageBarFill.style.width = "0%";
       els.usageBarFill.dataset.level = "ok";
     }
-    if (els.usageBarLabel) els.usageBarLabel.textContent = "—";
-    if (els.usageBarMonthly) {
-      els.usageBarMonthly.classList.add("hidden");
-      els.usageBarMonthly.textContent = "M";
-      els.usageBarMonthly.title = "Monthly usage";
+    if (els.usageBarFillMonthly) {
+      els.usageBarFillMonthly.style.width = "0%";
+      els.usageBarFillMonthly.dataset.level = "ok";
     }
-    setUsageBarTitles("");
+    if (els.usageBarLabel) els.usageBarLabel.textContent = "—";
+    if (els.usageBarTokens) els.usageBarTokens.textContent = "—";
+    if (els.usageBarMonthly) els.usageBarMonthly.textContent = "—";
+    if (els.usageSegMonthly) els.usageSegMonthly.classList.add("usage-seg-na");
   }
 
   function updateUsageBar(data) {
     if (!els.usageBar || !els.usageBarFill || !els.usageBarLabel) return;
-    if (!data || data.contextPercent == null || !Number.isFinite(Number(data.contextPercent))) {
-      // Still show bar when session selected but no data yet
-      els.usageBar.classList.remove("hidden");
+
+    const hasContext =
+      data && data.contextPercent != null && Number.isFinite(Number(data.contextPercent));
+
+    els.usageBar.classList.remove("hidden");
+
+    if (!hasContext) {
       els.usageBarFill.style.width = "0%";
       els.usageBarFill.dataset.level = "ok";
       els.usageBarLabel.textContent = "—";
-      setUsageBarTitles("Context usage unavailable");
-      if (els.usageBarMonthly) els.usageBarMonthly.classList.add("hidden");
-      return;
-    }
-    const pct = Math.max(0, Math.min(100, Number(data.contextPercent)));
-    const rounded = Math.round(pct);
-    els.usageBar.classList.remove("hidden");
-    els.usageBarFill.style.width = `${pct}%`;
-    els.usageBarFill.dataset.level = usageLevel(pct);
-    // Compact visible label; full used/total lives on hover
-    els.usageBarLabel.textContent = `${rounded}%`;
-
-    const used = data.contextTokensUsed;
-    const windowTok = data.contextWindowTokens;
-    let title;
-    if (used != null && windowTok != null) {
-      const usedN = Number(used).toLocaleString();
-      const winN = Number(windowTok).toLocaleString();
-      title =
-        `Context window: ${usedN} / ${winN} tokens (${rounded}%)\n` +
-        `This is session context fill, not monthly Grok subscription usage.`;
+      if (els.usageBarTokens) els.usageBarTokens.textContent = "—";
+      state.usageTitles.context =
+        "Session context window\n" +
+        "Not available from this session yet.\n\n" +
+        "How full this chat is vs the model context limit.\n" +
+        "Not your monthly Grok subscription.";
     } else {
-      title =
-        `Context window: ${rounded}%\n` +
-        `This is session context fill, not monthly Grok subscription usage.`;
-    }
-    setUsageBarTitles(title);
+      const pct = Math.max(0, Math.min(100, Number(data.contextPercent)));
+      const rounded = Math.round(pct);
+      els.usageBarFill.style.width = `${pct}%`;
+      els.usageBarFill.dataset.level = usageLevel(pct);
+      els.usageBarLabel.textContent = `${rounded}%`;
 
-    if (els.usageBarMonthly) {
-      const monthly = data.monthlyPercent;
-      if (monthly != null && Number.isFinite(Number(monthly))) {
-        const m = Math.round(Number(monthly));
-        els.usageBarMonthly.classList.remove("hidden");
-        els.usageBarMonthly.textContent = `M ${m}%`;
-        els.usageBarMonthly.title = `Monthly usage: ${m}%`;
-      } else if (data.isMonthly) {
-        els.usageBarMonthly.classList.remove("hidden");
-        els.usageBarMonthly.textContent = "M";
-        els.usageBarMonthly.title = "Monthly usage";
+      const used = data.contextTokensUsed;
+      const windowTok = data.contextWindowTokens;
+      const usedOk = used != null && Number.isFinite(Number(used));
+      const winOk = windowTok != null && Number.isFinite(Number(windowTok));
+      if (els.usageBarTokens) {
+        els.usageBarTokens.textContent =
+          usedOk && winOk
+            ? `${formatTokenCompact(used)} / ${formatTokenCompact(windowTok)}`
+            : "—";
+      }
+      if (usedOk && winOk) {
+        state.usageTitles.context =
+          "Session context window\n" +
+          `${Number(used).toLocaleString()} / ${Number(windowTok).toLocaleString()} tokens (${rounded}%)\n\n` +
+          "How full this chat is vs the model context limit.\n" +
+          "Not your monthly Grok subscription.";
       } else {
-        els.usageBarMonthly.classList.add("hidden");
-        els.usageBarMonthly.textContent = "M";
-        els.usageBarMonthly.title = "Monthly usage";
+        state.usageTitles.context =
+          "Session context window\n" +
+          `${rounded}%\n\n` +
+          "How full this chat is vs the model context limit.\n" +
+          "Not your monthly Grok subscription.";
       }
     }
+
+    // Monthly segment always visible; muted when missing
+    const monthly = data && data.monthlyPercent;
+    const monthlyOk = monthly != null && Number.isFinite(Number(monthly));
+    if (els.usageBarFillMonthly) {
+      if (monthlyOk) {
+        const mPct = Math.max(0, Math.min(100, Number(monthly)));
+        els.usageBarFillMonthly.style.width = `${mPct}%`;
+        els.usageBarFillMonthly.dataset.level = usageLevel(mPct);
+      } else {
+        els.usageBarFillMonthly.style.width = "0%";
+        els.usageBarFillMonthly.dataset.level = "ok";
+      }
+    }
+    if (els.usageBarMonthly) {
+      els.usageBarMonthly.textContent = monthlyOk ? `${Math.round(Number(monthly))}%` : "—";
+    }
+    if (els.usageSegMonthly) {
+      els.usageSegMonthly.classList.toggle("usage-seg-na", !monthlyOk);
+    }
+    if (monthlyOk) {
+      const m = Math.round(Number(monthly));
+      state.usageTitles.monthly =
+        "Monthly subscription usage\n" +
+        `${m}% of plan quota\n\n` +
+        "Your Grok plan/subscription fill for the period.\n" +
+        "Separate from session context window.";
+    } else {
+      state.usageTitles.monthly =
+        "Monthly subscription usage\n" +
+        "Not available from this session yet.\n\n" +
+        "When Grok reports it, this bar shows plan/quota fill.";
+    }
+
+    // Keep open popover text fresh
+    if (state.usagePopoverSeg && els.usagePopover && !els.usagePopover.classList.contains("hidden")) {
+      const t = state.usageTitles[state.usagePopoverSeg] || "";
+      els.usagePopover.textContent = t || "—";
+      const anchor =
+        state.usagePopoverSeg === "monthly" ? els.usageSegMonthly : els.usageSegContext;
+      positionUsagePopover(anchor);
+    }
+  }
+
+  function bindUsageBarEvents() {
+    if (!els.usageBar) return;
+
+    const segs = [
+      { key: "context", el: els.usageSegContext },
+      { key: "monthly", el: els.usageSegMonthly },
+    ];
+
+    for (const { key, el } of segs) {
+      if (!el) continue;
+      el.addEventListener("mouseenter", () => {
+        if (state.usagePopoverPinned && state.usagePopoverSeg !== key) return;
+        showUsagePopover(key, el);
+      });
+      el.addEventListener("mouseleave", () => {
+        scheduleHideUsagePopover();
+      });
+      el.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleUsagePopover(key, el);
+      });
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          toggleUsagePopover(key, el);
+        }
+      });
+    }
+
+    els.usageBar.addEventListener("mouseleave", () => {
+      scheduleHideUsagePopover();
+    });
+    els.usageBar.addEventListener("mouseenter", () => {
+      clearUsageHideTimer();
+    });
+
+    document.addEventListener("click", (e) => {
+      if (!state.usagePopoverSeg) return;
+      if (els.usageBar && els.usageBar.contains(e.target)) return;
+      hideUsagePopover();
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && state.usagePopoverSeg) {
+        hideUsagePopover();
+      }
+    });
+
+    window.addEventListener("resize", () => {
+      if (!state.usagePopoverSeg) return;
+      const anchor =
+        state.usagePopoverSeg === "monthly" ? els.usageSegMonthly : els.usageSegContext;
+      positionUsagePopover(anchor);
+    });
   }
 
   async function refreshUsage() {
@@ -3517,6 +3703,7 @@
 
   async function bootstrap() {
     bindEvents();
+    bindUsageBarEvents();
     setupViewport();
     updateStatusPill();
     updateVersionBadge();
