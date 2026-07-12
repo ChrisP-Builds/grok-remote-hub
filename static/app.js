@@ -243,6 +243,17 @@
     reconnectTimer: null,
     healthProbeTimer: null,
     hubReachable: null, // null | true | false (from /health while reconnecting)
+    bootId: null,
+    startedAt: null,
+    /** Set when noteBootId sees a new process bootId (hub process restarted). */
+    _hubProcessRestarted: false,
+    /** Freeze sticky scrolls during reconnect resume (one jump at end). */
+    _reconnectScrollFreeze: false,
+    _resumeAfterReconnect: false,
+    /** Durable client error log (toasts still auto-dismiss; strip does not). */
+    /** @type {{at: string, message: string, sessionId: string|null, source: string}[]} */
+    errorLog: [],
+    _lastStripError: null,
 
     status: {
       agent: "down",
@@ -257,6 +268,13 @@
     compatOk: null,
     compatIssues: [],
     hubSessionIds: [],
+    /** @type {Record<string, "working"|"question"|"idle">} */
+    sessionFlags: {},
+    /** @type {{sessionId: string, state: string}[]} */
+    liveTurns: [],
+    /** @type {string[]} */
+    pendingQuestionSessions: [],
+    maxConcurrentTurns: 3,
     sessionMode: "none", // none | history | live-remote
     attachSwitched: false, // true when live id != viewed foreign history id
     /** Hub-owned session id for prompts when viewing a different history id */
@@ -272,6 +290,13 @@
     promptQueueLength: 0,
     stickToBottom: true,
     _ignoreScroll: false,
+    /** Nested history rebuild depth; >0 suppresses per-line scroll/turn-strip thrash. */
+    _historyBatchDepth: 0,
+    _suppressStickyScroll: false,
+    /** Session ids already WS-subscribed this connection (skip redundant history dumps). */
+    subscribedSessions: new Set(),
+    /** @type {Map<string, string>} sessionId -> composer draft text */
+    composerDrafts: new Map(),
     historyLoadedFor: null,
     historyFingerprint: null,
     historyPollTimer: null,
@@ -370,6 +395,7 @@
     chatProject: $("#chat-project"),
     chatModel: $("#chat-model"),
     chatCwd: $("#chat-cwd"),
+    chatSessionId: $("#chat-session-id"),
     statusPill: $("#status-pill"),
     statusLabel: $("#status-label"),
     turnStrip: $("#turn-strip"),
@@ -398,6 +424,11 @@
     projectNewName: $("#project-new-name"),
     btnCreateProject: $("#btn-create-project"),
     toastHost: $("#toast-host"),
+    errorStrip: $("#error-strip"),
+    errorStripTime: $("#error-strip-time"),
+    errorStripMsg: $("#error-strip-msg"),
+    btnErrorCopy: $("#btn-error-copy"),
+    btnErrorDismiss: $("#btn-error-dismiss"),
     versionBadge: $("#version-badge"),
     versionLabel: $("#version-label"),
     compatDot: $("#compat-dot"),
@@ -435,14 +466,124 @@
     return `${proto}//${location.host}/ws${q}`;
   }
 
-  function toast(message, kind = "") {
+  function toast(message, kind = "", durationMs) {
     const el = document.createElement("div");
     el.className = `toast${kind ? " " + kind : ""}`;
     el.textContent = message;
     els.toastHost.appendChild(el);
+    const ms =
+      typeof durationMs === "number"
+        ? durationMs
+        : kind === "danger"
+          ? 8000
+          : 4200;
     setTimeout(() => {
       el.remove();
-    }, 4200);
+    }, ms);
+  }
+
+  /** Recoverable turn-clear notices (stall / max duration / no output) — not hard failures. */
+  function isRecoverableTurnClear(msg) {
+    return /send again|turn cleared|stalled mid-turn|no activity|max duration|no output/i.test(
+      String(msg || "")
+    );
+  }
+
+  /**
+   * Durable hub error: console + state.errorLog + toast + persistent strip.
+   * Toasts still auto-dismiss; the strip stays until Dismiss.
+   */
+  function reportError(message, meta = {}) {
+    const msg = String(message || "Error");
+    const entry = {
+      at: new Date().toISOString(),
+      message: msg,
+      sessionId: meta.sessionId || null,
+      source: meta.source || "hub",
+      level: "danger",
+    };
+    if (!state.errorLog) state.errorLog = [];
+    state.errorLog.unshift(entry);
+    if (state.errorLog.length > 40) state.errorLog.length = 40;
+    try {
+      console.error("[hub]", msg, meta || {});
+    } catch (_) {}
+    toast(msg, "danger", 8000);
+    updateErrorStrip(entry);
+    return entry;
+  }
+
+  /**
+   * Soft recoverable notice (turn cleared, etc.): toast + info strip (auto-dismiss 12s).
+   */
+  function reportInfo(message, meta = {}) {
+    const msg = String(message || "");
+    if (!msg) return null;
+    const entry = {
+      at: new Date().toISOString(),
+      message: msg,
+      sessionId: meta.sessionId || null,
+      source: meta.source || "hub",
+      level: "info",
+    };
+    if (!state.errorLog) state.errorLog = [];
+    state.errorLog.unshift(entry);
+    if (state.errorLog.length > 40) state.errorLog.length = 40;
+    try {
+      console.info("[hub]", msg, meta || {});
+    } catch (_) {}
+    toast(msg, "", 6000);
+    updateErrorStrip(entry);
+    return entry;
+  }
+
+  function updateErrorStrip(entry) {
+    if (!els.errorStrip) return;
+    if (state._infoStripTimer) {
+      clearTimeout(state._infoStripTimer);
+      state._infoStripTimer = null;
+    }
+    if (!entry) {
+      els.errorStrip.classList.add("hidden");
+      els.errorStrip.classList.remove("info", "danger");
+      state._lastStripError = null;
+      return;
+    }
+    state._lastStripError = entry;
+    els.errorStrip.classList.remove("hidden");
+    const isInfo = entry.level === "info";
+    els.errorStrip.classList.toggle("info", isInfo);
+    els.errorStrip.classList.toggle("danger", !isInfo);
+    if (els.errorStripMsg) els.errorStripMsg.textContent = entry.message || "";
+    if (els.errorStripTime) {
+      let label = "";
+      try {
+        label = new Date(entry.at).toLocaleTimeString();
+      } catch (_) {
+        label = "";
+      }
+      els.errorStripTime.textContent = label;
+    }
+    // Info strip auto-dismisses; danger stays until Dismiss.
+    if (isInfo) {
+      state._infoStripTimer = setTimeout(() => {
+        state._infoStripTimer = null;
+        if (state._lastStripError === entry) updateErrorStrip(null);
+      }, 12000);
+    }
+  }
+
+  function dismissErrorStrip() {
+    updateErrorStrip(null);
+  }
+
+  function copyErrorStrip() {
+    const e = state._lastStripError || (state.errorLog && state.errorLog[0]);
+    if (!e || !e.message) return;
+    const text = e.message;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {});
+    }
   }
 
   function relativeTime(iso) {
@@ -465,12 +606,21 @@
     return parts[parts.length - 1] || p;
   }
 
+  function shortSessionId(id) {
+    const s = String(id || "").trim();
+    if (!s) return "";
+    if (s.length <= 12) return s;
+    return s.slice(0, 8) + "…";
+  }
+
   function buildTopbarBubbleText(meta) {
     meta = meta || {};
     const cwd = meta.cwd || "";
     const project = basename(cwd) || (meta.project || "");
     const model = meta.modelId || meta.model || "";
-    return topbarBubbleText(project, model, cwd);
+    const sid = meta.sessionId || state.selectedId || "";
+    const base = topbarBubbleText(project, model, cwd);
+    return sid ? base + "\nSession: " + sid : base;
   }
 
   function setTopbarSessionMeta(meta) {
@@ -484,6 +634,7 @@
 
     const cwd = meta.cwd || "";
     const project = basename(cwd);
+    const sid = String(meta.sessionId || state.selectedId || "").trim();
     if (els.chatProject) {
       if (project) {
         els.chatProject.textContent = project;
@@ -505,6 +656,18 @@
         els.chatModel.classList.add("hidden");
       }
     }
+    if (els.chatSessionId) {
+      if (sid) {
+        els.chatSessionId.textContent = shortSessionId(sid);
+        els.chatSessionId.dataset.sessionId = sid;
+        els.chatSessionId.title = "Click to copy session id\n" + sid;
+        els.chatSessionId.classList.remove("hidden");
+      } else {
+        els.chatSessionId.textContent = "";
+        els.chatSessionId.dataset.sessionId = "";
+        els.chatSessionId.classList.add("hidden");
+      }
+    }
     if (state.metaPopoverPinned || (els.metaPopover && !els.metaPopover.classList.contains("hidden"))) {
       refreshMetaPopoverContent();
     }
@@ -522,7 +685,36 @@
       els.chatModel.textContent = "";
       els.chatModel.classList.add("hidden");
     }
+    if (els.chatSessionId) {
+      els.chatSessionId.textContent = "";
+      els.chatSessionId.dataset.sessionId = "";
+      els.chatSessionId.classList.add("hidden");
+    }
     hideMetaPopover();
+  }
+
+  function copySessionId(sessionId) {
+    const sid = String(sessionId || state.selectedId || "").trim();
+    if (!sid) return;
+    const done = () => toast("Session id copied", "");
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(sid).then(done).catch(() => {
+        // Fallback
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = sid;
+          ta.style.position = "fixed";
+          ta.style.left = "-9999px";
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          ta.remove();
+          done();
+        } catch (_) {
+          toast("Could not copy session id", "danger");
+        }
+      });
+    }
   }
 
   function clearMetaHideTimer() {
@@ -546,12 +738,14 @@
     const project = basename(cwd) || meta.project || "—";
     const model = meta.modelId || meta.model || "—";
     const path = cwd || "—";
+    const sid = String(meta.sessionId || state.selectedId || "").trim() || "—";
     // Structured HTML for clearer bubble (still plain text-safe via textContent)
     els.metaPopover.innerHTML = "";
     const rows = [
       ["Project", project],
       ["Model", model],
       ["Path", path],
+      ["Session", sid],
     ];
     for (const [k, v] of rows) {
       const line = document.createElement("div");
@@ -562,6 +756,23 @@
       const valEl = document.createElement("span");
       valEl.className = "meta-pop-v";
       valEl.textContent = v;
+      if (k === "Session" && v && v !== "—") {
+        valEl.classList.add("meta-pop-v-copy");
+        valEl.title = "Click to copy";
+        valEl.tabIndex = 0;
+        valEl.setAttribute("role", "button");
+        valEl.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          copySessionId(v);
+        });
+        valEl.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            copySessionId(v);
+          }
+        });
+      }
       line.append(keyEl, valEl);
       els.metaPopover.appendChild(line);
     }
@@ -665,6 +876,14 @@
       el.addEventListener("focus", () => {
         if (state.metaPopoverPinned) return;
         showMetaPopover(el);
+      });
+    }
+    // Session id chip: copy on click (does not open meta popover).
+    if (els.chatSessionId) {
+      els.chatSessionId.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        copySessionId(els.chatSessionId.dataset.sessionId || state.selectedId);
       });
     }
     if (els.metaPopover) {
@@ -1093,10 +1312,213 @@
     );
   }
 
+  function sessionLiveStatus(sessionId) {
+    if (!sessionId) return "idle";
+    // Order of truth: pending questions always win over working/idle flags.
+    // Status broadcasts can replace sessionFlags with idle/working and would
+    // otherwise mask a just-set question until the next user_question event.
+    const pending = state.pendingQuestionSessions || [];
+    if (pending.indexOf(sessionId) >= 0) return "question";
+    const flags = state.sessionFlags || {};
+    if (flags[sessionId] === "question") return "question";
+    const turns = state.liveTurns || [];
+    for (let i = 0; i < turns.length; i++) {
+      if (turns[i] && turns[i].sessionId === sessionId) return "working";
+    }
+    // Legacy single-turn fallback
+    if (
+      state.turnRunning &&
+      (sessionId === liveTurnId() ||
+        sessionId === (state.status && state.status.turnSessionId))
+    ) {
+      return "working";
+    }
+    if (flags[sessionId] === "working") return "working";
+    // Explicit idle flag wins over stale sessions-list liveStatus (stall clear).
+    if (flags[sessionId] === "idle") return "idle";
+    // Session payload liveStatus from list scan
+    const row = (state.sessions || []).find((s) => s.sessionId === sessionId);
+    if (row && (row.liveStatus === "working" || row.liveStatus === "question" || row.liveStatus === "idle")) {
+      return row.liveStatus;
+    }
+    return "idle";
+  }
+
+  function sessionStatusRank(st) {
+    if (st === "question") return 2;
+    if (st === "working") return 1;
+    return 0;
+  }
+
+  /** @type {Record<string, number>} */
+  let _sessionPillRanks = {};
+  let _sessionPillsRaf = 0;
+  let _sessionPillsTimer = 0;
+
+  /**
+   * Near-streaming pill updates: set live flags without thrashing full list rebuild.
+   * @param {string} sessionId
+   * @param {"working"|"question"|"idle"} mode
+   */
+  function markSessionActivity(sessionId, mode) {
+    if (!sessionId) return;
+    if (mode !== "working" && mode !== "question" && mode !== "idle") return;
+    if (!state.sessionFlags) state.sessionFlags = {};
+
+    if (mode === "working") {
+      // Never overwrite question with working (question wins until resolved/idle).
+      if (state.sessionFlags[sessionId] !== "question") {
+        const pending = state.pendingQuestionSessions || [];
+        if (pending.indexOf(sessionId) < 0) {
+          state.sessionFlags[sessionId] = "working";
+        }
+      }
+      if (!state.liveTurns) state.liveTurns = [];
+      if (!state.liveTurns.some((t) => t && t.sessionId === sessionId)) {
+        state.liveTurns.push({ sessionId: sessionId, state: "running" });
+      }
+    } else if (mode === "question") {
+      state.sessionFlags[sessionId] = "question";
+    } else {
+      state.sessionFlags[sessionId] = "idle";
+      state.liveTurns = (state.liveTurns || []).filter(
+        (t) => t && t.sessionId !== sessionId
+      );
+      // Idle from turn end: drop pending question for this session.
+      state.pendingQuestionSessions = (state.pendingQuestionSessions || []).filter(
+        (s) => s !== sessionId
+      );
+    }
+
+    const row = (state.sessions || []).find((s) => s && s.sessionId === sessionId);
+    if (row) row.liveStatus = sessionLiveStatus(sessionId);
+
+    scheduleSessionPills();
+  }
+
+  /** Coalesce pill DOM updates to rAF (or max ~50ms). */
+  function scheduleSessionPills() {
+    if (_sessionPillsRaf) return;
+    const flush = () => {
+      _sessionPillsRaf = 0;
+      if (_sessionPillsTimer) {
+        clearTimeout(_sessionPillsTimer);
+        _sessionPillsTimer = 0;
+      }
+      flushSessionPills();
+    };
+    _sessionPillsRaf = requestAnimationFrame(flush);
+    if (!_sessionPillsTimer) {
+      _sessionPillsTimer = setTimeout(() => {
+        _sessionPillsTimer = 0;
+        if (_sessionPillsRaf) {
+          cancelAnimationFrame(_sessionPillsRaf);
+          _sessionPillsRaf = 0;
+        }
+        flushSessionPills();
+      }, 50);
+    }
+  }
+
+  function flushSessionPills() {
+    if (!els.sessionList) return;
+    const rows = els.sessionList.querySelectorAll(".session-row[data-session-id]");
+    let rankChanged = false;
+    const nextRanks = {};
+    for (let i = 0; i < rows.length; i++) {
+      const id = rows[i].getAttribute("data-session-id");
+      if (!id) continue;
+      const rank = sessionStatusRank(sessionLiveStatus(id));
+      nextRanks[id] = rank;
+      const prev = Object.prototype.hasOwnProperty.call(_sessionPillRanks, id)
+        ? _sessionPillRanks[id]
+        : 0;
+      if (prev !== rank) rankChanged = true;
+    }
+    // Full rebuild only when status rank changes (sort order may change).
+    if (rankChanged) {
+      renderSessions();
+      return;
+    }
+    syncVisibleSessionPills();
+    _sessionPillRanks = nextRanks;
+  }
+
+  /** In-place Working / Needs reply pill updates (no list rebuild). */
+  function syncVisibleSessionPills() {
+    if (!els.sessionList) return;
+    const rows = els.sessionList.querySelectorAll(".session-row[data-session-id]");
+    for (let i = 0; i < rows.length; i++) {
+      const btn = rows[i];
+      const id = btn.getAttribute("data-session-id");
+      if (!id) continue;
+      const liveStatus = sessionLiveStatus(id);
+      btn.classList.remove("turn-live", "status-working", "status-question");
+      if (liveStatus === "working") btn.classList.add("turn-live", "status-working");
+      if (liveStatus === "question") btn.classList.add("turn-live", "status-question");
+
+      const titleRow = btn.querySelector(".title-row");
+      if (titleRow) {
+        const stale = titleRow.querySelectorAll(
+          ".session-pill.status-working, .session-pill.status-question"
+        );
+        for (let j = 0; j < stale.length; j++) stale[j].remove();
+        if (liveStatus === "working" || liveStatus === "question") {
+          const pill = document.createElement("span");
+          pill.className =
+            liveStatus === "working"
+              ? "session-pill status-working"
+              : "session-pill status-question";
+          pill.textContent = liveStatus === "working" ? "Working" : "Needs reply";
+          const title = titleRow.querySelector(".title");
+          if (title && title.nextSibling) {
+            titleRow.insertBefore(pill, title.nextSibling);
+          } else if (title) {
+            titleRow.appendChild(pill);
+          } else {
+            titleRow.insertBefore(pill, titleRow.firstChild);
+          }
+        }
+      }
+
+      const meta = btn.querySelector(".meta");
+      if (meta) {
+        let turnHint = meta.querySelector(".turn-hint");
+        const isLiveTurn = liveStatus === "working" || liveStatus === "question";
+        const hint = sessionListProgressHint({
+          is_live_turn: isLiveTurn,
+          tool: toolTitleForSession(id),
+        });
+        if (hint) {
+          if (!turnHint) {
+            turnHint = document.createElement("span");
+            turnHint.className = "turn-hint";
+            const last = meta.lastElementChild;
+            if (last) meta.insertBefore(turnHint, last);
+            else meta.appendChild(turnHint);
+          }
+          turnHint.textContent = hint;
+        } else if (turnHint) {
+          turnHint.remove();
+        }
+      }
+    }
+  }
+
   function turnRunningOnSelected() {
-    if (!state.turnRunning || !state.selectedId) return false;
+    if (!state.selectedId) return false;
+    const st = sessionLiveStatus(state.selectedId);
+    return st === "working" || st === "question";
+  }
+
+  function hasOtherProjectTurn() {
+    if (!state.selectedId) return !!state.turnRunning || (state.liveTurns || []).length > 0;
+    const turns = state.liveTurns || [];
+    if (turns.length) {
+      return turns.some((t) => t && t.sessionId && t.sessionId !== state.selectedId);
+    }
     const live = liveTurnId();
-    return !live || live === state.selectedId;
+    return !!(state.turnRunning && live && live !== state.selectedId);
   }
 
   function toolTitleForSession(sessionId) {
@@ -1163,6 +1585,16 @@
       if (stale && open) row.classList.add("stale");
       else row.classList.remove("stale");
     }
+  }
+
+  let _turnStripRaf = 0;
+  function scheduleTurnStrip() {
+    if (state._historyBatchDepth > 0) return;
+    if (_turnStripRaf) return;
+    _turnStripRaf = requestAnimationFrame(() => {
+      _turnStripRaf = 0;
+      updateTurnStrip();
+    });
   }
 
   function updateTurnStrip() {
@@ -1267,12 +1699,17 @@
         "Remote agent stream. Load a session to chat; desktop TUI stays separate.";
     } else if (turnRunningOnSelected()) {
       const q = state.promptQueueLength || 0;
-      els.composerHint.textContent = q
-        ? `Turn running · ${q} queued. Send adds to queue.`
-        : "Turn running · Send queues your next message.";
-    } else if (state.turnRunning && liveTurnId() && liveTurnId() !== state.selectedId) {
+      const st = sessionLiveStatus(state.selectedId);
+      if (st === "question") {
+        els.composerHint.textContent = "Agent is asking a question — answer in the dialog.";
+      } else {
+        els.composerHint.textContent = q
+          ? `Turn running · ${q} queued. Send adds to queue.`
+          : "Turn running · Send queues your next message.";
+      }
+    } else if (hasOtherProjectTurn()) {
       els.composerHint.textContent =
-        "Another session has a live turn. You can switch back anytime.";
+        "Other projects may be working. You can send here anytime.";
     } else if (state.sessionMode === "history") {
       els.composerHint.textContent =
         "History view. Opening attaches a live remote session (not the desktop TUI).";
@@ -1331,19 +1768,87 @@
     if (label) label.textContent = "thinking";
   }
 
-  function setTurnRunning(running) {
+  /**
+   * Drop stale client mid-turn / queue state when the server has no live turns
+   * (soft reconnect) or the hub process restarted.
+   * Does not clear composer drafts.
+   * @param {{ clearQuestions?: boolean }} opts
+   */
+  function clearStaleLiveTurns(opts = {}) {
+    const clearQuestions = !!opts.clearQuestions;
+    state.liveTurns = [];
+    state.turnRunning = false;
+    state.liveTurnSessionId = null;
+    if (state.status) {
+      state.status.turnRunning = false;
+      state.status.turnSessionId = null;
+    }
+    state.turnStartedAt = null;
+    state.lastTermLineAt = null;
+    state.promptQueueLength = 0;
+    clearStallWatch();
+
+    const flags = state.sessionFlags || {};
+    const next = {};
+    for (const k of Object.keys(flags)) {
+      next[k] = "idle";
+    }
+    if (!clearQuestions) {
+      const pending = state.pendingQuestionSessions || [];
+      for (let i = 0; i < pending.length; i++) {
+        const pid = pending[i];
+        if (pid) next[pid] = "question";
+      }
+    }
+    state.sessionFlags = next;
+
+    if (clearQuestions) {
+      state.pendingQuestionSessions = [];
+      closeAskUserModal();
+    }
+
+    if (state.sessionViews) {
+      for (const v of state.sessionViews.values()) {
+        if (v && v.pane) markStalePlanItems(v.pane, true);
+      }
+    }
+    if (state.activePane) markStalePlanItems(state.activePane, true);
+
+    setComposerEnabled(composerConnected());
+    forceComposerUnlocked();
+    updateTurnStrip();
+    renderSessions();
+  }
+
+  /** Full wipe of live client state after hub process restart (pending Qs die with process). */
+  function clearLiveClientStateAfterProcessRestart(reason) {
+    clearStaleLiveTurns({ clearQuestions: true });
+    try {
+      console.info(
+        "[hub] cleared live client state after process restart:",
+        reason || ""
+      );
+    } catch (_) {}
+  }
+
+  function setTurnRunning(running, sessionId, opts) {
+    if (!running && opts && opts.all) {
+      clearStaleLiveTurns({ clearQuestions: !!opts.clearQuestions });
+      return;
+    }
     state.turnRunning = !!running;
     if (running) {
+      if (sessionId) state.liveTurnSessionId = sessionId;
       startStallWatch();
     } else {
       clearStallWatch();
-      if (state.streamBuffers) {
+      const clearId = sessionId || state.liveTurnSessionId;
+      if (state.streamBuffers && (!clearId || clearId === state.selectedId)) {
         state.streamBuffers.lastToolTitle = "";
         markThoughtComplete(state.streamBuffers);
       }
-      const live = liveTurnId();
-      if (live) {
-        const v = state.sessionViews.get(live);
+      if (clearId) {
+        const v = state.sessionViews.get(clearId);
         if (v) {
           v.lastToolTitle = "";
           if (v.streamBuffers) {
@@ -1351,8 +1856,28 @@
             markThoughtComplete(v.streamBuffers);
           }
         }
+        state.liveTurns = (state.liveTurns || []).filter(
+          (t) => t && t.sessionId !== clearId
+        );
+        if (state.sessionFlags) state.sessionFlags[clearId] = "idle";
       }
-      state.liveTurnSessionId = null;
+      // Keep liveTurnSessionId if other turns remain; full idle when none left
+      if (!(state.liveTurns && state.liveTurns.length)) {
+        state.liveTurnSessionId = null;
+        state.turnRunning = false;
+        state.turnStartedAt = null;
+        state.lastTermLineAt = null;
+        // Server reported no lives: force remaining working flags idle
+        if (opts && opts.forceIdleFlags && state.sessionFlags) {
+          for (const k of Object.keys(state.sessionFlags)) {
+            if (state.sessionFlags[k] === "working") state.sessionFlags[k] = "idle";
+          }
+        }
+      } else {
+        state.turnRunning = true;
+        const still = state.liveTurns[state.liveTurns.length - 1];
+        state.liveTurnSessionId = still ? still.sessionId : null;
+      }
     }
     setComposerEnabled(composerConnected());
     forceComposerUnlocked();
@@ -1404,12 +1929,14 @@
         path: "",
         isWorking: true,
       };
+      if (!meta.sessionId) meta.sessionId = toId;
       state.sessions = [meta, ...state.sessions.filter((s) => s.sessionId !== toId)];
     }
     if (from && from !== toId) {
       cacheSessionView(from);
     }
     state.selectedId = toId;
+    if (meta && !meta.sessionId) meta.sessionId = toId;
     state.selectedMeta = meta;
     state.livePromptSessionId = toId;
     // Keep prior commands until agent sends a fresh list; builtins fill gaps.
@@ -1436,8 +1963,9 @@
     }
     noteTermLineActivity();
 
-    sendWs({ type: "subscribe", sessionId: toId });
+    subscribeSessionIds(toId, { force: true });
     if (from && from !== toId) {
+      if (state.subscribedSessions) state.subscribedSessions.delete(from);
       sendWs({ type: "unsubscribe", sessionId: from });
     }
     setComposerEnabled(composerConnected());
@@ -1610,6 +2138,16 @@
         const ap = isPinned(a.sessionId) ? 1 : 0;
         const bp = isPinned(b.sessionId) ? 1 : 0;
         if (ap !== bp) return bp - ap;
+        // Question sessions first (agent waiting), then working, then rest.
+        const rank = (s) => {
+          const st = sessionLiveStatus(s.sessionId) || s.liveStatus || "idle";
+          if (st === "question") return 2;
+          if (st === "working") return 1;
+          return 0;
+        };
+        const ar = rank(a);
+        const br = rank(b);
+        if (ar !== br) return br - ar;
         const at = a.updatedAt || "";
         const bt = b.updatedAt || "";
         if (at === bt) return 0;
@@ -1631,21 +2169,22 @@
       }
     }
 
+    const nextPillRanks = {};
     for (const s of items) {
       const pinned = isPinned(s.sessionId);
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = "session-row" + (pinned ? " pinned" : "");
       btn.setAttribute("role", "listitem");
+      btn.setAttribute("data-session-id", s.sessionId || "");
       btn.title = sessionTooltip(s);
       if (s.sessionId === state.selectedId) btn.classList.add("active");
       if (s.sessionId === state.status.loadedSessionId) btn.classList.add("live");
-      const isLiveTurn =
-        !!state.turnRunning &&
-        !!s.sessionId &&
-        (s.sessionId === liveTurnId() ||
-          s.sessionId === state.status.turnSessionId);
-      if (isLiveTurn) btn.classList.add("turn-live");
+      const liveStatus = sessionLiveStatus(s.sessionId) || s.liveStatus || "idle";
+      nextPillRanks[s.sessionId] = sessionStatusRank(liveStatus);
+      const isLiveTurn = liveStatus === "working" || liveStatus === "question";
+      if (liveStatus === "working") btn.classList.add("turn-live", "status-working");
+      if (liveStatus === "question") btn.classList.add("turn-live", "status-question");
 
       const bar = document.createElement("span");
       bar.className = "live-bar";
@@ -1660,6 +2199,17 @@
       title.className = "title";
       title.textContent = s.title || "Untitled session";
       titleRow.appendChild(title);
+      if (liveStatus === "working") {
+        const pill = document.createElement("span");
+        pill.className = "session-pill status-working";
+        pill.textContent = "Working";
+        titleRow.appendChild(pill);
+      } else if (liveStatus === "question") {
+        const pill = document.createElement("span");
+        pill.className = "session-pill status-question";
+        pill.textContent = "Needs reply";
+        titleRow.appendChild(pill);
+      }
       if (s.isSubagent) {
         const pill = document.createElement("span");
         pill.className = "session-pill subagent";
@@ -1783,6 +2333,7 @@
       });
       els.sessionList.appendChild(btn);
     }
+    _sessionPillRanks = nextPillRanks;
   }
 
   function emptyStreamBuffers() {
@@ -2042,9 +2593,29 @@
     updateJumpLatestUiOnly();
   }
 
+  function beginHistoryBatch() {
+    state._historyBatchDepth = (state._historyBatchDepth || 0) + 1;
+    state._suppressStickyScroll = true;
+  }
+
+  function endHistoryBatch({ jump } = {}) {
+    state._historyBatchDepth = Math.max(0, (state._historyBatchDepth || 1) - 1);
+    if (state._historyBatchDepth === 0) {
+      // Keep suppress during reconnect freeze until resumeAfterReconnect finishes.
+      if (!state._reconnectScrollFreeze) {
+        state._suppressStickyScroll = false;
+      }
+      updateTurnStrip();
+      if (jump && state.stickToBottom && !state._reconnectScrollFreeze) jumpToLatest();
+      else updateJumpLatestUiOnly();
+    }
+  }
+
   function scrollIfSticky(force) {
+    // Reconnect resume freezes intermediate sticky scrolls (final jump is intentional).
+    if (state._reconnectScrollFreeze && !force) return;
     // Batch history rebuilds suppress intermediate scrolls.
-    if (state._suppressStickyScroll && !force) return;
+    if ((state._suppressStickyScroll || state._historyBatchDepth > 0) && !force) return;
     // Offscreen session panes must not move the visible scroll position.
     if (state.activePane && state.activePane.hidden) return;
     if (!shouldScrollToBottom(state.stickToBottom, !!force)) {
@@ -2334,8 +2905,10 @@
       if (existing && existing.isConnected) {
         updateToolLine(existing, { title, status: st, summary });
         state.streamBuffers.lastToolTitle = title;
-        updateTurnStrip();
-        scrollIfSticky();
+        if (!(state._historyBatchDepth > 0)) {
+          scheduleTurnStrip();
+          scrollIfSticky();
+        }
         return existing;
       }
     }
@@ -2349,8 +2922,10 @@
     transcriptRoot().appendChild(row);
     if (id) state.streamBuffers.tools.set(id, row);
     state.streamBuffers.lastToolTitle = title;
-    updateTurnStrip();
-    scrollIfSticky();
+    if (!(state._historyBatchDepth > 0)) {
+      scheduleTurnStrip();
+      scrollIfSticky();
+    }
     return row;
   }
 
@@ -2440,24 +3015,28 @@
       return false;
     }
     const wasNearBottom = state.stickToBottom || distanceFromBottom() < 120;
-    renderHistory(list, { skipScroll: true });
-    state.historyLoadedFor = sessionId;
-    state.historyFingerprint = fp;
-    if (sessionId) {
-      const v = getSessionPane(sessionId);
-      v.historyFingerprint = fp;
-      v.historyLoaded = true;
-    }
-    if (wasNearBottom || opts.jump) {
-      jumpToLatest();
+    beginHistoryBatch();
+    try {
+      renderHistory(list, { skipScroll: true });
+      state.historyLoadedFor = sessionId;
+      state.historyFingerprint = fp;
+      if (sessionId) {
+        const v = getSessionPane(sessionId);
+        v.historyFingerprint = fp;
+        v.historyLoaded = true;
+      }
+    } finally {
+      // During reconnect freeze, resumeAfterReconnect does a single final jump.
+      const shouldJump =
+        !state._reconnectScrollFreeze && (wasNearBottom || !!opts.jump);
+      endHistoryBatch({ jump: shouldJump });
     }
     return true;
   }
 
   function renderHistory(messages, opts = {}) {
-    // Suppress per-line scrollIfSticky during rebuild; one pass after batch.
-    const prevSuppress = !!state._suppressStickyScroll;
-    state._suppressStickyScroll = true;
+    // Suppress per-line scroll/turn-strip during rebuild; one pass after batch.
+    beginHistoryBatch();
     try {
       clearTranscript();
       showEmptyMain(false);
@@ -2475,14 +3054,17 @@
       state.streamBuffers.activityEl = null;
       state.streamBuffers.tools = new Map();
       state.streamBuffers.lastToolTitle = "";
-      state.stickToBottom = true;
+      // Do not force stick-to-bottom during reconnect if user scrolled up.
+      if (!state._reconnectScrollFreeze) {
+        state.stickToBottom = true;
+      } else if (state.stickToBottom !== false) {
+        // Keep existing stick preference (only default true when already true).
+      }
     } finally {
-      state._suppressStickyScroll = prevSuppress;
+      endHistoryBatch({
+        jump: !opts.skipScroll && !state._reconnectScrollFreeze,
+      });
     }
-    if (!opts.skipScroll) {
-      scrollIfSticky(true);
-    }
-    updateTurnStrip();
   }
 
   function extractText(content) {
@@ -2602,7 +3184,7 @@
       if (id && row) state.streamBuffers.tools.set(id, row);
       state.streamBuffers.assistantEl = null;
       state.streamBuffers.lastToolTitle = label;
-      updateTurnStrip();
+      scheduleTurnStrip();
       return;
     }
 
@@ -2631,7 +3213,7 @@
       }
       // Tools stay closed by default; never auto-open on completion.
       state.streamBuffers.lastToolTitle = label;
-      updateTurnStrip();
+      scheduleTurnStrip();
       scrollIfSticky();
     }
   }
@@ -2692,6 +3274,20 @@
     const targetId = sessionId || state.selectedId;
     if (!targetId) return;
 
+    // Stream activity → Working pill immediately (including offscreen sessions).
+    // markSessionActivity never overwrites question with working.
+    if (
+      kind === "user_message_chunk" ||
+      kind === "agent_message_chunk" ||
+      kind === "agent_thought_chunk" ||
+      kind === "plan" ||
+      kind === "tool_call" ||
+      kind === "tool_call_update" ||
+      kind
+    ) {
+      markSessionActivity(targetId, "working");
+    }
+
     // Queued user echoes may use view id while selection is live (or vice versa).
     if (kind === "user_message_chunk") {
       const acceptUserEcho =
@@ -2716,8 +3312,8 @@
       if (kind === "tool_call" || kind === "tool_call_update") {
         const v = state.sessionViews.get(targetId);
         if (v && v.streamBuffers) v.lastToolTitle = v.streamBuffers.lastToolTitle || "";
-        renderSessions();
-        updateTurnStrip();
+        scheduleSessionPills();
+        scheduleTurnStrip();
       }
     };
 
@@ -2735,12 +3331,80 @@
     after();
   }
 
-  function subscribeSessionIds(...ids) {
+  function subscribeSessionIds(...args) {
+    let force = false;
+    const ids = [];
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (a && typeof a === "object" && !Array.isArray(a) && "force" in a) {
+        force = !!a.force;
+        continue;
+      }
+      if (a) ids.push(a);
+    }
+    if (!state.subscribedSessions) state.subscribedSessions = new Set();
     const seen = new Set();
     for (const id of ids) {
       if (!id || seen.has(id)) continue;
       seen.add(id);
+      if (!force && state.subscribedSessions.has(id)) continue;
+      state.subscribedSessions.add(id);
       sendWs({ type: "subscribe", sessionId: id });
+    }
+  }
+
+  /**
+   * POST /api/sessions/{id}/attach — ensure live hub session (session/load or new).
+   * Shared by openSession and resumeAfterReconnect after process restart.
+   * @returns {{liveId: string, switched: boolean, message: string, cwd: string}|null}
+   */
+  async function attachSessionLive(viewId, cwd, opts = {}) {
+    const showFailToast = opts.showFailToast !== false;
+    const focusOnFail = !!opts.focusOnFail;
+    try {
+      const res = await fetch(
+        apiUrl(`/api/sessions/${encodeURIComponent(viewId)}/attach`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cwd: cwd || "" }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        if (showFailToast) {
+          toast(data.error || "Attach failed — history only until agent is up", "danger");
+        }
+        subscribeSessionIds(viewId);
+        if (focusOnFail && els.input) els.input.focus();
+        return null;
+      }
+      const liveId = data.liveSessionId || viewId;
+      const switched = !!data.switched && liveId !== viewId;
+      if (Array.isArray(data.commands) && data.commands.length) {
+        applyCommands(data.commands);
+      }
+      if (state.hubSessionIds.indexOf(liveId) < 0) {
+        state.hubSessionIds = [liveId, ...state.hubSessionIds].slice(0, 50);
+      }
+      if (state.hubSessionIds.indexOf(viewId) < 0) {
+        state.hubSessionIds = [viewId, ...state.hubSessionIds].slice(0, 50);
+      }
+      state.livePromptSessionId = liveId;
+      if (!switched) {
+        setSessionMode("live-remote", { attachSwitched: false });
+      }
+      return {
+        liveId,
+        switched,
+        message: data.message || "",
+        cwd: data.cwd || cwd || "",
+      };
+    } catch (err) {
+      if (showFailToast) toast("Attach failed: " + err, "danger");
+      subscribeSessionIds(viewId);
+      if (focusOnFail && els.input) els.input.focus();
+      return null;
     }
   }
 
@@ -2760,9 +3424,11 @@
     const liveKeep = liveTurnId();
 
     if (prevId && prevId !== viewId) {
+      saveComposerDraft(prevId);
       cacheSessionView(prevId);
       // Keep WS subscription on the live turn session while it runs
       if (!(state.turnRunning && prevId === liveKeep)) {
+        if (state.subscribedSessions) state.subscribedSessions.delete(prevId);
         sendWs({ type: "unsubscribe", sessionId: prevId });
       }
     }
@@ -2780,8 +3446,10 @@
     const isLiveTurnHere =
       !!state.turnRunning &&
       (viewId === liveKeep || viewId === state.status.turnSessionId);
+    // Reuse when pane already has content or history was loaded (avoid HTTP + WS double rebuild).
     const hasCachedContent =
-      !!(existing && existing.pane && existing.pane.childElementCount > 0);
+      !!(existing && existing.pane && existing.pane.childElementCount > 0) ||
+      !!(existing && existing.historyLoaded);
 
     showEmptyMain(false);
     const paneView = showSessionPane(viewId);
@@ -2800,6 +3468,7 @@
       title: session.title || "Untitled session",
       cwd: session.cwd || "",
       modelId: session.modelId || "",
+      sessionId: session.sessionId || viewId,
     });
     renderSessions();
     syncFsForSession();
@@ -2808,20 +3477,23 @@
     forceComposerUnlocked();
     updateTurnStrip();
     refreshUsage();
+    restoreComposerDraft(viewId);
 
-    // Restore live/cached pane without wiping the in-flight stream
-    const reusePane = hasCachedContent && (isLiveTurnHere || paneView.historyLoaded);
+    // Restore live/cached pane without wiping the in-flight stream / replaying history.
+    const reusePane = hasCachedContent;
     if (reusePane) {
       rebuildToolsFromPane(paneView);
       state.streamBuffers = paneView.streamBuffers;
-      if (state.stickToBottom) scrollTranscriptToBottom();
+      if (state.stickToBottom) jumpToLatest();
     } else {
-      // History for the viewed session first (catch-up / TUI context)
+      // HTTP history only when pane empty / not historyLoaded
       try {
         const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(viewId)}/history`));
         const data = await res.json();
         if (state.selectedId !== viewId) return;
-        applyHistoryMessages(data.messages || [], { force: true, jump: true });
+        applyHistoryMessages(data.messages || [], {
+          jump: !!state.stickToBottom,
+        });
       } catch (err) {
         if (state.selectedId !== viewId) return;
         clearTranscript();
@@ -2853,32 +3525,22 @@
     }
     if (!(isLiveTurnHere && reusePane)) {
       try {
-        const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(viewId)}/attach`), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cwd: session.cwd || "" }),
+        const attached = await attachSessionLive(viewId, session.cwd || "", {
+          focusOnFail: true,
+          showFailToast: true,
         });
-        const data = await res.json().catch(() => ({}));
-        if (state.selectedId !== viewId && state.selectedId !== (data.liveSessionId || viewId)) {
-          return;
-        }
-        if (!res.ok) {
-          // Agent down or attach failed: stay on history view + subscribe view
-          toast(data.error || "Attach failed — history only until agent is up", "danger");
+        if (!attached) {
           subscribeSessionIds(viewId, liveKeep);
-          els.input.focus();
           return;
         }
-        liveId = data.liveSessionId || viewId;
-        switched = !!data.switched && liveId !== viewId;
-        const cwd = data.cwd || session.cwd || "";
-        if (Array.isArray(data.commands) && data.commands.length) {
-          applyCommands(data.commands);
+        if (
+          state.selectedId !== viewId &&
+          state.selectedId !== attached.liveId
+        ) {
+          return;
         }
-
-        if (state.hubSessionIds.indexOf(liveId) < 0) {
-          state.hubSessionIds = [liveId, ...state.hubSessionIds].slice(0, 50);
-        }
+        liveId = attached.liveId;
+        switched = !!attached.switched && liveId !== viewId;
 
         // Always remember where prompts should go
         state.livePromptSessionId = liveId;
@@ -2890,11 +3552,11 @@
             // User navigated away during attach; do not steal focus back.
           } else {
             setSessionMode("live-remote", { attachSwitched: true });
-            if (data.message) {
+            if (attached.message) {
               appendMessage({
                 role: "system",
                 text:
-                  data.message +
+                  attached.message +
                   " (Still showing this session’s transcript; sends use the live hub session.)",
               });
             }
@@ -2922,7 +3584,8 @@
     forceComposerUnlocked();
     updateTurnStrip();
     refreshUsage();
-    if (state.stickToBottom) scrollTranscriptToBottom();
+    restoreComposerDraft(viewId);
+    if (state.stickToBottom) jumpToLatest();
     clampHorizontalScroll();
     els.input.focus({ preventScroll: true });
     // Focus can still nudge layout on some mobile browsers
@@ -2935,6 +3598,87 @@
     }
   }
 
+  const DRAFT_STORAGE_KEY = "grh.composerDrafts";
+  const DRAFT_MAX_SESSIONS = 100;
+  const DRAFT_MAX_CHARS = 50000;
+
+  function loadComposerDrafts() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(DRAFT_STORAGE_KEY) || "{}");
+      if (!raw || typeof raw !== "object") {
+        state.composerDrafts = new Map();
+        return;
+      }
+      const map = new Map();
+      const keys = Object.keys(raw);
+      for (let i = 0; i < keys.length && map.size < DRAFT_MAX_SESSIONS; i++) {
+        const k = keys[i];
+        const v = raw[k];
+        if (typeof v === "string" && v) {
+          map.set(k, v.length > DRAFT_MAX_CHARS ? v.slice(0, DRAFT_MAX_CHARS) : v);
+        }
+      }
+      state.composerDrafts = map;
+    } catch (_) {
+      state.composerDrafts = new Map();
+    }
+  }
+
+  function persistComposerDrafts() {
+    try {
+      const obj = {};
+      let n = 0;
+      for (const [k, v] of state.composerDrafts) {
+        if (!v) continue;
+        obj[k] = String(v).slice(0, DRAFT_MAX_CHARS);
+        n += 1;
+        if (n >= DRAFT_MAX_SESSIONS) break;
+      }
+      localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(obj));
+    } catch (_) {}
+  }
+
+  function saveComposerDraft(sessionId) {
+    if (!sessionId || !els.input) return;
+    if (!state.composerDrafts) state.composerDrafts = new Map();
+    const text = els.input.value || "";
+    if (text) state.composerDrafts.set(sessionId, text.slice(0, DRAFT_MAX_CHARS));
+    else state.composerDrafts.delete(sessionId);
+    persistComposerDrafts();
+  }
+
+  function restoreComposerDraft(sessionId) {
+    if (!els.input) return;
+    const text =
+      sessionId && state.composerDrafts && state.composerDrafts.has(sessionId)
+        ? state.composerDrafts.get(sessionId) || ""
+        : "";
+    els.input.value = text || "";
+    autoGrow();
+  }
+
+  function clearComposerDraft(sessionId) {
+    if (sessionId && state.composerDrafts) state.composerDrafts.delete(sessionId);
+    persistComposerDrafts();
+    if (els.input && sessionId === state.selectedId) {
+      els.input.value = "";
+      autoGrow();
+    }
+  }
+
+  function noteBootId(bootId, startedAt) {
+    if (bootId) {
+      if (state.bootId && state.bootId !== bootId) {
+        // Hub process restarted while page stayed open — drop stale mid-turn UI.
+        clearLiveClientStateAfterProcessRestart("bootId changed");
+        state._hubProcessRestarted = true;
+        state._resumeAfterReconnect = true;
+      }
+      state.bootId = bootId;
+    }
+    if (startedAt != null) state.startedAt = startedAt;
+  }
+
   function probeHubHealth() {
     fetch("/health", { method: "GET", cache: "no-store" })
       .then((r) => {
@@ -2943,6 +3687,7 @@
       })
       .then((j) => {
         state.hubReachable = !!(j && j.ok === true);
+        if (j) noteBootId(j.bootId, j.startedAt);
         if (state.wsState === "reconnecting" || state.wsState === "connecting") {
           updateStatusPill();
         }
@@ -2969,6 +3714,305 @@
     state.hubReachable = null;
   }
 
+  /**
+   * Session ids that need resume after reconnect (selected + all mid-turn / question).
+   */
+  function collectLiveSessionIds() {
+    const ids = [];
+    const seen = new Set();
+    function add(id) {
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      ids.push(id);
+    }
+    add(state.selectedId);
+    const turns = state.liveTurns || [];
+    for (let i = 0; i < turns.length; i++) {
+      if (turns[i] && turns[i].sessionId) add(turns[i].sessionId);
+    }
+    const flags = state.sessionFlags || {};
+    for (const sid of Object.keys(flags)) {
+      if (flags[sid] === "working" || flags[sid] === "question") add(sid);
+    }
+    const pending = state.pendingQuestionSessions || [];
+    for (let i = 0; i < pending.length; i++) add(pending[i]);
+    add(liveTurnId());
+    add(state.livePromptSessionId);
+    return ids;
+  }
+
+  /**
+   * Light catch-up for live sessions discovered after reconnect status arrives.
+   * Subscribe + ensure panes only (idempotent; no history wipe).
+   */
+  function ensureLiveSessionsResumed(ids) {
+    if (!ids || !ids.length) return;
+    for (let i = 0; i < ids.length; i++) {
+      const sid = ids[i];
+      if (!sid) continue;
+      subscribeSessionIds(sid);
+      getSessionPane(sid);
+    }
+  }
+
+  /**
+   * Render history into a session pane without thrashing the selected transcript.
+   * Offscreen panes use withSessionTarget so selected scroll stays put.
+   */
+  function hydrateSessionPane(sessionId, messages) {
+    if (!sessionId) return false;
+    const list = messages || [];
+    const fp = historyFingerprint(list);
+    const v = getSessionPane(sessionId);
+    if (fp === v.historyFingerprint && v.historyLoaded) return false;
+
+    const isSelected = sessionId === state.selectedId;
+    withSessionTarget(sessionId, () => {
+      if (!v.pane.parentNode && els.transcript) {
+        els.transcript.appendChild(v.pane);
+        v.pane.hidden = !isSelected;
+      }
+      beginHistoryBatch();
+      try {
+        v.pane.innerHTML = "";
+        if (!list.length) {
+          appendMessage({
+            role: "system",
+            text: "No prior transcript on disk for this session.",
+          });
+        } else {
+          for (let i = 0; i < list.length; i++) appendMessage(list[i]);
+        }
+        v.streamBuffers.assistantEl = null;
+        v.streamBuffers.thoughtEl = null;
+        v.streamBuffers.planEl = null;
+        v.streamBuffers.activityEl = null;
+        v.streamBuffers.tools = new Map();
+        v.streamBuffers.lastToolTitle = "";
+      } finally {
+        endHistoryBatch({ jump: false });
+      }
+    });
+
+    v.historyFingerprint = fp;
+    v.historyLoaded = true;
+    if (isSelected) {
+      state.historyLoadedFor = sessionId;
+      state.historyFingerprint = fp;
+      if (state.activePane === v.pane) {
+        state.streamBuffers = v.streamBuffers;
+      }
+    }
+    return true;
+  }
+
+  async function hydrateSessionHistory(sessionId, opts = {}) {
+    if (!sessionId) return;
+    getSessionPane(sessionId);
+    try {
+      const res = await fetch(
+        apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/history`)
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      hydrateSessionPane(sessionId, data.messages || []);
+      if (
+        opts.visibleJump &&
+        sessionId === state.selectedId &&
+        state.stickToBottom &&
+        !state._reconnectScrollFreeze
+      ) {
+        jumpToLatest();
+      }
+    } catch (_) {
+      // keep current transcript on transient failures
+    }
+  }
+
+  /** Merge server-truth live state from /health before multi-session resume. */
+  async function mergeHealthIntoState() {
+    try {
+      const r = await fetch("/health", { method: "GET", cache: "no-store" });
+      if (!r.ok) return null;
+      const j = await r.json();
+      if (!j) return null;
+      noteBootId(j.bootId, j.startedAt);
+      if (Array.isArray(j.liveTurns)) state.liveTurns = j.liveTurns;
+      if (Array.isArray(j.pendingQuestionSessions)) {
+        state.pendingQuestionSessions = j.pendingQuestionSessions;
+      }
+      if (j.turnSessionId) state.liveTurnSessionId = j.turnSessionId;
+      if (j.turnRunning != null) {
+        state.turnRunning = !!j.turnRunning;
+        if (state.status) state.status.turnRunning = !!j.turnRunning;
+        if (state.status && j.turnSessionId) {
+          state.status.turnSessionId = j.turnSessionId;
+        }
+      }
+      state.hubReachable = j.ok === true;
+      return j;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /**
+   * After WS open: re-subscribe ALL mid-turn sessions, hydrate offscreen panes,
+   * optional selected history refresh, single jump to latest.
+   * Freezes intermediate sticky scrolls so reconnect does not thrash the pane.
+   * On hub process restart, clears stale client mid-turn UI (server has empty turns).
+   */
+  async function resumeAfterReconnect(opts = {}) {
+    const showToast = !!opts.wasReconnect;
+    state._reconnectScrollFreeze = true;
+    state._suppressStickyScroll = true;
+    state._resumeAfterReconnect = true;
+    state.reconnectAttempt = 0;
+    stopHealthProbe();
+
+    // Prefer server truth for concurrent mid-turn projects after reconnect.
+    // mergeHealthIntoState -> noteBootId may set _hubProcessRestarted + clear.
+    const health = await mergeHealthIntoState();
+    const processRestart = !!state._hubProcessRestarted;
+    const serverHasLive = !!(
+      (health &&
+        (health.turnRunning ||
+          (health.liveTurns && health.liveTurns.length))) ||
+      ((state.liveTurns || []).length > 0 && state.turnRunning)
+    );
+
+    let interruptedByRestart = false;
+    if (opts.wasReconnect && processRestart) {
+      // Capture live flags before clear so toast is danger only when a turn died.
+      const flagsBefore = state.sessionFlags || {};
+      const hadLiveBeforeClear =
+        !!state.turnRunning ||
+        !!(state.liveTurnSessionId) ||
+        !!(state.liveTurns && state.liveTurns.length) ||
+        Object.keys(flagsBefore).some((k) => flagsBefore[k] === "working") ||
+        (state.promptQueueLength || 0) > 0;
+      // After process restart, server has no in-flight turns/queues.
+      clearLiveClientStateAfterProcessRestart("hub process restart");
+      state._hubProcessRestarted = false;
+      interruptedByRestart = true;
+      if (hadLiveBeforeClear) {
+        reportError(
+          "Hub restarted: live turns were interrupted. Re-send if a project was still working.",
+          { source: "reconnect" }
+        );
+      } else {
+        toast("Hub restarted · reconnected", "");
+      }
+      // Auto-attach selected session so session/load runs without re-open.
+      if (state.selectedId) {
+        let cwd =
+          (state.selectedMeta && state.selectedMeta.cwd) ||
+          "";
+        if (!cwd && Array.isArray(state.sessions)) {
+          const row = state.sessions.find(
+            (s) => s && s.sessionId === state.selectedId
+          );
+          if (row && row.cwd) cwd = row.cwd;
+        }
+        if (cwd) {
+          try {
+            await attachSessionLive(state.selectedId, cwd, {
+              showFailToast: false,
+              focusOnFail: false,
+            });
+          } catch (_) {
+            // attach best-effort; user can re-open session
+          }
+        }
+      }
+    } else if (opts.wasReconnect && !serverHasLive) {
+      // Soft reconnect: server idle but client may still show working · quiet · queue.
+      const flags = state.sessionFlags || {};
+      const clientStale =
+        state.turnRunning ||
+        !!(state.liveTurnSessionId) ||
+        Object.keys(flags).some((k) => flags[k] === "working") ||
+        (state.promptQueueLength || 0) > 0;
+      if (clientStale) {
+        clearStaleLiveTurns({ clearQuestions: false });
+      }
+    }
+
+    // New WS connection: clear subscription tracking then re-subscribe once each.
+    if (state.subscribedSessions) state.subscribedSessions.clear();
+    else state.subscribedSessions = new Set();
+
+    const resumeIds = collectLiveSessionIds();
+    for (let i = 0; i < resumeIds.length; i++) {
+      const sid = resumeIds[i];
+      subscribeSessionIds(sid);
+      getSessionPane(sid);
+    }
+    if (state.selectedId) subscribeSessionIds(state.selectedId);
+
+    setComposerEnabled(true);
+    forceComposerUnlocked();
+
+    const hydrates = [];
+    let selectedMidTurn = false;
+    for (let i = 0; i < resumeIds.length; i++) {
+      const sid = resumeIds[i];
+      const isSelected = sid === state.selectedId;
+      // After process-restart clear, flags are idle — do not treat as mid-turn.
+      const st = sessionLiveStatus(sid);
+      const midTurn =
+        !interruptedByRestart && (st === "working" || st === "question");
+
+      if (isSelected && midTurn) {
+        // Keep live stream; only subscribe + pane (already done).
+        selectedMidTurn = true;
+        continue;
+      }
+      if (isSelected && !midTurn) {
+        hydrates.push(Promise.resolve(refreshHistory(sid)));
+        continue;
+      }
+      // Offscreen (or unselected live): hydrate pane without moving selected scroll.
+      hydrates.push(hydrateSessionHistory(sid, { visibleJump: false }));
+    }
+
+    const liveCount = interruptedByRestart
+      ? 0
+      : (state.liveTurns || []).length;
+    const finish = () => {
+      if (state.selectedId && state.stickToBottom) {
+        jumpToLatest();
+      } else {
+        updateJumpLatestUiOnly();
+      }
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          state._reconnectScrollFreeze = false;
+          state._suppressStickyScroll = false;
+          state._resumeAfterReconnect = false;
+        });
+      });
+      if (interruptedByRestart) {
+        // Toast already shown (danger if had live turns, else info); skip "N live".
+      } else if (showToast) {
+        if (liveCount > 0) {
+          toast(`Hub reconnected · ${liveCount} live project(s)`, "");
+        } else {
+          toast("Hub reconnected", "");
+        }
+      } else if (selectedMidTurn) {
+        toast("Turn still running on server…", "");
+      }
+    };
+
+    try {
+      await Promise.all(hydrates);
+    } catch (_) {
+      // individual hydrates already swallow fetch errors
+    }
+    finish();
+  }
+
   function connectWs() {
     if (state.reconnectTimer) {
       clearTimeout(state.reconnectTimer);
@@ -2981,20 +4025,12 @@
     state.ws = ws;
 
     ws.addEventListener("open", () => {
+      const wasReconnect =
+        state.reconnectAttempt > 0 || state.wsState === "reconnecting";
       state.wsState = "open";
-      state.reconnectAttempt = 0;
-      stopHealthProbe();
       updateStatusPill();
       sendWs({ type: "hello" });
-      if (state.selectedId) {
-        subscribeSessionIds(state.selectedId, liveTurnId());
-        if (!turnRunningOnSelected()) {
-          refreshHistory(state.selectedId);
-        }
-      } else {
-        subscribeSessionIds(liveTurnId());
-      }
-      setComposerEnabled(true);
+      resumeAfterReconnect({ wasReconnect });
     });
 
     ws.addEventListener("message", (ev) => {
@@ -3009,6 +4045,7 @@
 
     ws.addEventListener("close", () => {
       state.wsState = "reconnecting";
+      if (state.subscribedSessions) state.subscribedSessions.clear();
       startHealthProbe();
       updateStatusPill();
       setComposerEnabled(false);
@@ -3042,15 +4079,54 @@
         turnRunning: !!msg.turnRunning,
         turnSessionId: msg.turnSessionId || null,
       };
+      if (msg.sessionFlags && typeof msg.sessionFlags === "object") {
+        state.sessionFlags = msg.sessionFlags;
+      }
+      if (Array.isArray(msg.liveTurns)) {
+        state.liveTurns = msg.liveTurns;
+        // After reconnect, status may list live sessions client had not resumed yet.
+        ensureLiveSessionsResumed(
+          msg.liveTurns.map((t) => (t && t.sessionId) || null).filter(Boolean)
+        );
+      }
+      if (Array.isArray(msg.pendingQuestionSessions)) {
+        state.pendingQuestionSessions = msg.pendingQuestionSessions;
+        ensureLiveSessionsResumed(msg.pendingQuestionSessions);
+      }
+      // Preserve local pending questions across status merges: server flags can
+      // lag or overwrite a just-set question with idle/working.
+      {
+        const pendingIds = new Set(state.pendingQuestionSessions || []);
+        if (Array.isArray(msg.pendingQuestionSessions)) {
+          for (let i = 0; i < msg.pendingQuestionSessions.length; i++) {
+            const pid = msg.pendingQuestionSessions[i];
+            if (pid) pendingIds.add(pid);
+          }
+        }
+        if (pendingIds.size) {
+          if (!state.sessionFlags) state.sessionFlags = {};
+          if (!state.pendingQuestionSessions) state.pendingQuestionSessions = [];
+          pendingIds.forEach((pid) => {
+            state.sessionFlags[pid] = "question";
+            if (state.pendingQuestionSessions.indexOf(pid) < 0) {
+              state.pendingQuestionSessions.push(pid);
+            }
+          });
+        }
+      }
+      if (msg.maxConcurrentTurns != null) {
+        state.maxConcurrentTurns = Number(msg.maxConcurrentTurns) || 3;
+      }
       if (msg.turnSessionId) {
         state.liveTurnSessionId = msg.turnSessionId;
-      } else if (!msg.turnRunning) {
+      } else if (!msg.turnRunning && !(state.liveTurns && state.liveTurns.length)) {
         state.liveTurnSessionId = null;
       }
       if (msg.hubVersion != null) state.hubVersion = msg.hubVersion;
       if (msg.cliVersion != null) state.cliVersion = msg.cliVersion;
       if (msg.compatOk != null) state.compatOk = !!msg.compatOk;
       if (Array.isArray(msg.compatIssues)) state.compatIssues = msg.compatIssues;
+      noteBootId(msg.bootId, msg.startedAt);
       if (msg.promptQueueLength != null) {
         state.promptQueueLength = Number(msg.promptQueueLength) || 0;
       }
@@ -3065,18 +4141,83 @@
           setSessionMode("live-remote");
         }
       }
-      // Server is source of truth for turnRunning (single-agent hub).
-      // Track globally so mid-turn session switches keep streaming into the live pane.
-      if (msg.turnRunning != null) {
-        const serverRunning = !!msg.turnRunning;
+      // Server empty live set: trust server over stale client mid-turn / queue UI.
+      // (Process restart or soft reconnect where client still shows working · quiet · queue.)
+      if (
+        Array.isArray(msg.liveTurns) &&
+        msg.liveTurns.length === 0 &&
+        !msg.turnRunning
+      ) {
+        if (msg.promptQueueLength != null) {
+          state.promptQueueLength = Number(msg.promptQueueLength) || 0;
+        }
+        const flags = state.sessionFlags || {};
+        const hasWorkingFlag = Object.keys(flags).some(
+          (k) => flags[k] === "working"
+        );
+        const clientStale =
+          state.turnRunning ||
+          hasWorkingFlag ||
+          !!state.liveTurnSessionId ||
+          !!state.turnStartedAt ||
+          (state.promptQueueLength || 0) > 0;
+        if (clientStale) {
+          const serverPendingEmpty =
+            Array.isArray(msg.pendingQuestionSessions) &&
+            msg.pendingQuestionSessions.length === 0;
+          clearStaleLiveTurns({ clearQuestions: serverPendingEmpty });
+          if (!serverPendingEmpty && Array.isArray(msg.pendingQuestionSessions)) {
+            state.pendingQuestionSessions = msg.pendingQuestionSessions;
+            for (let i = 0; i < msg.pendingQuestionSessions.length; i++) {
+              const pid = msg.pendingQuestionSessions[i];
+              if (pid) {
+                if (!state.sessionFlags) state.sessionFlags = {};
+                state.sessionFlags[pid] = "question";
+              }
+            }
+          }
+          if (msg.promptQueueLength != null) {
+            state.promptQueueLength = Number(msg.promptQueueLength) || 0;
+          }
+        }
+      }
+      // Server is source of truth for multi-session turns.
+      // Keep streaming continuity for any live turn sessions.
+      if (msg.turnRunning != null || Array.isArray(msg.liveTurns)) {
+        const serverRunning =
+          !!msg.turnRunning ||
+          (Array.isArray(msg.liveTurns) && msg.liveTurns.length > 0);
+        const turns = state.liveTurns || [];
+        for (let i = 0; i < turns.length; i++) {
+          if (turns[i] && turns[i].sessionId) subscribeSessionIds(turns[i].sessionId);
+        }
         if (serverRunning && msg.turnSessionId) {
           subscribeSessionIds(msg.turnSessionId);
         }
         if (serverRunning && !state.turnRunning) {
-          setTurnRunning(true);
-          toast("Turn still running on server…", "");
+          setTurnRunning(true, msg.turnSessionId || null);
+          if (turnRunningOnSelected()) {
+            toast("Turn still running on server…", "");
+          }
+        } else if (
+          !serverRunning &&
+          (state.turnRunning ||
+            !!state.liveTurnSessionId ||
+            Object.keys(state.sessionFlags || {}).some(
+              (k) => state.sessionFlags[k] === "working"
+            ))
+        ) {
+          // Server has zero lives but client still mid-turn: force global idle.
+          setTurnRunning(false, msg.turnSessionId || null, {
+            all: true,
+            forceIdleFlags: true,
+          });
+          // clearStaleLiveTurns zeros queue; restore server truth if present.
+          if (msg.promptQueueLength != null) {
+            state.promptQueueLength = Number(msg.promptQueueLength) || 0;
+          }
         } else if (serverRunning !== state.turnRunning) {
-          setTurnRunning(serverRunning);
+          setTurnRunning(serverRunning, msg.turnSessionId || null);
         } else {
           state.turnRunning = serverRunning;
           updateTurnStrip();
@@ -3084,7 +4225,7 @@
       }
       updateVersionBadge();
       updateStatusPill();
-      renderSessions();
+      scheduleSessionPills();
       setComposerEnabled(composerConnected());
       forceComposerUnlocked();
       return;
@@ -3111,7 +4252,11 @@
     }
     if (type === "history") {
       if (msg.sessionId === state.selectedId) {
-        applyHistoryMessages(msg.messages || []);
+        // Never wipe a live stream with a disk dump mid-turn.
+        if (turnRunningOnSelected()) return;
+        applyHistoryMessages(msg.messages || [], { jump: false });
+      } else if (msg.sessionId) {
+        hydrateSessionPane(msg.sessionId, msg.messages || []);
       }
       return;
     }
@@ -3169,12 +4314,18 @@
       return;
     }
     if (type === "turn") {
-      if (msg.state === "running" && msg.sessionId) {
-        state.liveTurnSessionId = msg.sessionId;
-        subscribeSessionIds(msg.sessionId);
-      } else if (msg.state === "idle") {
-        if (!msg.sessionId || msg.sessionId === state.liveTurnSessionId) {
-          state.liveTurnSessionId = null;
+      const sid = msg.sessionId || null;
+      if (msg.state === "running" && sid) {
+        state.liveTurnSessionId = sid;
+        subscribeSessionIds(sid);
+        markSessionActivity(sid, "working");
+      } else if (msg.state === "idle" && sid) {
+        markSessionActivity(sid, "idle");
+        if (sid === state.liveTurnSessionId) {
+          state.liveTurnSessionId =
+            state.liveTurns.length
+              ? state.liveTurns[state.liveTurns.length - 1].sessionId
+              : null;
         }
       }
       // Track turn globally so session list + offscreen pane stay live during switches.
@@ -3182,18 +4333,72 @@
         msg.state === "idle" && msg.error && /busy/i.test(String(msg.error));
       // Old hub "busy" idle+error: keep turnRunning (server still mid-turn) and unlock composer.
       if (busyIdle) {
-        if (msg.error) toast(msg.error, "danger");
-      } else {
-        setTurnRunning(msg.state === "running");
-        if (msg.error && msg.state === "idle") {
-          toast(msg.error, "danger");
+        if (msg.error) {
+          reportError(msg.error, { sessionId: sid, source: "turn" });
         }
-        if (msg.state === "idle" && (!msg.sessionId || msg.sessionId === state.selectedId)) {
+      } else if (msg.state === "running") {
+        setTurnRunning(true, sid);
+      } else if (msg.state === "idle") {
+        const anyLeft = (state.liveTurns || []).length > 0;
+        const recoverable =
+          !!msg.error && isRecoverableTurnClear(msg.error);
+        if (recoverable) {
+          // Force this session fully idle after stall/max-duration clear.
+          setTurnRunning(false, sid, { forceIdleFlags: !anyLeft });
+          if (anyLeft) {
+            state.turnRunning = true;
+            if (!state.liveTurnSessionId && state.liveTurns.length) {
+              state.liveTurnSessionId =
+                state.liveTurns[state.liveTurns.length - 1].sessionId;
+            }
+          }
+        } else if (anyLeft) {
+          // Other projects still running: do not treat as global idle.
+          state.turnRunning = true;
+          if (!state.liveTurnSessionId && state.liveTurns.length) {
+            state.liveTurnSessionId =
+              state.liveTurns[state.liveTurns.length - 1].sessionId;
+          }
+          // Selected session went idle: strip must show idle for it.
+          updateTurnStrip();
+        } else {
+          setTurnRunning(false, sid, { forceIdleFlags: true });
+        }
+        // Reset timers when THIS session is idle so strip can't show quiet 445s.
+        if (!sid || sid === state.selectedId) {
+          if (!turnRunningOnSelected()) {
+            state.turnStartedAt = null;
+            state.lastTermLineAt = null;
+            clearStallWatch();
+          }
+        }
+        if (msg.error) {
+          if (recoverable) {
+            reportInfo(msg.error, { sessionId: sid, source: "turn" });
+            // Once: also land the notice in the session transcript.
+            const noteKey = `${sid || "_"}:${msg.error}`;
+            if (!state._turnClearNotes) state._turnClearNotes = {};
+            if (!state._turnClearNotes[noteKey]) {
+              state._turnClearNotes[noteKey] = true;
+              const appendClearNote = () =>
+                appendMessage({ role: "system", text: msg.error });
+              if (!sid || sid === state.selectedId) {
+                appendClearNote();
+              } else {
+                withSessionTarget(sid, appendClearNote);
+              }
+            }
+          } else {
+            reportError(msg.error, { sessionId: sid, source: "turn" });
+          }
+        }
+        if (!sid || sid === state.selectedId) {
           refreshUsage();
         }
+        updateTurnStrip();
       }
       updateStatusPill();
-      renderSessions();
+      scheduleSessionPills();
       // Always re-enable composer after turn events (never leave disabled).
       setComposerEnabled(composerConnected());
       forceComposerUnlocked();
@@ -3208,12 +4413,15 @@
         setTurnRunning(false);
       }
       if (busy && !queueFull) {
-        toast(
+        reportError(
           "Message not queued — restart hub to enable queue, or wait for turn to finish.",
-          "danger"
+          { sessionId: msg.sessionId || null, source: "error" }
         );
       } else {
-        toast(errText, "danger");
+        reportError(errText, {
+          sessionId: msg.sessionId || null,
+          source: "error",
+        });
       }
       setComposerEnabled(composerConnected());
       forceComposerUnlocked();
@@ -3233,16 +4441,19 @@
   function onUserQuestion(msg) {
     const requestId = String(msg.requestId || "");
     if (!requestId) return;
-    const sessionId = msg.sessionId ? String(msg.sessionId) : null;
-    // Prefer matching selected session; always open if no session or live turn matches.
-    const forMe =
-      !sessionId ||
-      sessionId === state.selectedId ||
-      (state.selectedId && isHubCreatedSession(sessionId)) ||
-      sessionId === (state.status && state.status.turnSessionId) ||
-      sessionId === (state.status && state.status.loadedSessionId);
-    if (!forMe) {
-      // Still store so phone can answer even if sub lag; open anyway for always-broadcast.
+    // Resolve sessionId with fallbacks so rail always gets a flag.
+    const sessionId =
+      (msg.sessionId && String(msg.sessionId)) ||
+      liveTurnId() ||
+      (state.status && state.status.turnSessionId) ||
+      state.selectedId ||
+      null;
+    if (sessionId) {
+      if (!state.pendingQuestionSessions) state.pendingQuestionSessions = [];
+      if (state.pendingQuestionSessions.indexOf(sessionId) < 0) {
+        state.pendingQuestionSessions.push(sessionId);
+      }
+      markSessionActivity(sessionId, "question");
     }
     state.pendingUserQuestion = {
       requestId,
@@ -3250,17 +4461,43 @@
       questions: Array.isArray(msg.questions) ? msg.questions : [],
       toolCallId: msg.toolCallId || null,
     };
+    // Always open modal so the question stays answerable. Rail "Needs reply"
+    // flag remains the primary multi-session notification.
     openAskUserModal();
-    toast("Agent is asking a question", "");
+    let toastTitle = "";
+    if (sessionId && Array.isArray(state.sessions)) {
+      const row = state.sessions.find((s) => s && s.sessionId === sessionId);
+      if (row && row.title) toastTitle = String(row.title);
+    }
+    toast(
+      toastTitle
+        ? "Waiting for your answer · " + toastTitle
+        : "Waiting for your answer",
+      ""
+    );
   }
 
   function onUserQuestionResolved(msg) {
     const requestId = String(msg.requestId || "");
+    const prevSid =
+      state.pendingUserQuestion && state.pendingUserQuestion.sessionId
+        ? String(state.pendingUserQuestion.sessionId)
+        : null;
     if (
       state.pendingUserQuestion &&
       String(state.pendingUserQuestion.requestId) === requestId
     ) {
       closeAskUserModal();
+    }
+    if (prevSid) {
+      state.pendingQuestionSessions = (state.pendingQuestionSessions || []).filter(
+        (s) => s !== prevSid
+      );
+      // Back to working if turn still live, else idle
+      const still =
+        (state.liveTurns || []).some((t) => t && t.sessionId === prevSid) ||
+        state.liveTurnSessionId === prevSid;
+      markSessionActivity(prevSid, still ? "working" : "idle");
     }
   }
 
@@ -4176,6 +5413,8 @@
       text,
       cwd: (state.selectedMeta && state.selectedMeta.cwd) || "",
     });
+    clearComposerDraft(state.selectedId);
+    if (sid && sid !== state.selectedId) clearComposerDraft(sid);
     els.input.value = "";
     autoGrow();
     closeSlash();
@@ -4451,6 +5690,7 @@
   function onComposerInput() {
     forceComposerUnlocked();
     autoGrow(); // re-sticks when stickToBottom (composer shrinks transcript)
+    saveComposerDraft(state.selectedId);
     maybeOpenSlashFromValue();
   }
 
@@ -4912,6 +6152,12 @@
     if (els.btnJumpLatest) {
       els.btnJumpLatest.addEventListener("click", jumpToLatest);
     }
+    if (els.btnErrorDismiss) {
+      els.btnErrorDismiss.addEventListener("click", dismissErrorStrip);
+    }
+    if (els.btnErrorCopy) {
+      els.btnErrorCopy.addEventListener("click", copyErrorStrip);
+    }
 
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "visible") return;
@@ -5366,6 +6612,7 @@
     bindUsageBarEvents();
     bindMetaPopoverEvents();
     setupViewport();
+    loadComposerDrafts();
     updateStatusPill();
     updateVersionBadge();
     updateSessionBanner();

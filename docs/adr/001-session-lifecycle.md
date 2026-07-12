@@ -50,7 +50,7 @@ running -> stalled (no ACP update N seconds) -> recover -> idle|running
 
 | Failure | Recovery |
 |---|---|
-| No ACP updates after prompt start (60s) | Force-clear turn; error UI; next send may create fresh remote session |
+| No ACP updates after prompt start (60s) | Force-clear turn; same session kept; error UI — send again (no session/new) |
 | Mid-turn stall (600s since last ACP activity) | Force-clear; idle broadcast; user resends (see TUI-aligned amendment) |
 | Max turn duration (1800s) | Force-clear; idle broadcast |
 | Stuck before new prompt | Force-clear only if watchdog would (mid-stall / max wall / no-output) |
@@ -115,7 +115,7 @@ Observed failure: tools/thinking streamed, then agent hung mid-turn. Hub kept `t
 
 | Failure | Recovery |
 |---|---|
-| No ACP updates after prompt start (60s) | Force-clear; may prepare fresh remote session |
+| No ACP updates after prompt start (60s) | Force-clear; same session kept — send again (no session/new) |
 | Mid-turn stall (600s since last ACP activity) | Force-clear; idle broadcast; user resends |
 | Max turn duration (1800s) | Force-clear; idle broadcast |
 | Stuck before new prompt | Same as watchdog force-clear (activity-aware), not a short healthy wall |
@@ -147,6 +147,39 @@ also desynced UI from a still-running server turn.
 - Status rebroadcast every 10s while running remains.
 - Client: turn strip copy is `running` / `idle`; `data-state=stalled` is visual quiet cue only.
 - Only user Stop/Cancel or server idle/error ends the client turn lock.
+
+## Amendment (2026-07-12): hub-owned resume via session/load after restart
+
+### Problem
+
+`acp_created_sessions` is process-local. After hub/agent restart, opening a prior hub session always took `session/new` and emitted `session_switch`, discarding multi-turn continuity for sessions the hub itself created.
+
+### Decision
+
+- **Hub-owned** ids may be resumed with `session/load` after restart (same session id).
+- Resume candidate if any of: process-live (`acp_created_sessions`), disk `hub_origin` in `{user, attach}`, or id is a value in `remote-sessions.json` / `remote_agent_session`.
+- Prefer the **viewed** id over a different cwd remote-map entry when the viewed id is hub-owned.
+- Load has a hard timeout (20s); on fail/timeout → `session/new` + `session_switch` with reason `resume_failed`.
+- **Foreign/CLI** ids remain non-loadable for ensure/prompt; path stays `session/new` + switch (`cli_or_foreign_session`).
+- Prompt path still uses `allow_load=False`; load only in ensure/resume and explicit HTTP load for candidates.
+
+Policy: `is_hub_resume_candidate`, `resolve_ensure_action` in `hub/session_policy.py`.
+
+## Amendment (2026-07-12b): durable hubIds + resume after restart
+
+### Problem
+
+`remote-sessions.json` only stored `byCwd` (one id per project). Older hub sessions for the same cwd lost resume eligibility when the map advanced. Disk `hub_origin` stamps were unreliable (agent rewrites `summary.json`). After process restart, `status.hubSessionIds` listed only process-live ids (empty), so the client demoted hub sessions to history and did not auto-attach the selected session.
+
+### Decision
+
+- Extend `remote-sessions.json` to `{ "byCwd": {...}, "hubIds": ["id1", ...] }`.
+- `load_remote_sessions` still returns the byCwd dict; `load_hub_session_ids` returns the durable set (hubIds ∪ byCwd values).
+- On every hub-recorded session, add the id to `hub_owned_session_ids` and persist.
+- `resolve_ensure_action` unions `hub_owned_ids` into resume candidates so a viewed id in hubIds with empty origin still gets `resume_view` (not switched to a newer byCwd id).
+- `status.hubSessionIds` includes process-live first, then disk hub-owned / map values (client marks hub-owned before attach).
+- Stamp `hub_origin` immediately (sync best-effort) plus existing retry after session/load resume and session/new.
+- Client `resumeAfterReconnect`: on process restart, auto-attach selected session; danger toast only if live turns were interrupted.
 
 ## Amendment (2026-07-10): full ACP client surface for advertised capabilities
 

@@ -1323,9 +1323,58 @@ a {
   animation: pulse-bar 1.2s ease-in-out infinite;
 }
 
+.session-row.status-question .live-bar {
+  background: var(--accent, #6ea8fe);
+  animation: pulse-bar-question 0.75s ease-in-out infinite;
+}
+
+.session-row.status-question {
+  background: color-mix(in srgb, var(--accent, #6ea8fe) 10%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent, #6ea8fe) 28%, transparent);
+}
+
 .session-row.turn-live .meta .turn-hint {
   color: var(--warn);
   font-weight: 500;
+}
+
+.session-pill.status-working {
+  background: color-mix(in srgb, var(--warn) 22%, transparent);
+  color: var(--warn);
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+}
+
+.session-pill.status-question {
+  background: color-mix(in srgb, var(--accent, #6ea8fe) 32%, transparent);
+  color: var(--accent, #6ea8fe);
+  border: 1px solid color-mix(in srgb, var(--accent, #6ea8fe) 65%, transparent);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  font-size: 0.68em;
+  animation: pill-question-glow 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse-bar-question {
+  0%,
+  100% {
+    opacity: 1;
+    filter: brightness(1.15);
+  }
+  50% {
+    opacity: 0.45;
+    filter: brightness(0.9);
+  }
+}
+
+@keyframes pill-question-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent, #6ea8fe) 0%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent, #6ea8fe) 35%, transparent);
+  }
 }
 
 #btn-menu {
@@ -1392,6 +1441,38 @@ a {
   border-color: var(--accent-dim);
   max-width: min(42vw, 160px);
   flex-shrink: 1;
+}
+
+.chip-session-id {
+  color: var(--muted);
+  border-color: var(--border);
+  font-family: var(--font);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  flex-shrink: 0;
+  max-width: 9.5rem;
+}
+
+.chip-session-id:hover,
+.chip-session-id:focus-visible {
+  color: var(--accent);
+  border-color: var(--accent-dim);
+  outline: none;
+}
+
+.chip-session-id.hidden {
+  display: none;
+}
+
+.meta-pop-v-copy {
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+.meta-pop-v-copy:hover {
+  color: var(--accent);
 }
 
 .status-pill {
@@ -2537,6 +2618,55 @@ a {
   text-overflow: ellipsis;
 }
 
+/* Durable error strip (danger stays until Dismiss; .info auto-hides) */
+.error-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  min-width: 0;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--danger);
+  background: rgba(240, 113, 120, 0.08);
+  border-left: 3px solid var(--danger);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.error-strip.info {
+  border-bottom-color: var(--accent-dim);
+  border-left-color: var(--accent);
+  background: rgba(230, 184, 77, 0.08);
+}
+
+.error-strip.hidden {
+  display: none !important;
+}
+
+.error-strip-time {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+
+.error-strip-msg {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-family: var(--font);
+}
+
+.error-strip-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
 /* Toasts */
 .toast-host {
   position: fixed;
@@ -2773,6 +2903,10 @@ a {
 
   .chip-project.hidden {
     display: none;
+  }
+
+  .chip-session-id {
+    max-width: 7.5rem;
   }
 
   #chat-model {

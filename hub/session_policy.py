@@ -112,9 +112,98 @@ def needs_fresh_agent_session(session_id: str | None, created_set: set[str] | fr
     return sid not in created_set
 
 
+def is_hub_resume_candidate(
+    session_id: str | None,
+    *,
+    created_set: set[str] | frozenset[str],
+    remote_map_ids: set[str] | frozenset[str],
+    hub_origin: str | None = None,
+) -> bool:
+    """True when id may be resumed via session/load after restart.
+
+    Process-live (created_set), disk hub_origin user|attach, remote map value,
+    or durable hubIds (passed via remote_map_ids by the caller).
+    Pure: caller supplies hub_origin from disk I/O.
+    """
+    if not session_id:
+        return False
+    sid = str(session_id).strip()
+    if not sid:
+        return False
+    if sid in created_set:
+        return True
+    origin = str(hub_origin or "").strip()
+    if origin in ("user", "attach"):
+        return True
+    if sid in remote_map_ids:
+        return True
+    return False
+
+
 def cwd_key(cwd: str | None) -> str:
     """Normalize cwd for map keys (casefold, backslash, strip trailing sep)."""
     return str(cwd or "").replace("/", "\\").rstrip("\\").casefold()
+
+
+def resolve_ensure_action(
+    view_session_id: str | None,
+    cwd: str | None,
+    created_set: set[str] | frozenset[str],
+    remote_by_cwd: dict[str, str],
+    *,
+    view_hub_origin: str | None = None,
+    remote_hub_origin: str | None = None,
+    hub_owned_ids: set[str] | frozenset[str] | None = None,
+) -> tuple[str | None, str, str]:
+    """Resolve ensure path: (target_id | None, action, reason).
+
+    action is one of: reuse | load | new.
+
+    Preference order (hub-owned view is continuity source of truth after restart):
+    1. view process-live → reuse / hub_session (caller records byCwd on use)
+    2. view hub resume candidate (origin/hubIds/map) → load / resume_view
+    3. byCwd process-live → reuse / reuse_cwd
+    4. byCwd resume candidate → load / resume_cwd
+    5. else → new / need_session_new
+
+    Rationale: the session the user has open is continuity; byCwd is fallback when
+    view is foreign/CLI or empty. One-live-per-cwd is kept by updating byCwd when
+    view is used (caller _record_hub_session). hub_owned_ids: durable hub session
+    ids from remote-sessions.json hubIds (union into resume set).
+    """
+    view = str(view_session_id or "").strip() or None
+    remote_map_ids = set(remote_by_cwd.values()) if remote_by_cwd else set()
+    if hub_owned_ids:
+        remote_map_ids |= set(hub_owned_ids)
+
+    if view and view in created_set:
+        return view, "reuse", "hub_session"
+
+    if view and is_hub_resume_candidate(
+        view,
+        created_set=created_set,
+        remote_map_ids=remote_map_ids,
+        hub_origin=view_hub_origin,
+    ):
+        return view, "load", "resume_view"
+
+    key = cwd_key(cwd)
+    if key:
+        existing = remote_by_cwd.get(key)
+        if existing:
+            existing = str(existing).strip()
+            if existing:
+                if existing in created_set:
+                    return existing, "reuse", "reuse_cwd"
+                if is_hub_resume_candidate(
+                    existing,
+                    created_set=created_set,
+                    remote_map_ids=remote_map_ids,
+                    hub_origin=remote_hub_origin,
+                ):
+                    return existing, "load", "resume_cwd"
+
+    return None, "new", "need_session_new"
 
 
 def resolve_live_session_id(
@@ -123,29 +212,31 @@ def resolve_live_session_id(
     created_set: set[str] | frozenset[str],
     remote_by_cwd: dict[str, str],
 ) -> tuple[str | None, bool, str]:
-    """Resolve a reusable live hub session without calling ACP.
+    """Process-live only: reusable id without session/load.
 
     Returns (live_session_id | None, needs_session_new, reason).
 
-    - If view is hub-created: reuse view (needs_new=False, reason=hub_session).
-    - Else if cwd has a hub-created remote: reuse it (needs_new=False, reason=reuse_cwd).
-    - Else: needs session/new (live_id=None, needs_new=True, reason=need_session_new).
+    Prefer resolve_ensure_action for ensure/attach (supports post-restart load).
+    Kept for backward compatibility and process-live-only checks.
     """
-    view = str(view_session_id or "").strip() or None
-    if view and not needs_fresh_agent_session(view, created_set):
-        return view, False, "hub_session"
-
-    key = cwd_key(cwd)
-    if key:
-        existing = remote_by_cwd.get(key)
-        if existing and not needs_fresh_agent_session(existing, created_set):
-            return str(existing), False, "reuse_cwd"
-
+    target, action, reason = resolve_ensure_action(
+        view_session_id,
+        cwd,
+        created_set,
+        remote_by_cwd,
+    )
+    if action == "reuse" and target:
+        return target, False, reason
     return None, True, "need_session_new"
 
 
 def load_remote_sessions(path: Path | str) -> dict[str, str]:
-    """Load cwd_key -> session_id map from JSON. Empty dict if missing/invalid."""
+    """Load cwd_key -> session_id map from JSON. Empty dict if missing/invalid.
+
+    Accepts {"byCwd": {...}, "hubIds": [...]} or legacy flat {cwd: id} map.
+    Returns only byCwd for backward compatibility; use load_hub_session_ids
+    for the durable hub id set.
+    """
     p = Path(path)
     if not p.is_file():
         return {}
@@ -156,8 +247,11 @@ def load_remote_sessions(path: Path | str) -> dict[str, str]:
     if not isinstance(raw, dict):
         return {}
     out: dict[str, str] = {}
-    # Accept either {"byCwd": {...}} or flat map
-    src: Any = raw.get("byCwd") if "byCwd" in raw else raw
+    # Accept either {"byCwd": {...}} or flat map (ignore non-map keys like hubIds)
+    if "byCwd" in raw:
+        src: Any = raw.get("byCwd")
+    else:
+        src = {k: v for k, v in raw.items() if k != "hubIds"}
     if not isinstance(src, dict):
         return {}
     for k, v in src.items():
@@ -168,8 +262,44 @@ def load_remote_sessions(path: Path | str) -> dict[str, str]:
     return out
 
 
-def save_remote_sessions(path: Path | str, mapping: dict[str, str]) -> None:
-    """Persist cwd_key -> session_id map. Creates parent dirs as needed."""
+def load_hub_session_ids(path: Path | str) -> set[str]:
+    """Load durable hub session ids from remote-sessions.json hubIds array.
+
+    Also includes byCwd values so older files without hubIds still contribute.
+    Empty set if missing/invalid.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return set()
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return set()
+    if not isinstance(raw, dict):
+        return set()
+    out: set[str] = set()
+    hub_list = raw.get("hubIds")
+    if isinstance(hub_list, list):
+        for item in hub_list:
+            sid = str(item or "").strip()
+            if sid:
+                out.add(sid)
+    # Merge byCwd values (or flat map) so map-only files still resume
+    mapping = load_remote_sessions(path)
+    out.update(mapping.values())
+    return out
+
+
+def save_remote_sessions(
+    path: Path | str,
+    mapping: dict[str, str],
+    hub_ids: set[str] | frozenset[str] | list[str] | None = None,
+) -> None:
+    """Persist byCwd map and hubIds. Creates parent dirs as needed.
+
+    When hub_ids is None, preserve existing hubIds from disk and merge map values.
+    When hub_ids is provided, use that set unioned with map values.
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     clean: dict[str, str] = {}
@@ -178,5 +308,29 @@ def save_remote_sessions(path: Path | str, mapping: dict[str, str]) -> None:
         sid = str(v or "").strip()
         if key and sid:
             clean[key] = sid
-    payload = {"byCwd": clean}
+
+    ids: set[str] = set()
+    if hub_ids is None:
+        # Preserve prior hubIds (do not drop historical hub-owned ids)
+        if p.is_file():
+            try:
+                prev = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(prev, dict) and isinstance(prev.get("hubIds"), list):
+                    for item in prev["hubIds"]:
+                        sid = str(item or "").strip()
+                        if sid:
+                            ids.add(sid)
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                pass
+    else:
+        for item in hub_ids:
+            sid = str(item or "").strip()
+            if sid:
+                ids.add(sid)
+    ids.update(clean.values())
+
+    payload = {
+        "byCwd": clean,
+        "hubIds": sorted(ids),
+    }
     p.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

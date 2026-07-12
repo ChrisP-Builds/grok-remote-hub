@@ -1,9 +1,15 @@
 """ACP _x.ai/ask_user_question normalize + result builders (pure helpers).
 
-Result shapes use discriminant ``outcome`` (same style as permission replies)::
+Agent ``AskUserQuestionExtResponse`` is an internally tagged enum (tag ``outcome``)::
 
-    {"outcome": {"outcome": "accepted", "answers": {qid: {"values": [...]}}}}
-    {"outcome": {"outcome": "cancelled"}}
+    {"outcome": "accepted", "answers": {qid: ["opt0"]}, "partial_answers": {}}
+    {"outcome": "cancelled"}
+
+Each map value in ``answers`` is ``StringOrVec``: a string or a list of strings.
+Prefer always a list of strings for multi-select consistency.
+
+Do not nest like permission replies (``{"outcome": {"outcome": "selected", ...}}``).
+Do not wrap values as ``{"values": [...]}``; that fails StringOrVec deserialization.
 """
 
 from __future__ import annotations
@@ -77,11 +83,20 @@ def normalize_questions(params: Mapping[str, Any] | None) -> list[dict[str, Any]
 
 
 def build_accepted_result(answers: dict[str, list[str]] | Mapping[str, Any] | None) -> dict[str, Any]:
-    """Build ACP accepted outcome (discriminant style, matches permission path).
+    """Build ACP accepted outcome (internally tagged enum).
 
-    Shape: ``{"outcome": {"outcome": "accepted", "answers": {qid: {"values": [...]}}}}``
+    Shape::
+
+        {
+          "outcome": "accepted",
+          "answers": {qid: ["opt0", ...]},
+          "partial_answers": {},
+        }
+
+    Each answer value is ``StringOrVec`` (prefer always ``list[str]``).
+    Input may still use legacy ``{"values": [...]}``; that is unwrapped.
     """
-    normalized: dict[str, dict[str, list[str]]] = {}
+    normalized: dict[str, list[str]] = {}
     if isinstance(answers, Mapping):
         for qid, val in answers.items():
             key = str(qid)
@@ -101,11 +116,14 @@ def build_accepted_result(answers: dict[str, list[str]] | Mapping[str, Any] | No
             else:
                 s = str(val).strip()
                 values = [s] if s else []
-            normalized[key] = {"values": values}
-    return {"outcome": {"outcome": "accepted", "answers": normalized}}
+            normalized[key] = values
+    return {
+        "outcome": "accepted",
+        "answers": normalized,
+        "partial_answers": {},
+    }
 
 
 def build_cancelled_result() -> dict[str, Any]:
-    """Build ACP cancelled outcome (discriminant style)."""
-    return {"outcome": {"outcome": "cancelled"}}
-
+    """Build ACP cancelled outcome (internally tagged enum)."""
+    return {"outcome": "cancelled"}

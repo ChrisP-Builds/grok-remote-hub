@@ -54,6 +54,8 @@ class Config:
     static_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "static")
     max_sessions: int = 80
     max_history_messages: int = 800
+    # Concurrent live turns across different project cwds (default 3).
+    max_concurrent_turns: int = 3
 
     @property
     def agent_ws_url(self) -> str:
@@ -108,4 +110,5 @@ def load_config(path: Path | None = None) -> Config:
         static_dir=_as_path(hub.get("static_dir"), PROJECT_ROOT / "static"),
         max_sessions=int(hub.get("max_sessions", 80)),
         max_history_messages=int(hub.get("max_history_messages", 800)),
+        max_concurrent_turns=int(hub.get("max_concurrent_turns", 3)),
     )

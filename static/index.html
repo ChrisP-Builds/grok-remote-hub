@@ -74,6 +74,7 @@
             <span id="chat-project" class="chip chip-project meta-chip hidden" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Project details"></span>
             <span id="chat-model" class="chip meta-chip hidden" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Model details"></span>
             <span id="chat-cwd" class="cwd muted meta-chip" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Project path"></span>
+            <button type="button" id="chat-session-id" class="chip chip-session-id meta-chip hidden" title="Click to copy full session id" aria-label="Copy session id"></button>
           </div>
         </div>
         <div id="status-pill" class="status-pill" data-state="connecting" title="Connection status">
@@ -101,6 +102,15 @@
           <span id="usage-bar-reset" class="usage-bar-reset muted"></span>
         </div>
         <div id="usage-popover" class="usage-popover hidden" role="tooltip"></div>
+      </div>
+
+      <div id="error-strip" class="error-strip hidden" role="alert" aria-live="assertive">
+        <span id="error-strip-time" class="error-strip-time"></span>
+        <span id="error-strip-msg" class="error-strip-msg"></span>
+        <div class="error-strip-actions">
+          <button type="button" id="btn-error-copy" class="btn btn-ghost btn-sm">Copy</button>
+          <button type="button" id="btn-error-dismiss" class="btn btn-ghost btn-sm">Dismiss</button>
+        </div>
       </div>
 
       <div id="chat-panel" class="chat-panel">

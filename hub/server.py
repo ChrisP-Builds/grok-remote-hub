@@ -4,7 +4,10 @@ import asyncio
 import json
 import logging
 import re
+import secrets
 import subprocess
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +26,17 @@ from hub.fs_browser import (
 )
 from hub.history import load_session_history
 from hub.projects import ProjectError, create_project
+from hub.multi_turn import (
+    STATUS_IDLE,
+    can_start_concurrent_turn,
+    merge_session_flags,
+)
 from hub.prompt_queue import PromptQueue
 from hub.session_index import (
     delete_session,
     find_session,
     list_projects,
+    read_hub_origin,
     rename_session,
     scan_sessions,
     stamp_hub_origin,
@@ -37,9 +46,10 @@ from hub.session_signals import read_session_signals, read_signals_file, find_si
 from hub.session_policy import (
     STUCK_TURN_SECONDS,
     cwd_key,
+    is_hub_resume_candidate,
+    load_hub_session_ids,
     load_remote_sessions,
-    needs_fresh_agent_session,
-    resolve_live_session_id,
+    resolve_ensure_action,
     save_remote_sessions,
 )
 from hub.session_tailer import EventDedupe, SessionTailer
@@ -55,7 +65,7 @@ REMOTE_SESSION_SYSTEM_NOTE = (
 )
 REMOTE_SESSION_SAME_NOTE = "Live remote session"
 NO_OUTPUT_USER_MSG = (
-    "Agent produced no output. Started a fresh remote session — send again."
+    "Agent produced no output. Same session kept — send again."
 )
 MID_TURN_STALL_USER_MSG = (
     "Agent stalled mid-turn (no activity). Turn cleared — you can send again."
@@ -125,6 +135,9 @@ class Hub:
     def __init__(self, config: Config):
         self.config = config
         self.secret = config.ensure_agent_secret()
+        # Process identity: changes on every hub process start (restart detection).
+        self.boot_id = secrets.token_hex(8)
+        self.started_at = time.time()
         self.bind_host = "127.0.0.1"
         self.bind_hosts: list[str] = ["127.0.0.1"]
         self.bind_mode = "local"
@@ -149,16 +162,19 @@ class Hub:
             on_event=self._on_disk_event,
             poll_interval=0.25,
         )
-        # Session ids created via session/new in this hub process (safe to prompt).
-        # Restored from remote-sessions.json on start so multi-turn survives hub restart.
+        # Session ids created via session/new (or resumed via session/load) in this process.
+        # Process-local only; not seeded from disk (disk ids need session/load first).
         self.acp_created_sessions: set[str] = set()
+        # Durable hub-owned ids from remote-sessions.json hubIds (resume candidates).
+        self.hub_owned_session_ids: set[str] = set()
         # cwd (casefold) -> last hub-created agent session id for remote prompts.
         self.remote_agent_session: dict[str, str] = {}
         self.remote_sessions_path = REMOTE_SESSIONS_FILE
         self._load_remote_sessions_map()
-        # FIFO prompts while a turn is running (data only; no ws refs).
-        self._prompt_queue = PromptQueue(max_size=10)
+        # Per-cwd FIFO queues while that project has a turn running (data only).
+        self._prompt_queues: dict[str, PromptQueue] = {}
         self._prompt_queue_lock = asyncio.Lock()
+        self._max_concurrent_turns = max(1, int(getattr(config, "max_concurrent_turns", 3) or 3))
         self._app: web.Application | None = None
         self._status_resync_task: asyncio.Task | None = None
         self._last_broadcast_force_clear: str | None = None
@@ -186,20 +202,63 @@ class Hub:
         return self.compat
 
     def _hub_session_ids(self, limit: int = 50) -> list[str]:
-        ids = list(self.acp_created_sessions)
-        # Prefer most recently recorded remote sessions first when possible
+        """Process-live ids first, then durable disk hub-owned / remote-map values.
+
+        Client uses this for isHubCreatedSession after restart (before attach).
+        """
         recent = list(self.remote_agent_session.values())
         ordered: list[str] = []
         seen: set[str] = set()
+        # Live first: prefer recently recorded cwd map values that are process-live
         for sid in reversed(recent):
             if sid in self.acp_created_sessions and sid not in seen:
                 ordered.append(sid)
                 seen.add(sid)
-        for sid in ids:
+        for sid in self.acp_created_sessions:
+            if sid not in seen:
+                ordered.append(sid)
+                seen.add(sid)
+        # Disk resume candidates so UI marks hub-owned before attach
+        for sid in reversed(recent):
+            if sid not in seen:
+                ordered.append(sid)
+                seen.add(sid)
+        for sid in sorted(self.hub_owned_session_ids):
             if sid not in seen:
                 ordered.append(sid)
                 seen.add(sid)
         return ordered[:limit]
+
+    def _queue_total_length(self) -> int:
+        return sum(len(q) for q in self._prompt_queues.values())
+
+    def _session_flags_map(self, extra_ids: list[str] | None = None) -> dict[str, str]:
+        ids = list(self._hub_session_ids(50))
+        for sid in self.acp.turn_session_ids:
+            if sid not in ids:
+                ids.append(sid)
+        for sid in self.acp.sessions_with_pending_questions():
+            if sid not in ids:
+                ids.append(sid)
+        if extra_ids:
+            for sid in extra_ids:
+                if sid and sid not in ids:
+                    ids.append(sid)
+        return merge_session_flags(
+            ids,
+            active_sessions=set(self.acp.turn_session_ids),
+            pending_question_sessions=self.acp.sessions_with_pending_questions(),
+        )
+
+    def _sessions_items_with_status(self) -> list[dict[str, Any]]:
+        items = self._scan_sessions()
+        flags = self._session_flags_map([s.sessionId for s in items])
+        out: list[dict[str, Any]] = []
+        for s in items:
+            d = s.to_dict()
+            d["liveStatus"] = flags.get(s.sessionId, STATUS_IDLE)
+            out.append(d)
+        return out
 
     def status_payload(self) -> dict[str, Any]:
         agent = "up" if self.agent_status == "up" and self.acp_connected else (
@@ -214,6 +273,12 @@ class Hub:
             agent = "up"
         compat = self.compat or {}
         issues = list(compat.get("issues") or [])
+        live_turns = [
+            {"sessionId": sid, "state": "running"}
+            for sid in self.acp.turn_session_ids
+        ]
+        pending_q = sorted(self.acp.sessions_with_pending_questions())
+        session_flags = self._session_flags_map()
         return {
             "type": "status",
             "agent": agent,
@@ -223,14 +288,60 @@ class Hub:
             "loadedSessionId": self.acp.loaded_session_id,
             "turnRunning": self.acp.turn_running,
             "turnSessionId": self.acp.turn_session_id,
-            "promptQueueLength": len(self._prompt_queue),
+            "liveTurns": live_turns,
+            "pendingQuestionSessions": pending_q,
+            "sessionFlags": session_flags,
+            "maxConcurrentTurns": self._max_concurrent_turns,
+            "activeTurnCount": len(self.acp.turn_session_ids),
+            "promptQueueLength": self._queue_total_length(),
             "hubVersion": HUB_VERSION,
             "cliVersion": self.cli_version or compat.get("cliVersion"),
             "compatOk": bool(compat.get("ok")),
             "compatIssues": issues[:8],
             "productTag": "remote-stream",
             "hubSessionIds": self._hub_session_ids(50),
+            "bootId": self.boot_id,
+            "startedAt": self._started_at_iso(),
         }
+
+    def _started_at_iso(self) -> str:
+        return (
+            datetime.fromtimestamp(self.started_at, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+
+    @staticmethod
+    def _now_iso() -> str:
+        return (
+            datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        )
+
+    async def _emit_error(
+        self,
+        message: str,
+        *,
+        session_id: str | None = None,
+        ws: web.WebSocketResponse | None = None,
+        level: str = "warning",
+    ) -> None:
+        """Log + send a client-facing error (WS unicast or broadcast)."""
+        msg = str(message or "Error")
+        log_fn = log.error if level == "error" else log.warning
+        log_fn("client_error session=%s: %s", session_id or "-", msg)
+        payload: dict[str, Any] = {
+            "type": "error",
+            "message": msg,
+            "sessionId": session_id,
+            "at": self._now_iso(),
+        }
+        if ws is not None and not ws.closed:
+            try:
+                await ws.send_str(json.dumps(payload, default=str))
+            except Exception:
+                log.debug("failed to send error to ws session=%s", session_id or "-", exc_info=True)
+            return
+        await self.broadcast(payload)
 
     async def _on_agent_status(self, status: str) -> None:
         self.agent_status = status
@@ -239,19 +350,31 @@ class Hub:
     async def _on_acp_connection(self, connected: bool) -> None:
         self.acp_connected = connected
         if not connected:
+            # Prior process-local session/new ids are dead after ACP drop.
+            # Keep remote_agent_session for UI badges; next ensure will session/new.
+            if self.acp_created_sessions:
+                log.info(
+                    "ACP disconnected; clearing %d agent-live session id(s)",
+                    len(self.acp_created_sessions),
+                )
+            self.acp_created_sessions.clear()
+            sids = list(self.acp.disconnect_turn_session_ids or [])
+            self.acp.disconnect_turn_session_ids = []
             sid = self.acp.disconnect_turn_session_id
             self.acp.disconnect_turn_session_id = None
-            if not sid:
-                sid = self.acp.turn_session_id
-            if sid:
+            if sid and sid not in sids:
+                sids.append(sid)
+            if not sids and self.acp.turn_session_id:
+                sids.append(self.acp.turn_session_id)
+            for cleared in sids:
                 await self.broadcast(
                     {
                         "type": "turn",
-                        "sessionId": sid,
+                        "sessionId": cleared,
                         "state": "idle",
                         "error": "ACP disconnected",
                     },
-                    session_id=sid,
+                    session_id=cleared,
                 )
         await self.broadcast(self.status_payload())
 
@@ -261,15 +384,23 @@ class Hub:
 
     async def _on_user_question(self, payload: dict[str, Any]) -> None:
         """Fan out agent ask_user_question to all connected UIs."""
+        session_id = payload.get("sessionId")
+        if not session_id:
+            log.warning(
+                "user_question missing sessionId requestId=%s",
+                payload.get("requestId"),
+            )
         await self.broadcast(
             {
                 "type": "user_question",
                 "requestId": payload.get("requestId"),
-                "sessionId": payload.get("sessionId"),
+                "sessionId": session_id,
                 "questions": payload.get("questions") or [],
                 "toolCallId": payload.get("toolCallId"),
             }
         )
+        # Refresh sessionFlags / pendingQuestionSessions so rail shows question.
+        await self.broadcast(self.status_payload())
 
     async def _ws_user_question_answer(
         self, ws: web.WebSocketResponse, payload: dict[str, Any]
@@ -279,8 +410,8 @@ class Hub:
 
         request_id = str(payload.get("requestId") or "")
         if not request_id:
-            await ws.send_str(
-                json.dumps({"type": "error", "message": "user_question_answer missing requestId"})
+            await self._emit_error(
+                "user_question_answer missing requestId", ws=ws
             )
             return
         outcome = str(payload.get("outcome") or "accepted").lower()
@@ -300,14 +431,12 @@ class Hub:
                 "ok": ok,
             }
         )
+        # Clear question flag in sessionFlags for the rail.
+        await self.broadcast(self.status_payload())
         if not ok:
-            await ws.send_str(
-                json.dumps(
-                    {
-                        "type": "error",
-                        "message": f"No pending user question for requestId={request_id}",
-                    }
-                )
+            await self._emit_error(
+                f"No pending user question for requestId={request_id}",
+                ws=ws,
             )
 
 
@@ -419,33 +548,43 @@ class Hub:
         return cwd_key(cwd)
 
     def _load_remote_sessions_map(self) -> None:
-        """Restore remote_agent_session + acp_created_sessions from disk."""
+        """Restore remote_agent_session + hub_owned_session_ids; never seed agent-live set.
+
+        Disk ids from a prior hub/agent process are not live in this process.
+        acp_created_sessions stays process-local until session/new or successful load.
+        """
         mapping = load_remote_sessions(self.remote_sessions_path)
         self.remote_agent_session = dict(mapping)
-        for sid in mapping.values():
-            if sid:
-                self.acp_created_sessions.add(str(sid))
-        if mapping:
+        self.hub_owned_session_ids = load_hub_session_ids(self.remote_sessions_path)
+        # Do NOT add disk ids to acp_created_sessions.
+        if mapping or self.hub_owned_session_ids:
             log.info(
-                "Loaded %d remote session mapping(s) from %s",
+                "Restored remote map for UI only (%d mapping(s), %d hubId(s) from %s); "
+                "agent-live set starts empty.",
                 len(mapping),
+                len(self.hub_owned_session_ids),
                 self.remote_sessions_path,
             )
 
     def _persist_remote_sessions_map(self) -> None:
         try:
-            save_remote_sessions(self.remote_sessions_path, self.remote_agent_session)
+            save_remote_sessions(
+                self.remote_sessions_path,
+                self.remote_agent_session,
+                hub_ids=self.hub_owned_session_ids,
+            )
         except OSError as exc:
             log.debug("failed to write remote-sessions.json: %s", exc)
 
     def _record_hub_session(self, session_id: str, cwd: str) -> None:
-        """Track a hub-created agent session and persist remote map + last id."""
+        """Track a hub-created agent session and persist remote map + hubIds + last id."""
         sid = str(session_id)
         self.acp_created_sessions.add(sid)
+        self.hub_owned_session_ids.add(sid)
         key = self._cwd_key(cwd)
         if key:
             self.remote_agent_session[key] = sid
-            self._persist_remote_sessions_map()
+        self._persist_remote_sessions_map()
         try:
             path = LAST_REMOTE_SESSION_FILE
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -454,7 +593,24 @@ class Hub:
             log.debug("failed to write last-remote-session.txt: %s", exc)
 
     def _hub_remote_ids(self) -> set[str]:
-        return set(self.remote_agent_session.values())
+        return set(self.remote_agent_session.values()) | set(self.hub_owned_session_ids)
+
+    def _resume_map_ids(self) -> set[str]:
+        """Remote map values plus durable hubIds (resume candidates after restart)."""
+        return set(self.remote_agent_session.values()) | set(self.hub_owned_session_ids)
+
+    def _stamp_origin_sync(self, session_id: str, origin: str) -> bool:
+        """Immediate best-effort hub_origin stamp (summary may not exist yet)."""
+        try:
+            return stamp_hub_origin(self.config.sessions_root, session_id, origin)
+        except Exception as exc:
+            log.debug(
+                "stamp_hub_origin sync error session=%s origin=%s: %s",
+                session_id,
+                origin,
+                exc,
+            )
+            return False
 
     def _scan_sessions(self) -> list:
         return scan_sessions(
@@ -482,6 +638,97 @@ class Hub:
             "stamp_hub_origin gave up session=%s origin=%s", session_id, origin
         )
 
+    async def _try_session_load(self, session_id: str, cwd: str) -> bool:
+        """Attempt session/load with hard timeout. True on success."""
+        try:
+            await asyncio.wait_for(
+                self.acp.session_load(session_id, cwd),
+                timeout=20.0,
+            )
+            return True
+        except Exception as exc:
+            log.warning("session/load failed for %s: %s", session_id, exc)
+            return False
+
+    async def _load_or_fallback_session(
+        self,
+        target: str,
+        cwd: str,
+        *,
+        view_session_id: str,
+        view_origin: str | None,
+    ) -> str:
+        """Load target; on fail retry once, then try view if different, else session/new.
+
+        Prefers not abandoning the intended continuity id. When load fails for byCwd
+        while view is a different hub resume candidate, tries load view before new.
+        """
+        view = str(view_session_id or "").strip() or None
+
+        async def _succeed(sid: str, how: str) -> str:
+            self._record_hub_session(sid, cwd)
+            self._stamp_origin_sync(sid, "attach")
+            asyncio.create_task(self._stamp_origin_with_retry(sid, "attach"))
+            log.info(
+                "Resumed hub session via %s %s for view %s cwd=%s",
+                how,
+                sid,
+                view_session_id,
+                cwd,
+            )
+            return sid
+
+        if await self._try_session_load(target, cwd):
+            return await _succeed(target, "session/load")
+
+        # Retry once after short delay (transient agent/load races).
+        log.warning(
+            "session/load first attempt failed for %s; retrying after 0.5s",
+            target,
+        )
+        await asyncio.sleep(0.5)
+        if await self._try_session_load(target, cwd):
+            return await _succeed(target, "session/load retry")
+
+        # byCwd load failed while view is a different hub resume candidate → try view.
+        if (
+            view
+            and view != target
+            and is_hub_resume_candidate(
+                view,
+                created_set=self.acp_created_sessions,
+                remote_map_ids=self._resume_map_ids(),
+                hub_origin=view_origin,
+            )
+        ):
+            log.warning(
+                "session/load failed for target %s; trying view resume candidate %s",
+                target,
+                view,
+            )
+            if await self._try_session_load(view, cwd):
+                return await _succeed(view, "session/load view-fallback")
+
+        # Only mint new when continuity load is exhausted.
+        log.error(
+            "session/load exhausted for target=%s view=%s cwd=%s; "
+            "falling back to session/new (continuity abandoned)",
+            target,
+            view,
+            cwd,
+        )
+        agent_sid = await self.acp.session_new(cwd)
+        self._record_hub_session(agent_sid, cwd)
+        self._stamp_origin_sync(agent_sid, "attach")
+        asyncio.create_task(self._stamp_origin_with_retry(agent_sid, "attach"))
+        log.info(
+            "Created hub remote session %s for view %s cwd=%s (resume_failed)",
+            agent_sid,
+            view_session_id,
+            cwd,
+        )
+        return agent_sid
+
     async def _ensure_hub_agent_session(
         self,
         view_session_id: str,
@@ -492,32 +739,29 @@ class Hub:
     ) -> tuple[str, bool, str]:
         """Return (live_session_id, switched, reason) safe for session/prompt.
 
-        If view_session_id was never created by this hub, reuse cwd remote or
-        session/new. Optionally notify UI via session_switch and subscribe ws.
+        Process-live: reuse. Hub-owned after restart: session/load same id.
+        Foreign/CLI or load failure: session/new. Optionally notify session_switch.
         """
-        live, needs_new, reason = resolve_live_session_id(
+        view_origin = read_hub_origin(self.config.sessions_root, view_session_id)
+        key = self._cwd_key(cwd)
+        remote_id = self.remote_agent_session.get(key) if key else None
+        remote_origin = (
+            read_hub_origin(self.config.sessions_root, remote_id) if remote_id else ""
+        )
+        target, action, reason = resolve_ensure_action(
             view_session_id,
             cwd,
             self.acp_created_sessions,
             self.remote_agent_session,
+            view_hub_origin=view_origin or None,
+            remote_hub_origin=remote_origin or None,
+            hub_owned_ids=self.hub_owned_session_ids,
         )
-        if not needs_new and live:
-            agent_sid = live
-            # After hub restart / ACP reconnect, ensure agent has hub session loaded.
-            if self.acp.connected and self.acp.loaded_session_id != agent_sid:
-                try:
-                    await self.acp.session_load(agent_sid, cwd)
-                except Exception:
-                    log.info(
-                        "Reusing remote session failed load; creating new (cwd=%s)",
-                        cwd,
-                    )
-                    agent_sid = await self.acp.session_new(cwd)
-                    self._record_hub_session(agent_sid, cwd)
-                    asyncio.create_task(
-                        self._stamp_origin_with_retry(agent_sid, "attach")
-                    )
-                    reason = "need_session_new"
+
+        if action == "reuse" and target:
+            agent_sid = target
+            # Keep byCwd aligned with the working session (view wins).
+            self._record_hub_session(agent_sid, cwd)
             log.info(
                 "Reuse hub remote session %s for view %s cwd=%s reason=%s",
                 agent_sid,
@@ -525,9 +769,19 @@ class Hub:
                 cwd,
                 reason,
             )
+        elif action == "load" and target:
+            agent_sid = await self._load_or_fallback_session(
+                target,
+                cwd,
+                view_session_id=view_session_id,
+                view_origin=view_origin or None,
+            )
+            if agent_sid != target:
+                reason = "resume_failed"
         else:
             agent_sid = await self.acp.session_new(cwd)
             self._record_hub_session(agent_sid, cwd)
+            self._stamp_origin_sync(agent_sid, "attach")
             asyncio.create_task(self._stamp_origin_with_retry(agent_sid, "attach"))
             reason = "need_session_new"
             log.info(
@@ -540,11 +794,17 @@ class Hub:
         switched = agent_sid != view_session_id
         switch_reason = "hub_session"
         if switched:
-            switch_reason = (
-                "cli_or_foreign_session"
-                if reason in ("reuse_cwd", "need_session_new", "cli_or_foreign_session")
-                else reason
-            )
+            if reason == "resume_failed":
+                switch_reason = "resume_failed"
+            elif reason in (
+                "reuse_cwd",
+                "resume_cwd",
+                "need_session_new",
+                "cli_or_foreign_session",
+            ):
+                switch_reason = "cli_or_foreign_session"
+            else:
+                switch_reason = reason
             if notify_switch:
                 switch = {
                     "type": "session_switch",
@@ -559,7 +819,7 @@ class Hub:
                     self.subscriptions.setdefault(ws, set()).add(agent_sid)
                 items = self._scan_sessions()
                 await self.broadcast(
-                    {"type": "sessions", "items": [s.to_dict() for s in items]}
+                    {"type": "sessions", "items": self._sessions_items_with_status()}
                 )
                 await self.broadcast(self.status_payload())
         else:
@@ -622,12 +882,14 @@ class Hub:
                 break
             await asyncio.sleep(0.25)
         # In-memory turn state is fresh on start; still clear any stuck flag if present.
-        if self.acp.turn_running and self.acp.is_turn_stuck(STUCK_TURN_SECONDS):
-            sid = self.acp.turn_session_id
-            self.acp.force_clear_turn(
-                f"startup clear stuck turn age>{STUCK_TURN_SECONDS}s"
-            )
-            log.warning("Startup force-cleared stuck turn session=%s", sid)
+        if self.acp.turn_running:
+            for sid in list(self.acp.turn_session_ids):
+                if self.acp.is_turn_stuck(session_id=sid):
+                    self.acp.force_clear_turn(
+                        f"startup clear stuck turn age>{STUCK_TURN_SECONDS}s",
+                        session_id=sid,
+                    )
+                    log.warning("Startup force-cleared stuck turn session=%s", sid)
         self.refresh_compat()
         self._status_resync_task = asyncio.create_task(
             self._status_resync_loop(), name="hub-status-resync"
@@ -651,21 +913,26 @@ class Hub:
                 pass
         await self.tailer.stop()
         await self.acp.stop()
-        await self.supervisor.stop()
+        # Leave agent serve up across hub bounce (code deploy / restart-hub).
+        # Full agent teardown: stop-hub.ps1 -KillAgent (default for stop alone).
+        await self.supervisor.stop(kill_agent=False)
 
     async def _status_resync_loop(self) -> None:
         """While a turn is running, re-broadcast status so clients re-sync turnRunning.
 
+        Near-streaming cadence (1s) while any turn is active; slower when idle.
         Also surfaces watchdog force-clears that may not have gone through WS prompt.
         """
         try:
             while True:
-                await asyncio.sleep(10.0)
+                active = bool(self.acp.turn_running) or bool(self.acp.turn_session_ids)
+                # 1.0s while turns run so rail pills stay fresh; 5–10s when idle.
+                await asyncio.sleep(1.0 if active else 8.0)
                 reason = self.acp.last_force_clear_reason
                 if reason and reason != self._last_broadcast_force_clear:
                     sid = self.acp.last_force_clear_session
                     self._last_broadcast_force_clear = reason
-                    if sid and not self.acp.turn_running:
+                    if sid and not self.acp.is_session_active(sid):
                         err = MID_TURN_STALL_USER_MSG
                         low = reason.lower()
                         if "max turn" in low:
@@ -676,13 +943,7 @@ class Hub:
                             await self._broadcast_turn(sid, "idle", err)
                         except Exception:
                             log.debug("status resync turn idle broadcast failed", exc_info=True)
-                if self.acp.turn_running:
-                    # Hard safety: wall-clock stuck even if watchdog task died
-                    if self.acp.is_turn_stuck(STUCK_TURN_SECONDS):
-                        age = self.acp.turn_age_seconds()
-                        if age is not None and age >= STUCK_TURN_SECONDS:
-                            # Prefer max-turn only via acp watchdog; here just re-broadcast.
-                            pass
+                if self.acp.turn_running or bool(self.acp.turn_session_ids):
                     try:
                         await self.broadcast(self.status_payload())
                     except Exception:
@@ -708,11 +969,22 @@ class Hub:
             "turnRunning": self.acp.turn_running,
             "turnSessionId": self.acp.turn_session_id,
             "turnAgeSeconds": self.acp.turn_age_seconds(),
+            "liveTurns": [
+                {"sessionId": sid, "state": "running"}
+                for sid in self.acp.turn_session_ids
+            ],
+            "activeTurnCount": len(self.acp.turn_session_ids),
+            "maxConcurrentTurns": self._max_concurrent_turns,
+            "pendingQuestionSessions": sorted(
+                self.acp.sessions_with_pending_questions()
+            ),
             "hubVersion": HUB_VERSION,
             "cliVersion": self.cli_version or compat.get("cliVersion"),
             "compatOk": bool(compat.get("ok")),
             "compatIssues": list(compat.get("issues") or [])[:8],
             "productTag": "remote-stream",
+            "bootId": self.boot_id,
+            "startedAt": self._started_at_iso(),
         }
         return web.json_response(body)
 
@@ -727,31 +999,50 @@ class Hub:
         return web.json_response(compat)
 
     async def handle_reset_turn(self, request: web.Request) -> web.Response:
-        """Force-clear a stuck turn so clients can send again."""
-        sid = self.acp.turn_session_id
+        """Force-clear stuck turn(s) so clients can send again.
+
+        Optional JSON body ``sessionId`` clears only that turn; otherwise all.
+        """
+        body: dict[str, Any] = {}
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                body = {}
+        except Exception:
+            body = {}
+        target = str(body.get("sessionId") or "").strip() or None
+        sids = [target] if target else list(self.acp.turn_session_ids)
         was = self.acp.turn_running
-        cleared = self.acp.force_clear_turn("admin POST /api/admin/reset-turn")
+        cleared = self.acp.force_clear_turn(
+            "admin POST /api/admin/reset-turn", session_id=target
+        )
         if cleared:
             self._last_broadcast_force_clear = self.acp.last_force_clear_reason
-        if sid:
-            await self.broadcast(
-                {
-                    "type": "turn",
-                    "sessionId": sid,
-                    "state": "idle",
-                    "error": "Turn reset by admin",
-                },
-                session_id=sid,
-            )
-        # Always push full status so every client re-syncs turnRunning=false.
+        for sid in sids:
+            if sid:
+                await self.broadcast(
+                    {
+                        "type": "turn",
+                        "sessionId": sid,
+                        "state": "idle",
+                        "error": "Turn reset by admin",
+                    },
+                    session_id=sid,
+                )
+        # Always push full status so every client re-syncs turn state.
         await self.broadcast(self.status_payload())
         return web.json_response(
-            {"ok": True, "cleared": cleared, "wasRunning": was, "sessionId": sid}
+            {
+                "ok": True,
+                "cleared": cleared,
+                "wasRunning": was,
+                "sessionId": target or (sids[0] if sids else None),
+                "sessionIds": sids,
+            }
         )
 
     async def handle_sessions(self, request: web.Request) -> web.Response:
-        items = self._scan_sessions()
-        return web.json_response({"items": [s.to_dict() for s in items]})
+        return web.json_response({"items": self._sessions_items_with_status()})
 
     async def handle_rename_session(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]
@@ -770,7 +1061,7 @@ class Hub:
         if not updated:
             return web.json_response({"error": "session not found"}, status=404)
         items = self._scan_sessions()
-        await self.broadcast({"type": "sessions", "items": [s.to_dict() for s in items]})
+        await self.broadcast({"type": "sessions", "items": self._sessions_items_with_status()})
         return web.json_response({"item": updated.to_dict()})
 
     async def handle_delete_session(self, request: web.Request) -> web.Response:
@@ -801,7 +1092,7 @@ class Hub:
             log.debug("failed to clear last-remote-session.txt: %s", exc)
 
         items = self._scan_sessions()
-        await self.broadcast({"type": "sessions", "items": [s.to_dict() for s in items]})
+        await self.broadcast({"type": "sessions", "items": self._sessions_items_with_status()})
         await self.broadcast(self.status_payload())
         return web.json_response({"ok": True})
 
@@ -1000,13 +1291,14 @@ class Hub:
         try:
             session_id = await self.acp.session_new(cwd)
             self._record_hub_session(session_id, cwd)
+            self._stamp_origin_sync(session_id, "user")
             asyncio.create_task(self._stamp_origin_with_retry(session_id, "user"))
         except Exception as exc:
             log.exception("session/new failed")
             return web.json_response({"error": str(exc)}, status=500)
         await self.broadcast(self.status_payload())
         items = self._scan_sessions()
-        await self.broadcast({"type": "sessions", "items": [s.to_dict() for s in items]})
+        await self.broadcast({"type": "sessions", "items": self._sessions_items_with_status()})
         return web.json_response({"sessionId": session_id, "cwd": cwd})
 
     async def handle_load_session(self, request: web.Request) -> web.Response:
@@ -1024,8 +1316,15 @@ class Hub:
             return web.json_response({"error": "cwd required"}, status=400)
         if not self.acp.connected:
             return web.json_response({"error": "agent not connected"}, status=503)
-        # Only allow session/load for hub-created sessions (never foreign/CLI).
-        if needs_fresh_agent_session(session_id, self.acp_created_sessions):
+        # Allow session/load for process-live or hub resume candidates (never pure CLI).
+        hub_origin = read_hub_origin(self.config.sessions_root, session_id)
+        remote_map_ids = self._resume_map_ids()
+        if not is_hub_resume_candidate(
+            session_id,
+            created_set=self.acp_created_sessions,
+            remote_map_ids=remote_map_ids,
+            hub_origin=hub_origin or None,
+        ):
             return web.json_response(
                 {
                     "error": "foreign session; use POST /api/sessions/{id}/attach for live remote",
@@ -1033,27 +1332,33 @@ class Hub:
                 },
                 status=400,
             )
-        if self.acp.turn_running and self.acp.is_turn_stuck():
-            stuck_sid = self.acp.turn_session_id
-            self.acp.force_clear_turn("auto-clear stuck turn before session load")
-            if stuck_sid:
-                await self.broadcast(
-                    {
-                        "type": "turn",
-                        "sessionId": stuck_sid,
-                        "state": "idle",
-                        "error": "Turn cleared (stuck)",
-                    },
-                    session_id=stuck_sid,
-                )
+        # Only block/clear when THIS session is mid-turn; other projects may run.
+        if self.acp.is_session_active(session_id) and self.acp.is_turn_stuck(
+            session_id=session_id
+        ):
+            self.acp.force_clear_turn(
+                "auto-clear stuck turn before session load", session_id=session_id
+            )
+            await self.broadcast(
+                {
+                    "type": "turn",
+                    "sessionId": session_id,
+                    "state": "idle",
+                    "error": "Turn cleared (stuck)",
+                },
+                session_id=session_id,
+            )
             await self.broadcast(self.status_payload())
-        if self.acp.turn_running:
+        if self.acp.is_session_active(session_id):
             return web.json_response(
-                {"error": "turn in progress; wait until idle to switch sessions"},
+                {"error": "turn in progress on this session; wait until idle"},
                 status=409,
             )
         try:
             await self.acp.session_load(session_id, cwd)
+            self._record_hub_session(session_id, cwd)
+            self._stamp_origin_sync(session_id, "attach")
+            asyncio.create_task(self._stamp_origin_with_retry(session_id, "attach"))
         except Exception as exc:
             log.exception("session/load failed")
             return web.json_response({"error": str(exc)}, status=500)
@@ -1090,20 +1395,25 @@ class Hub:
         if not self.acp.connected:
             return web.json_response({"error": "agent not connected"}, status=503)
 
-        if self.acp.turn_running and self.acp.is_turn_stuck():
-            stuck_sid = self.acp.turn_session_id
-            self.acp.force_clear_turn("auto-clear stuck turn before attach")
-            if stuck_sid:
+        # Attach must not be blocked by other projects' turns.
+        # Clear only a stuck turn on the view/live session if needed.
+        for check_sid in (view_session_id,):
+            if self.acp.is_session_active(check_sid) and self.acp.is_turn_stuck(
+                session_id=check_sid
+            ):
+                self.acp.force_clear_turn(
+                    "auto-clear stuck turn before attach", session_id=check_sid
+                )
                 await self.broadcast(
                     {
                         "type": "turn",
-                        "sessionId": stuck_sid,
+                        "sessionId": check_sid,
                         "state": "idle",
                         "error": "Turn cleared (stuck)",
                     },
-                    session_id=stuck_sid,
+                    session_id=check_sid,
                 )
-            await self.broadcast(self.status_payload())
+                await self.broadcast(self.status_payload())
 
         try:
             live_id, switched, reason = await self._ensure_hub_agent_session(
@@ -1147,7 +1457,7 @@ class Hub:
         self.subscriptions[ws] = set()
         await ws.send_str(json.dumps(self.status_payload()))
         items = self._scan_sessions()
-        await ws.send_str(json.dumps({"type": "sessions", "items": [s.to_dict() for s in items]}))
+        await ws.send_str(json.dumps({"type": "sessions", "items": self._sessions_items_with_status()}))
         # Push cached agent slash commands so reconnect/new clients get real list
         # without waiting for attach or a later available_commands_update.
         if self.acp.available_commands:
@@ -1175,7 +1485,7 @@ class Hub:
         try:
             payload = json.loads(data)
         except json.JSONDecodeError:
-            await ws.send_str(json.dumps({"type": "error", "message": "invalid json"}))
+            await self._emit_error("invalid json", ws=ws)
             return
         if not isinstance(payload, dict):
             return
@@ -1252,7 +1562,7 @@ class Hub:
         if typ == "user_question_answer":
             await self._ws_user_question_answer(ws, payload)
             return
-        await ws.send_str(json.dumps({"type": "error", "message": f"unknown type: {typ}"}))
+        await self._emit_error(f"unknown type: {typ}", ws=ws)
 
     async def _ws_prompt_safe(self, ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
         try:
@@ -1261,17 +1571,16 @@ class Hub:
             log.exception("background prompt task failed")
             try:
                 sid = str(payload.get("sessionId") or "")
-                if not ws.closed:
-                    await ws.send_str(
-                        json.dumps(
-                            {
-                                "type": "error",
-                                "message": "Prompt failed unexpectedly. You can send again.",
-                            }
-                        )
-                    )
+                await self._emit_error(
+                    "Prompt failed unexpectedly. You can send again.",
+                    session_id=sid or None,
+                    ws=ws,
+                    level="error",
+                )
                 if sid:
-                    await self._broadcast_turn(sid, sid, "idle", "Prompt failed unexpectedly")
+                    await self._broadcast_turn(
+                        sid, "idle", "Prompt failed unexpectedly"
+                    )
             except Exception:
                 pass
 
@@ -1303,6 +1612,13 @@ class Hub:
         also_session_id: str | None = None,
     ) -> None:
         """Broadcast turn state; optionally also to a view session id (unlock UI)."""
+        if error:
+            log.warning(
+                "turn_error session=%s state=%s: %s",
+                session_id or "-",
+                state,
+                error,
+            )
         payload = {
             "type": "turn",
             "sessionId": session_id,
@@ -1318,15 +1634,45 @@ class Hub:
                 "error": error,
             }
             await self.broadcast(also, session_id=also_session_id)
+        # Immediate status so client liveTurns/sessionFlags/pills update on start/end.
+        try:
+            await self.broadcast(self.status_payload())
+        except Exception:
+            log.debug("status broadcast after turn failed", exc_info=True)
+
+    def _resolve_prompt_cwd_key(
+        self, view_session_id: str, cwd_raw: str
+    ) -> tuple[str, str]:
+        """Return (cwd, cwd_key) for queue / concurrency gating."""
+        session = find_session(self.config.sessions_root, view_session_id)
+        cwd = (cwd_raw or (session.cwd if session else "") or "").strip()
+        # Prefer live remote session id mapping key when known
+        key = self._cwd_key(cwd) if cwd else ""
+        if not key:
+            for k, sid in self.remote_agent_session.items():
+                if sid == view_session_id or sid == self.acp.loaded_session_id:
+                    key = k
+                    break
+        if not key:
+            key = f"session:{view_session_id}"
+        return cwd, key
 
     async def _ws_prompt(self, ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
         view_session_id = str(payload.get("sessionId") or "")
         text = str(payload.get("text") or "")
         if not view_session_id or not text.strip():
-            await ws.send_str(json.dumps({"type": "error", "message": "sessionId and text required"}))
+            await self._emit_error(
+                "sessionId and text required",
+                session_id=view_session_id or None,
+                ws=ws,
+            )
             return
         if not self.acp.connected:
-            await ws.send_str(json.dumps({"type": "error", "message": "agent not connected"}))
+            await self._emit_error(
+                "agent not connected",
+                session_id=view_session_id or None,
+                ws=ws,
+            )
             await ws.send_str(
                 json.dumps(
                     {
@@ -1339,26 +1685,65 @@ class Hub:
             )
             return
 
-        # Auto-clear only when watchdog would (mid-turn stall / max wall / no-output)
-        if self.acp.turn_running and self.acp.is_turn_stuck():
-            stuck_sid = self.acp.turn_session_id
-            self.acp.force_clear_turn("auto-clear stuck turn before new prompt")
-            if stuck_sid:
-                await self._broadcast_turn(
-                    stuck_sid, "idle", "Turn cleared (stuck)", also_session_id=view_session_id
-                )
-            await self.broadcast(self.status_payload())
-
         cwd_raw = str(payload.get("cwd") or "")
-        # While a turn is active, queue instead of rejecting (TUI-like).
-        if self.acp.turn_running:
-            await self._enqueue_prompt(ws, view_session_id, text, cwd_raw)
+        cwd, cwd_key = self._resolve_prompt_cwd_key(view_session_id, cwd_raw)
+
+        # Resolve likely live id for active-turn checks (view may map to hub remote).
+        live_guess = view_session_id
+        if cwd_key and self.remote_agent_session.get(cwd_key):
+            live_guess = self.remote_agent_session[cwd_key]
+        elif view_session_id in self.acp_created_sessions:
+            live_guess = view_session_id
+
+        # Auto-clear stuck turn only for this session (not other projects).
+        for check_sid in {view_session_id, live_guess}:
+            if self.acp.is_session_active(check_sid) and self.acp.is_turn_stuck(
+                session_id=check_sid
+            ):
+                self.acp.force_clear_turn(
+                    "auto-clear stuck turn before new prompt", session_id=check_sid
+                )
+                await self._broadcast_turn(
+                    check_sid, "idle", "Turn cleared (stuck)", also_session_id=view_session_id
+                )
+                await self.broadcast(self.status_payload())
+
+        # This session already running → per-cwd queue (TUI-like follow-ups).
+        if self.acp.is_session_active(view_session_id) or self.acp.is_session_active(
+            live_guess
+        ):
+            await self._enqueue_prompt(ws, view_session_id, text, cwd_raw, cwd_key)
             return
 
-        await self._execute_prompt(
-            view_session_id, text, cwd_raw, ws=ws, echo_user=True
+        active_map = self.acp.active_by_session_cwd()
+        # Prefer cwd_key from active map when missing
+        ok, reason = can_start_concurrent_turn(
+            live_guess,
+            cwd_key,
+            active_by_session=active_map,
+            max_concurrent=self._max_concurrent_turns,
         )
-        await self._drain_prompt_queue()
+        if not ok:
+            if reason == "max_concurrent":
+                await self._emit_error(
+                    (
+                        f"Max concurrent project turns "
+                        f"({self._max_concurrent_turns}). "
+                        "Wait for a project to finish."
+                    ),
+                    session_id=view_session_id,
+                    ws=ws,
+                )
+                return
+            # same_cwd_busy: queue for this project
+            await self._enqueue_prompt(ws, view_session_id, text, cwd_raw, cwd_key)
+            return
+
+        # Different project (or free capacity): execute immediately in parallel.
+        await self._execute_prompt(
+            view_session_id, text, cwd_raw, ws=ws, echo_user=True, cwd_key=cwd_key
+        )
+        await self._drain_prompt_queues()
 
     async def _enqueue_prompt(
         self,
@@ -1366,27 +1751,32 @@ class Hub:
         view_session_id: str,
         text: str,
         cwd_raw: str,
+        cwd_key: str | None = None,
     ) -> None:
-        """Queue a prompt while a turn is running. Echoes user text immediately."""
+        """Queue a prompt for one project cwd. Echoes user text immediately."""
+        if not cwd_key:
+            _, cwd_key = self._resolve_prompt_cwd_key(view_session_id, cwd_raw)
         async with self._prompt_queue_lock:
-            position = self._prompt_queue.try_enqueue(
+            q = self._prompt_queues.get(cwd_key)
+            if q is None:
+                q = PromptQueue(max_size=10)
+                self._prompt_queues[cwd_key] = q
+            position = q.try_enqueue(
                 {
                     "view_session_id": view_session_id,
                     "text": text,
                     "cwd": cwd_raw,
+                    "cwd_key": cwd_key,
                 }
             )
             if position is None:
-                await ws.send_str(
-                    json.dumps(
-                        {
-                            "type": "error",
-                            "message": "Queue full (max 10). Wait for turns to finish.",
-                        }
-                    )
+                await self._emit_error(
+                    "Queue full (max 10). Wait for turns to finish.",
+                    session_id=view_session_id,
+                    ws=ws,
                 )
                 return
-            queue_length = len(self._prompt_queue)
+            queue_length = self._queue_total_length()
 
         await self.broadcast(
             {
@@ -1398,7 +1788,6 @@ class Hub:
             }
         )
         # Unscoped echo: view id may differ from live selection; all clients get it.
-        # Client accepts user_message_chunk when turnRunning or session matches.
         await self.broadcast(
             {
                 "type": "acp",
@@ -1425,17 +1814,20 @@ class Hub:
         *,
         ws: web.WebSocketResponse | None = None,
         echo_user: bool = True,
+        cwd_key: str = "",
     ) -> None:
-        """Run one prompt turn. Does not enqueue; caller drains the queue after."""
+        """Run one prompt turn. Does not enqueue; caller drains queues after."""
         session = find_session(self.config.sessions_root, view_session_id)
         cwd = (cwd_raw or (session.cwd if session else "") or "").strip()
         if not cwd and self.acp.loaded_session_id != view_session_id:
             err = "cwd unknown for session"
-            if ws is not None and not ws.closed:
-                await ws.send_str(json.dumps({"type": "error", "message": err}))
+            await self._emit_error(err, session_id=view_session_id, ws=ws)
             await self._broadcast_turn(view_session_id, "idle", err)
             await self.broadcast(self.status_payload())
             return
+
+        if not cwd_key:
+            cwd_key = self._cwd_key(cwd) if cwd else f"session:{view_session_id}"
 
         session_id = view_session_id
         # Hub-owned session for prompts (CLI / foreign ids cannot be prompted)
@@ -1445,8 +1837,9 @@ class Hub:
             )
         except Exception as exc:
             log.exception("ensure hub agent session failed view=%s", view_session_id)
-            if ws is not None and not ws.closed:
-                await ws.send_str(json.dumps({"type": "error", "message": str(exc)}))
+            await self._emit_error(
+                str(exc), session_id=view_session_id, ws=ws, level="error"
+            )
             await self._broadcast_turn(
                 view_session_id, "idle", str(exc), also_session_id=session_id
             )
@@ -1456,15 +1849,17 @@ class Hub:
         if ws is not None:
             self.subscriptions.setdefault(ws, set()).add(session_id)
         log.info(
-            "WS prompt start session=%s view=%s hub_created=%s",
+            "WS prompt start session=%s view=%s hub_created=%s active=%d",
             session_id,
             view_session_id,
             session_id in self.acp_created_sessions,
+            len(self.acp.turn_session_ids),
         )
         # Running on live id; also unlock view selection if still on foreign id
         await self._broadcast_turn(
             session_id, "running", None, also_session_id=view_session_id
         )
+        await self.broadcast(self.status_payload())
         # Echo user message as acp-shaped update so all clients see it immediately
         # (skip when item was already echoed at enqueue time)
         if echo_user:
@@ -1486,14 +1881,14 @@ class Hub:
                 session_id=session_id,
             )
 
-        # Hub-created sessions are already loaded via session/new; never load foreign ids.
-        allow_load = session_id in self.acp_created_sessions
+        # ensure path session/new'd if needed; multi-session agent holds id without load.
         try:
             await self.acp.session_prompt(
                 session_id,
                 text,
                 cwd=cwd or None,
-                allow_load=allow_load,
+                allow_load=False,
+                cwd_key=cwd_key,
             )
             log.info("WS prompt end session=%s ok", session_id)
             await self._broadcast_turn(
@@ -1501,44 +1896,24 @@ class Hub:
             )
         except Exception as exc:
             log.exception("prompt failed session=%s", session_id)
-            if self.acp.turn_running and self.acp.turn_session_id == session_id:
-                self.acp.force_clear_turn(f"prompt exception: {exc}")
+            if self.acp.is_session_active(session_id):
+                self.acp.force_clear_turn(
+                    f"prompt exception: {exc}", session_id=session_id
+                )
 
             err_msg = str(exc)
-            # Hang with zero output: drop cached remote, create fresh for next send
+            # Hang with zero output: keep same session; do not fork or rebind map.
             if self._is_no_output_error(exc):
                 err_msg = NO_OUTPUT_USER_MSG
-                key = self._cwd_key(cwd)
-                if key and self.remote_agent_session.get(key) == session_id:
-                    self.remote_agent_session.pop(key, None)
-                    self._persist_remote_sessions_map()
-                self.acp_created_sessions.discard(session_id)
-                try:
-                    fresh = await self.acp.session_new(cwd)
-                    self._record_hub_session(fresh, cwd)
-                    asyncio.create_task(self._stamp_origin_with_retry(fresh, "attach"))
-                    switch = {
-                        "type": "session_switch",
-                        "from": session_id,
-                        "to": fresh,
-                        "reason": "no_output_retry",
-                        "cwd": cwd,
-                        "message": NO_OUTPUT_USER_MSG,
-                    }
-                    await self.broadcast(switch)
-                    if ws is not None:
-                        self.subscriptions.setdefault(ws, set()).add(fresh)
-                    items = self._scan_sessions()
-                    await self.broadcast(
-                        {"type": "sessions", "items": [s.to_dict() for s in items]}
+                if self.acp.is_session_active(session_id):
+                    self.acp.force_clear_turn(
+                        "no-output recovery: clear stuck turn, same session",
+                        session_id=session_id,
                     )
-                    log.info(
-                        "no-output: prepared fresh remote session %s (was %s)",
-                        fresh,
-                        session_id,
-                    )
-                except Exception as create_exc:
-                    log.warning("no-output: fresh session create failed: %s", create_exc)
+                log.warning(
+                    "no-output: kept session %s (no session/new, no map rewrite)",
+                    session_id,
+                )
             elif self._is_mid_turn_stall_error(exc):
                 err_msg = MID_TURN_STALL_USER_MSG
             elif self._is_max_turn_error(exc):
@@ -1552,26 +1927,61 @@ class Hub:
             await self._broadcast_turn(
                 session_id, "idle", err_msg, also_session_id=view_session_id
             )
-            await self.broadcast({"type": "error", "message": err_msg})
+            await self._emit_error(
+                err_msg, session_id=session_id, level="warning"
+            )
         finally:
             # Always re-assert idle unlock path via status (success already idled above)
-            if self.acp.turn_running and self.acp.turn_session_id == session_id:
-                self.acp.force_clear_turn("prompt finally safeguard")
+            if self.acp.is_session_active(session_id):
+                self.acp.force_clear_turn(
+                    "prompt finally safeguard", session_id=session_id
+                )
                 await self._broadcast_turn(
                     session_id, "idle", None, also_session_id=view_session_id
                 )
         await self.broadcast(self.status_payload())
 
-    async def _drain_prompt_queue(self) -> None:
-        """Run queued prompts FIFO until empty or a turn is still running."""
+    async def _drain_prompt_queues(self) -> None:
+        """Start queued prompts whose cwd/session can run now (multi-project)."""
         while True:
+            item: dict[str, Any] | None = None
             async with self._prompt_queue_lock:
-                if self.acp.turn_running or not self._prompt_queue:
+                # Drop empty queues
+                empty_keys = [k for k, q in self._prompt_queues.items() if len(q) == 0]
+                for k in empty_keys:
+                    self._prompt_queues.pop(k, None)
+                if not self._prompt_queues:
                     return
-                item = self._prompt_queue.pop()
-                if item is None:
-                    return
-                remaining = len(self._prompt_queue)
+                active_map = self.acp.active_by_session_cwd()
+                for qkey, q in list(self._prompt_queues.items()):
+                    if len(q) == 0:
+                        continue
+                    # Peek without pop
+                    peek = q._items[0] if q._items else None
+                    if peek is None:
+                        continue
+                    view_sid = str(peek.get("view_session_id") or "")
+                    item_key = str(peek.get("cwd_key") or qkey)
+                    # Resolve live id if mapped
+                    live = self.remote_agent_session.get(item_key) or view_sid
+                    ok, reason = can_start_concurrent_turn(
+                        live,
+                        item_key,
+                        active_by_session=active_map,
+                        max_concurrent=self._max_concurrent_turns,
+                    )
+                    if not ok:
+                        continue
+                    if reason == "already_active":
+                        # Session still mid-turn; keep queued
+                        continue
+                    item = q.pop()
+                    if len(q) == 0:
+                        self._prompt_queues.pop(qkey, None)
+                    break
+                remaining = self._queue_total_length()
+            if item is None:
+                return
             await self.broadcast(
                 {
                     "type": "queue",
@@ -1586,47 +1996,74 @@ class Hub:
                     str(item.get("cwd") or ""),
                     ws=None,
                     echo_user=False,
+                    cwd_key=str(item.get("cwd_key") or ""),
                 )
             except Exception:
                 log.exception("queued prompt failed")
-                # continue draining remaining items
+                # continue draining remaining startable items
+
+    # Back-compat name used by older call sites / tests.
+    async def _drain_prompt_queue(self) -> None:
+        await self._drain_prompt_queues()
 
     async def _ws_cancel(self, ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
         session_id = str(payload.get("sessionId") or "")
         if not session_id:
             return
-        # Stop cancels active turn and drops any waiting queued prompts.
+        # Stop cancels only this session's turn + its project queue.
+        _, cwd_key = self._resolve_prompt_cwd_key(session_id, "")
+        # Also match by remote map reverse lookup
+        for k, sid in self.remote_agent_session.items():
+            if sid == session_id:
+                cwd_key = k
+                break
         async with self._prompt_queue_lock:
-            self._prompt_queue.clear()
-        await self.broadcast({"type": "queue", "queueLength": 0, "sessionId": session_id})
+            q = self._prompt_queues.pop(cwd_key, None)
+            if q is not None:
+                q.clear()
+            # Also drop queue items targeting this session under any key
+            for k, qq in list(self._prompt_queues.items()):
+                kept: list[dict[str, Any]] = []
+                for it in list(qq._items):
+                    if str(it.get("view_session_id") or "") == session_id:
+                        continue
+                    kept.append(it)
+                qq._items = kept
+                if len(qq) == 0:
+                    self._prompt_queues.pop(k, None)
+            remaining = self._queue_total_length()
+        await self.broadcast(
+            {"type": "queue", "queueLength": remaining, "sessionId": session_id}
+        )
         try:
             await self.acp.session_cancel(session_id)
         except Exception as exc:
             log.warning("session_cancel raised session=%s: %s — force-clearing", session_id, exc)
             try:
-                self.acp.force_clear_turn(f"user cancel fallback: {exc}")
+                self.acp.force_clear_turn(
+                    f"user cancel fallback: {exc}", session_id=session_id
+                )
             except Exception:
                 log.exception("force_clear_turn after cancel failure")
             try:
-                await ws.send_str(
-                    json.dumps(
-                        {
-                            "type": "error",
-                            "message": (
-                                f"Stop: agent cancel failed ({exc}); "
-                                "turn force-cleared locally."
-                            ),
-                        }
-                    )
+                await self._emit_error(
+                    (
+                        f"Stop: agent cancel failed ({exc}); "
+                        "turn force-cleared locally."
+                    ),
+                    session_id=session_id,
+                    ws=ws,
                 )
             except Exception:
                 pass
-        # Always broadcast idle + status so clients unlock (turnRunning: false).
+        # Always broadcast idle + status so clients unlock this session.
         await self.broadcast(
             {"type": "turn", "sessionId": session_id, "state": "idle", "error": None},
             session_id=session_id,
         )
         await self.broadcast(self.status_payload())
+        # Other projects may have queued work that can start now.
+        await self._drain_prompt_queues()
 
 
 def create_app(config: Config | None = None) -> web.Application:
