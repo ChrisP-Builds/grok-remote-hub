@@ -368,6 +368,27 @@ class AcpClient:
             self._maintain_task = None
         await self._close_ws()
 
+    async def reconnect(self, timeout: float = 10.0) -> None:
+        """Close the current ACP WebSocket so the maintain loop reconnects.
+
+        Waits until connected (and initialized) or raises TimeoutError.
+        Used by no-output heal; does not session/new.
+        """
+        was_connected = self.connected
+        log.info("ACP reconnect requested (was_connected=%s)", was_connected)
+        try:
+            await self._close_ws()
+        except Exception as exc:
+            log.warning("ACP reconnect close failed: %s", exc)
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        # If already mid-reconnect, wait for the next connected edge.
+        while time.monotonic() < deadline:
+            if self.connected and self._ws is not None:
+                log.info("ACP reconnect complete")
+                return
+            await asyncio.sleep(0.15)
+        raise TimeoutError(f"ACP reconnect timed out after {timeout}s")
+
     async def _set_connected(self, value: bool) -> None:
         self.connected = value
         if self.on_connection:

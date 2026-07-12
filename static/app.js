@@ -487,9 +487,9 @@
     }, ms);
   }
 
-  /** Recoverable turn-clear notices (stall / max duration / no output) — not hard failures. */
+  /** Recoverable turn-clear notices (stall / max duration / no output / auto-retry) — not hard failures. */
   function isRecoverableTurnClear(msg) {
-    return /send again|turn cleared|stalled mid-turn|no activity|max duration|no output/i.test(
+    return /send again|try again|turn cleared|stalled mid-turn|no activity|max duration|no output|recovering|retrying|still not responding/i.test(
       String(msg || "")
     );
   }
@@ -4343,6 +4343,10 @@
         }
       } else if (msg.state === "running") {
         setTurnRunning(true, sid);
+        // Soft notice during same-session no-output auto-recovery (not a dead-end error).
+        if (msg.error && /recovering|retrying/i.test(String(msg.error))) {
+          reportInfo(msg.error, { sessionId: sid, source: "turn" });
+        }
       } else if (msg.state === "idle") {
         const anyLeft = (state.liveTurns || []).length > 0;
         const recoverable =
@@ -4413,8 +4417,11 @@
       const errText = msg.message || "Error";
       const queueFull = /queue full/i.test(errText);
       const busy = /busy|stuck/i.test(errText);
+      const recovering = /recovering|retrying/i.test(errText);
+      const soft = recovering || isRecoverableTurnClear(errText);
       // Queue-full / busy from old hub: keep turnRunning; do not unlock the turn.
-      if (!queueFull && !busy) {
+      // Recovery in progress: keep turnRunning so composer stays in working state.
+      if (!queueFull && !busy && !recovering) {
         setTurnRunning(false);
       }
       if (busy && !queueFull) {
@@ -4422,6 +4429,11 @@
           "Message not queued — restart hub to enable queue, or wait for turn to finish.",
           { sessionId: msg.sessionId || null, source: "error" }
         );
+      } else if (soft) {
+        reportInfo(errText, {
+          sessionId: msg.sessionId || null,
+          source: "error",
+        });
       } else {
         reportError(errText, {
           sessionId: msg.sessionId || null,

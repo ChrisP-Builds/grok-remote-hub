@@ -97,6 +97,23 @@ def is_turn_stuck_for_new_prompt(
     )
 
 
+def is_no_output_error_message(msg: str | BaseException | None) -> bool:
+    """True when an exception/message is the zero-ACP-update hang (force-clear)."""
+    text = str(msg or "").lower()
+    return "no acp session/update" in text or (
+        "force-cleared" in text and "session/update" in text
+    )
+
+
+def should_auto_retry_no_output(
+    exc: BaseException | str | None, already_retried: bool
+) -> bool:
+    """True when no-output should trigger one same-session auto-retry."""
+    if already_retried:
+        return False
+    return is_no_output_error_message(exc)
+
+
 def needs_fresh_agent_session(session_id: str | None, created_set: set[str] | frozenset[str]) -> bool:
     """True when this hub process never created the session via session/new.
 
