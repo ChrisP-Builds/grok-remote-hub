@@ -67,8 +67,9 @@ def test_js_term_line_structure() -> None:
     assert "tool-detail" in js
     assert "planHasActiveWork" in js
     assert 'createElement("details")' in js
-    # Tools default closed; never auto-open on create/update
+    # Tools start closed then open when running/pending or detail-rich
     assert "row.open = false" in js
+    assert "row.open = true" in js
     assert "toolOneLinerRedundant" in js
     # Live tool_call must not build label+summary as title
     assert 'truncate(`${label} ${summary}`, 160)' not in js
@@ -95,7 +96,7 @@ def test_format_term_prefix() -> None:
     assert format_term_prefix("user") == "You:"
     assert format_term_prefix("assistant") == "Grok:"
     assert format_term_prefix("tool") == "·"
-    assert format_term_prefix("thought") == "·"
+    assert format_term_prefix("thought") == "Thinking:"
     assert format_term_prefix("plan") == "·"
     assert format_term_prefix("system") == "·"
 

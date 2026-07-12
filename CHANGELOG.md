@@ -9,8 +9,24 @@ This file is the **public narrative**. Session chat context is not required to u
 
 ## [Unreleased]
 
+---
+
+## [0.3.2] — 2026-07-12
+
+Stream feel, session source labels, and restart UX polish on top of the 0.3.x hub.
+
+### Added
+- **CLI / Hub source pills** — session rail labels hub-owned vs stock CLI/TUI sessions (`isCli` on the session API; distinct pill colors).
+- **Optimistic user bubble** — composer submit paints your message immediately; server echo is deduped.
+- **One-tap Resend after hub process restart** — last prompt kept in sessionStorage; Resend on the error strip when a live turn was interrupted (client-first; no server store of prompt text).
+- **Stream parity** — clearer Thinking panels, richer tool detail, tools open while running/pending; subagent spawn/finish as system lines in history and live stream.
+
 ### Fixed
 - **No-output auto-retry** — on first silent turn, hub reloads the same session (reconnect ACP if needed) and resends once; only then surfaces a soft failure. No `session/new`, no map rewrite.
+- Nested ACP content shapes for thought/tool text extraction (history + live UI).
+
+### Docs
+- README gallery screenshots refreshed from a live hub (sanitized demo titles/paths).
 
 ---
 

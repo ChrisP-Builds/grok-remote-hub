@@ -45,6 +45,7 @@ class SessionInfo:
     hubOrigin: str = ""  # user | attach | "" from summary hub_origin
     isNoise: bool = False  # temp/e2e junk
     isHubRemote: bool = False  # filled by scan when hub_remote_ids passed
+    isCli: bool = False  # not hub-owned: no hub_origin and not hub remote
     isWorking: bool = True  # computed: not isSubagent and not isNoise
 
     def to_dict(self) -> dict[str, Any]:
@@ -278,6 +279,8 @@ def scan_sessions(
             # Subagents never classified as noise; they have their own filter
             is_noise = is_noise_session(cwd, title) and not is_sub
             is_hub_remote = sid in remote_ids
+            # Hub-owned: stamped hub_origin (user|attach) or currently hub remote
+            is_cli = not (bool(hub_origin) or is_hub_remote)
             is_working = (not is_sub) and (not is_noise)
 
             found.append(
@@ -296,6 +299,7 @@ def scan_sessions(
                         hubOrigin=hub_origin,
                         isNoise=is_noise,
                         isHubRemote=is_hub_remote,
+                        isCli=is_cli,
                         isWorking=is_working,
                     ),
                 )
@@ -382,6 +386,7 @@ def rename_session(sessions_root: Path, session_id: str, title: str) -> SessionI
         hubOrigin=session.hubOrigin,
         isNoise=session.isNoise,
         isHubRemote=session.isHubRemote,
+        isCli=session.isCli,
         isWorking=session.isWorking,
     )
 
