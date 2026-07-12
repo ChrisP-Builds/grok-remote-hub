@@ -9,7 +9,8 @@ This file is the **public narrative**. Session chat context is not required to u
 
 ## [Unreleased]
 
-_(empty — next changes land here)_
+### Fixed
+- **No-output auto-retry** — on first silent turn, hub reloads the same session (reconnect ACP if needed) and resends once; only then surfaces a soft failure. No `session/new`, no map rewrite.
 
 ---
 
