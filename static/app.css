@@ -431,10 +431,16 @@ a {
   background: rgba(230, 184, 77, 0.08);
 }
 
-.session-pill.live {
+.session-pill.hub {
   color: #6ba3d6;
   border-color: rgba(107, 163, 214, 0.45);
   background: rgba(107, 163, 214, 0.1);
+}
+
+.session-pill.cli {
+  color: #9a9a7a;
+  border-color: rgba(154, 154, 122, 0.45);
+  background: rgba(154, 154, 122, 0.1);
 }
 
 .session-pill.noise {
@@ -1764,6 +1770,15 @@ a {
   margin-bottom: 3px;
 }
 
+/* Thinking panel: visible by default, stronger than pure muted */
+.term-line.thought {
+  border-left: 2px solid color-mix(in srgb, var(--accent) 70%, transparent);
+  padding-left: 8px;
+  margin-bottom: 6px;
+  color: var(--text);
+  font-size: 13px;
+}
+
 .term-line.tool.running {
   border-left: 2px solid var(--accent);
   padding-left: 8px;
@@ -1796,10 +1811,14 @@ a {
 }
 
 .term-line.tool .term-body,
-.term-line.thought .term-body,
 .term-line.plan .term-body,
 .term-line.system .term-body {
   color: var(--muted);
+  white-space: pre-wrap;
+}
+
+.term-line.thought .term-body {
+  color: color-mix(in srgb, var(--text) 88%, var(--muted));
   white-space: pre-wrap;
 }
 
@@ -1865,6 +1884,22 @@ a {
   gap: 0.35ch 0.5ch;
 }
 
+.term-line.thought > summary {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.term-line.thought .thought-summary-label {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.term-line.thought .term-prefix {
+  color: var(--accent);
+  font-weight: 500;
+}
+
 /* Tool summary: one compact horizontal line (ellipsis when tight) */
 .term-line.tool > summary {
   flex-wrap: nowrap;
@@ -1924,8 +1959,9 @@ a {
 .term-line.thought .term-body {
   margin-top: 4px;
   margin-left: 1.5ch;
-  color: var(--muted);
-  font-size: 12px;
+  color: color-mix(in srgb, var(--text) 88%, var(--muted));
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .tool-one-liner {
@@ -2852,6 +2888,27 @@ a {
 
 .toast.danger {
   border-left-color: var(--danger);
+}
+
+.toast.toast-with-action {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.toast-with-action .toast-msg {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.toast-with-action .toast-action {
+  flex: 0 0 auto;
+  font-weight: 600;
+  color: var(--accent);
+  border: 1px solid var(--border);
+  padding: 2px 8px;
 }
 
 .muted {

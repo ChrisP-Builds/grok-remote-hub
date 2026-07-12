@@ -537,11 +537,14 @@ def test_stamp_hub_origin(tmp_path: Path) -> None:
     results = scan_sessions(root, limit=10)
     assert results[0].hubOrigin == "user"
     assert results[0].isWorking is True
+    assert results[0].isCli is False
 
     assert stamp_hub_origin(root, sid, "attach") is True
     data = json.loads((d / "summary.json").read_text(encoding="utf-8"))
     assert data["hub_origin"] == "attach"
-    assert scan_sessions(root, limit=10)[0].hubOrigin == "attach"
+    stamped = scan_sessions(root, limit=10)[0]
+    assert stamped.hubOrigin == "attach"
+    assert stamped.isCli is False
 
     assert stamp_hub_origin(root, sid, "nope") is False
     assert stamp_hub_origin(root, "00000000-0000-0000-0000-000000000000", "user") is False
@@ -566,9 +569,92 @@ def test_scan_hub_remote_flag(tmp_path: Path) -> None:
 
     plain = scan_sessions(root, limit=10)
     assert all(not r.isHubRemote for r in plain)
+    # No hub_origin and not remote → CLI sessions
+    assert all(r.isCli for r in plain)
 
     flagged = scan_sessions(root, limit=10, hub_remote_ids={live_id})
     by_id = {r.sessionId: r for r in flagged}
     assert by_id[live_id].isHubRemote is True
     assert by_id[live_id].isWorking is True
+    assert by_id[live_id].isCli is False
     assert by_id[other_id].isHubRemote is False
+    assert by_id[other_id].isCli is True
+
+
+def test_scan_is_cli_classification(tmp_path: Path) -> None:
+    """isCli = not hub-owned (no hub_origin user|attach and not hub remote)."""
+    root = tmp_path / "sessions"
+    cli_id = "019f493c-af12-7652-a6d8-bf645c10921c"
+    user_id = "019f06ee-305f-7903-b295-d706c08f0b4f"
+    attach_id = "019f07ff-305f-7903-b295-d706c08f0b50"
+    remote_id = "019f08aa-305f-7903-b295-d706c08f0b51"
+    sub_id = "019f09bb-305f-7903-b295-d706c08f0b52"
+
+    _write_summary(
+        (root / "proj" / cli_id / "summary.json"),
+        {
+            "info": {"id": cli_id, "cwd": r"D:\Projects\Alpha"},
+            "generated_title": "Stock CLI",
+            "updated_at": "2026-07-09T12:00:00Z",
+            "num_chat_messages": 1,
+        },
+    )
+    _write_summary(
+        (root / "proj" / user_id / "summary.json"),
+        {
+            "info": {"id": user_id, "cwd": r"D:\Projects\Alpha"},
+            "generated_title": "Hub user",
+            "hub_origin": "user",
+            "updated_at": "2026-07-09T12:00:00Z",
+            "num_chat_messages": 1,
+        },
+    )
+    _write_summary(
+        (root / "proj" / attach_id / "summary.json"),
+        {
+            "info": {"id": attach_id, "cwd": r"D:\Projects\Alpha"},
+            "generated_title": "Hub attach",
+            "hub_origin": "attach",
+            "updated_at": "2026-07-09T12:00:00Z",
+            "num_chat_messages": 1,
+        },
+    )
+    _write_summary(
+        (root / "proj" / remote_id / "summary.json"),
+        {
+            "info": {"id": remote_id, "cwd": r"D:\Projects\Alpha"},
+            "generated_title": "Hub remote only",
+            "updated_at": "2026-07-09T12:00:00Z",
+            "num_chat_messages": 1,
+        },
+    )
+    _write_summary(
+        (root / "proj" / sub_id / "summary.json"),
+        {
+            "info": {"id": sub_id, "cwd": r"D:\Projects\Alpha"},
+            "generated_title": "CLI subagent",
+            "session_kind": "subagent",
+            "parent_session_id": cli_id,
+            "updated_at": "2026-07-09T12:00:00Z",
+            "num_chat_messages": 1,
+        },
+    )
+
+    results = scan_sessions(root, limit=20, hub_remote_ids={remote_id})
+    by_id = {r.sessionId: r for r in results}
+
+    assert by_id[cli_id].isCli is True
+    assert by_id[cli_id].isHubRemote is False
+    assert by_id[cli_id].hubOrigin == ""
+
+    assert by_id[user_id].isCli is False
+    assert by_id[user_id].hubOrigin == "user"
+
+    assert by_id[attach_id].isCli is False
+    assert by_id[attach_id].hubOrigin == "attach"
+
+    assert by_id[remote_id].isCli is False
+    assert by_id[remote_id].isHubRemote is True
+
+    assert by_id[sub_id].isCli is True
+    assert by_id[sub_id].isSubagent is True

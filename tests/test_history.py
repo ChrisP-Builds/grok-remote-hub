@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from hub.history import (
+    _extract_text,
     normalize_status,
     parse_updates_jsonl,
     tool_label,
@@ -248,3 +249,49 @@ def test_skips_hook_execution(tmp_path: Path) -> None:
     msgs = parse_updates_jsonl(path)
     assert len(msgs) == 1
     assert msgs[0]["role"] == "user"
+
+
+def test_extract_text_nested_content_shapes() -> None:
+    """Parity with JS extractText: nested content dict/array/text."""
+    assert _extract_text("plain") == "plain"
+    assert _extract_text({"type": "text", "text": "hello"}) == "hello"
+    assert (
+        _extract_text(
+            {
+                "type": "content",
+                "content": {"type": "text", "text": "nested"},
+            }
+        )
+        == "nested"
+    )
+    assert (
+        _extract_text(
+            [
+                {"type": "content", "content": {"type": "text", "text": "a"}},
+                {"type": "content", "content": {"type": "text", "text": "b"}},
+            ]
+        )
+        == "ab"
+    )
+    assert _extract_text({"content": [{"text": "x"}, {"text": "y"}]}) == "xy"
+
+
+def test_subagent_events_as_system(tmp_path: Path) -> None:
+    path = tmp_path / "updates.jsonl"
+    path.write_text(
+        "\n".join(
+            [
+                _line("subagent_spawned", sessionId="child-1"),
+                _line("subagent_finished", sessionId="child-1"),
+                _line("user_message_chunk", content={"type": "text", "text": "hi"}),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    msgs = parse_updates_jsonl(path)
+    roles = [m["role"] for m in msgs]
+    assert roles == ["system", "system", "user"]
+    assert "subagent spawned" in msgs[0]["text"]
+    assert "child-1" in msgs[0]["text"]
+    assert "subagent finished" in msgs[1]["text"]

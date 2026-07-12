@@ -13,7 +13,9 @@ def format_term_prefix(role: str) -> str:
         return "You:"
     if r == "assistant":
         return "Grok:"
-    # tool / thought / plan / system / activity
+    if r == "thought":
+        return "Thinking:"
+    # tool / plan / system / activity
     return "·"
 
 

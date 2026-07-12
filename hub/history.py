@@ -10,12 +10,20 @@ def _extract_text(content: Any) -> str:
         return ""
     if isinstance(content, str):
         return content
+    if isinstance(content, (int, float, bool)):
+        return str(content)
     if isinstance(content, dict):
-        if "text" in content:
+        if "text" in content and content.get("text") not in (None, ""):
             return str(content.get("text") or "")
         parts = content.get("content")
         if isinstance(parts, list):
             return "".join(_extract_text(p) for p in parts)
+        if isinstance(parts, dict):
+            return _extract_text(parts)
+        if isinstance(parts, str):
+            return parts
+        if "text" in content:
+            return str(content.get("text") or "")
         return ""
     if isinstance(content, list):
         return "".join(_extract_text(p) for p in content)
@@ -278,6 +286,18 @@ def _message_from_update(update: dict[str, Any]) -> dict[str, Any] | None:
     if kind in ("hook_execution", "hook_execution_start", "hook_execution_end"):
         # Skip hook noise in transcript
         return None
+
+    if kind in ("subagent_spawned", "subagent_finished"):
+        sid = (
+            update.get("sessionId")
+            or update.get("agentId")
+            or update.get("subagentId")
+            or update.get("agentSessionId")
+            or ""
+        )
+        label = str(kind).replace("_", " ")
+        text = f"{label} ({sid})" if sid else label
+        return {"role": "system", "text": text, "meta": {"kind": kind}}
 
     if kind in ("turn_completed", "task_completed", "prompt_complete"):
         return {

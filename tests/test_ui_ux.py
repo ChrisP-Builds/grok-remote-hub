@@ -253,17 +253,86 @@ def test_js_multi_session_resume_after_reconnect() -> None:
     assert "ensureLiveSessionsResumed" in js
 
 
+def test_js_stream_parity_thought_and_tools() -> None:
+    """Live stream shows thinking panels and tool detail closer to CLI."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+
+    # extractText recurses into arrays / nested content objects
+    extract_idx = js.find("function extractText")
+    assert extract_idx >= 0
+    extract_chunk = js[extract_idx : extract_idx + 900]
+    assert "Array.isArray(content)" in extract_chunk
+    assert "content.content" in extract_chunk
+    assert "content.text" in extract_chunk
+    assert "map(extractText)" in extract_chunk or "extractText(content.content)" in extract_chunk
+
+    # Thought prefix + labels
+    assert 'if (r === "thought") return "Thinking:"' in js
+    assert 'label.textContent = opts.stream ? "thinking…" : "Thinking"' in js
+    assert 'if (label) label.textContent = "Thinking"' in js
+
+    # New thought "screen" after tools / before assistant reply
+    tool_call_idx = js.find('if (kind === "tool_call")')
+    assert tool_call_idx >= 0
+    tool_call_chunk = js[tool_call_idx : tool_call_idx + 500]
+    assert "markThoughtComplete" in tool_call_chunk
+    assert "thoughtEl = null" in tool_call_chunk
+
+    msg_idx = js.find('if (kind === "agent_message_chunk")')
+    assert msg_idx >= 0
+    msg_chunk = js[msg_idx : msg_idx + 450]
+    assert "markThoughtComplete" in msg_chunk
+    assert "thoughtEl = null" in msg_chunk
+
+    # Thought chunks force open + _rawText append
+    thought_idx = js.find('if (kind === "agent_thought_chunk")')
+    assert thought_idx >= 0
+    thought_chunk = js[thought_idx : thought_idx + 900]
+    assert "el.open = true" in thought_chunk
+    assert "body._rawText" in thought_chunk
+    assert "open: true" in thought_chunk
+
+    # Tools auto-open when running/pending; detail limit 8000
+    create_idx = js.find("function createToolLine")
+    assert create_idx >= 0
+    create_chunk = js[create_idx : create_idx + 700]
+    assert 'st === "running" || st === "pending"' in create_chunk
+    assert "row.open = true" in create_chunk
+
+    assert "extractToolContentSnippet(update, 8000)" in js
+    assert "function extractToolContentSnippet(update, limit = 120)" in js
+
+    # Subagent activity lines
+    assert 'kind === "subagent_spawned"' in js
+    assert 'kind === "subagent_finished"' in js
+
+    # Thought panel CSS is prominent
+    assert ".term-line.thought" in css
+    assert ".thought-summary-label" in css
+    assert "font-size: 13px" in css
+
+
 def test_js_process_restart_clears_stale_live_state() -> None:
     """After hub process restart, client must drop mid-turn/queue/quiet UI."""
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     assert "function clearStaleLiveTurns" in js
     assert "function clearLiveClientStateAfterProcessRestart" in js
     assert "_hubProcessRestarted" in js
+    assert "function snapshotLiveClientForRestart" in js
+    assert "function snapshotHadLive" in js
+    assert "function saveLastPrompt" in js
+    assert "function loadLastPrompt" in js
+    assert "function offerInterruptedResend" in js
+    assert "function resendLastPrompt" in js
 
-    # bootId change clears live state and flags process restart
+    # bootId change snapshots then clears live state and flags process restart
     note_idx = js.find("function noteBootId")
     assert note_idx >= 0
-    note_chunk = js[note_idx : note_idx + 700]
+    note_chunk = js[note_idx : note_idx + 900]
+    assert "snapshotLiveClientForRestart" in note_chunk
+    assert "snapshotHadLive" in note_chunk
+    assert "_pendingRestartInterrupt" in note_chunk
     assert "clearLiveClientStateAfterProcessRestart" in note_chunk
     assert "bootId changed" in note_chunk
     assert "_hubProcessRestarted" in note_chunk
@@ -288,20 +357,60 @@ def test_js_process_restart_clears_stale_live_state() -> None:
     if resume_idx < 0:
         resume_idx = js.find("function resumeAfterReconnect")
     assert resume_idx >= 0
-    resume_chunk = js[resume_idx : resume_idx + 5500]
+    resume_chunk = js[resume_idx : resume_idx + 7000]
     assert "_hubProcessRestarted" in resume_chunk
     assert "clearLiveClientStateAfterProcessRestart" in resume_chunk
     assert "interrupted" in resume_chunk
     assert "reportError" in resume_chunk
     assert "interruptedByRestart" in resume_chunk
-    # Soften toast: only danger when had live turns before clear
+    # Snapshot + last prompt BEFORE mergeHealthIntoState (bootId clear race)
+    pre_merge = resume_chunk.split("mergeHealthIntoState")[0]
+    assert "snapshotLiveClientForRestart" in pre_merge or "preSnap" in pre_merge
+    assert "loadLastPrompt" in pre_merge
     assert "hadLiveBeforeClear" in resume_chunk
+    assert "offerInterruptedResend" in resume_chunk
     assert "Hub restarted · reconnected" in resume_chunk
     # Auto-attach selected after process restart (session/load without re-open)
     assert "attachSessionLive" in resume_chunk
     # Soft path clears stale live without killing pending questions
     assert "clearStaleLiveTurns" in resume_chunk
     assert "clearQuestions: false" in resume_chunk
+
+
+def test_js_last_prompt_resend_and_optimistic_user() -> None:
+    """Persist last prompt, one-tap Resend, optimistic user bubble on submit."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+
+    assert "grh.lastPrompt.v1" in js
+    assert "function saveLastPrompt" in js
+    assert "function loadLastPrompt" in js
+    assert "function clearLastPromptPending" in js
+    assert "function markLastPromptPending" in js
+    assert "function resendLastPrompt" in js
+    assert "function offerInterruptedResend" in js
+    assert "Hub restarted — turn interrupted" in js or "Hub restarted: live turn interrupted" in js
+    assert 'actionLabel: "Resend"' in js or "actionLabel: 'Resend'" in js
+
+    # submitPrompt saves last prompt and optimistic user bubble
+    submit_idx = js.find("function submitPrompt")
+    assert submit_idx >= 0
+    submit_chunk = js[submit_idx : submit_idx + 1800]
+    assert "saveLastPrompt" in submit_chunk
+    assert "appendMessage" in submit_chunk
+    assert 'role: "user"' in submit_chunk or "role: 'user'" in submit_chunk
+
+    # processUserMessageChunk dedupes identical user text
+    umc_idx = js.find("function processUserMessageChunk")
+    assert umc_idx >= 0
+    umc_chunk = js[umc_idx : umc_idx + 900]
+    assert "existing === text" in umc_chunk
+
+    # Error strip Resend control
+    assert "btn-error-resend" in html
+    assert "btnErrorResend" in js
+    assert "toast-with-action" in css or "toast-action" in css
 
 
 def test_js_attach_session_live_helper() -> None:
@@ -362,7 +471,7 @@ def test_js_report_error_and_error_strip() -> None:
     assert "6000" in info_chunk
     assert "updateErrorStrip" in info_chunk
     strip_idx = js.find("function updateErrorStrip")
-    strip_chunk = js[strip_idx : strip_idx + 1200]
+    strip_chunk = js[strip_idx : strip_idx + 2000]
     assert 'classList.toggle("info"' in strip_chunk or 'classList.toggle("info",' in strip_chunk
     assert "12000" in strip_chunk
     # type===error: hard failures reportError; recovering/soft use reportInfo
@@ -375,7 +484,7 @@ def test_js_report_error_and_error_strip() -> None:
     assert "reportError(msg.error" in js or 'reportError(msg.error' in js
     # danger toasts last longer than info toasts
     toast_idx = js.find("function toast(")
-    toast_chunk = js[toast_idx : toast_idx + 450]
+    toast_chunk = js[toast_idx : toast_idx + 1600]
     assert "8000" in toast_chunk
     assert "4200" in toast_chunk
 
@@ -470,6 +579,24 @@ def test_js_question_pill_needs_reply() -> None:
     assert 'st === "question"' in render_chunk or 'liveStatus === "question"' in render_chunk
     assert ".session-pill.status-question" in css
     assert ".session-row.status-question" in css
+
+
+def test_js_hub_session_pill() -> None:
+    """Non-subagent sessions show source pills: Hub (!isCli) or CLI (isCli)."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    render_idx = js.find("function renderSessions")
+    assert render_idx >= 0
+    render_chunk = js[render_idx : render_idx + 5000]
+    assert "!s.isCli" in render_chunk
+    assert "s.isCli" in render_chunk
+    assert "session-pill hub" in render_chunk
+    assert "session-pill cli" in render_chunk
+    assert 'textContent = "Hub"' in render_chunk or "textContent = 'Hub'" in render_chunk
+    assert 'textContent = "CLI"' in render_chunk or "textContent = 'CLI'" in render_chunk
+    assert 'textContent = "live"' not in render_chunk
+    assert ".session-pill.hub" in css
+    assert ".session-pill.cli" in css
 
 
 def test_js_status_merge_reapplies_question_for_pending() -> None:
@@ -639,5 +766,5 @@ def test_js_composer_drafts_per_session() -> None:
     assert "clearComposerDraft" in js
     submit_idx = js.find("function submitPrompt")
     assert submit_idx >= 0
-    submit_chunk = js[submit_idx : submit_idx + 1200]
+    submit_chunk = js[submit_idx : submit_idx + 2200]
     assert "clearComposerDraft" in submit_chunk

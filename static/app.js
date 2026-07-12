@@ -9,6 +9,7 @@
     const r = String(role || "").trim().toLowerCase();
     if (r === "user") return "You:";
     if (r === "assistant") return "Grok:";
+    if (r === "thought") return "Thinking:";
     return "·";
   }
 
@@ -247,6 +248,8 @@
     startedAt: null,
     /** Set when noteBootId sees a new process bootId (hub process restarted). */
     _hubProcessRestarted: false,
+    /** True if client had live work when bootId changed (before clear). */
+    _pendingRestartInterrupt: false,
     /** Freeze sticky scrolls during reconnect resume (one jump at end). */
     _reconnectScrollFreeze: false,
     _resumeAfterReconnect: false,
@@ -434,6 +437,7 @@
     errorStripMsg: $("#error-strip-msg"),
     btnErrorCopy: $("#btn-error-copy"),
     btnErrorDismiss: $("#btn-error-dismiss"),
+    btnErrorResend: $("#btn-error-resend"),
     versionBadge: $("#version-badge"),
     versionLabel: $("#version-label"),
     compatDot: $("#compat-dot"),
@@ -471,10 +475,35 @@
     return `${proto}//${location.host}/ws${q}`;
   }
 
-  function toast(message, kind = "", durationMs) {
+  function toast(message, kind = "", durationMs, opts) {
+    if (durationMs && typeof durationMs === "object") {
+      opts = durationMs;
+      durationMs = opts.durationMs;
+    }
+    opts = opts || {};
     const el = document.createElement("div");
     el.className = `toast${kind ? " " + kind : ""}`;
-    el.textContent = message;
+    if (opts.actionLabel && typeof opts.onAction === "function") {
+      el.classList.add("toast-with-action");
+      const msgSpan = document.createElement("span");
+      msgSpan.className = "toast-msg";
+      msgSpan.textContent = message;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn-ghost btn-sm toast-action";
+      btn.textContent = opts.actionLabel;
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+          opts.onAction();
+        } catch (_) {}
+        el.remove();
+      });
+      el.append(msgSpan, btn);
+    } else {
+      el.textContent = message;
+    }
     els.toastHost.appendChild(el);
     const ms =
       typeof durationMs === "number"
@@ -483,7 +512,7 @@
           ? 8000
           : 4200;
     setTimeout(() => {
-      el.remove();
+      if (el.parentNode) el.remove();
     }, ms);
   }
 
@@ -542,6 +571,12 @@
     return entry;
   }
 
+  function setStripResendVisible(show) {
+    if (!els.btnErrorResend) return;
+    if (show) els.btnErrorResend.classList.remove("hidden");
+    else els.btnErrorResend.classList.add("hidden");
+  }
+
   function updateErrorStrip(entry) {
     if (!els.errorStrip) return;
     if (state._infoStripTimer) {
@@ -552,6 +587,7 @@
       els.errorStrip.classList.add("hidden");
       els.errorStrip.classList.remove("info", "danger");
       state._lastStripError = null;
+      setStripResendVisible(false);
       return;
     }
     state._lastStripError = entry;
@@ -569,6 +605,7 @@
       }
       els.errorStripTime.textContent = label;
     }
+    setStripResendVisible(!!entry.resend);
     // Info strip auto-dismisses; danger stays until Dismiss.
     if (isInfo) {
       state._infoStripTimer = setTimeout(() => {
@@ -1149,7 +1186,7 @@
     return "";
   }
 
-  function extractToolContentSnippet(update) {
+  function extractToolContentSnippet(update, limit = 120) {
     const content = update.content;
     if (content == null) return "";
     if (Array.isArray(content)) {
@@ -1164,9 +1201,9 @@
           if (t.trim()) parts.push(t.trim());
         }
       }
-      return truncate(parts.join(" "));
+      return truncate(parts.join(" "), limit);
     }
-    return truncate(extractText(content));
+    return truncate(extractText(content), limit);
   }
 
   function statusClass(status) {
@@ -1770,7 +1807,7 @@
     const el = buffers.thoughtEl;
     // Leave open so user can still read; only update the label.
     const label = el.querySelector && el.querySelector(".thought-summary-label");
-    if (label) label.textContent = "thinking";
+    if (label) label.textContent = "Thinking";
   }
 
   /**
@@ -1836,6 +1873,155 @@
     } catch (_) {}
   }
 
+  /** Snapshot client live flags before noteBootId/mergeHealth can wipe them. */
+  function snapshotLiveClientForRestart() {
+    return {
+      turnRunning: !!state.turnRunning,
+      liveTurnSessionId: state.liveTurnSessionId || null,
+      liveTurns: (state.liveTurns || []).slice(),
+      workingSessionIds: Object.keys(state.sessionFlags || {}).filter(
+        (k) =>
+          state.sessionFlags[k] === "working" ||
+          state.sessionFlags[k] === "question"
+      ),
+      promptQueueLength: state.promptQueueLength || 0,
+      selectedId: state.selectedId || null,
+    };
+  }
+
+  function snapshotHadLive(snap) {
+    if (!snap) return false;
+    return !!(
+      snap.turnRunning ||
+      snap.liveTurnSessionId ||
+      (snap.liveTurns && snap.liveTurns.length) ||
+      (snap.workingSessionIds && snap.workingSessionIds.length) ||
+      snap.promptQueueLength > 0
+    );
+  }
+
+  const LAST_PROMPT_KEY = "grh.lastPrompt.v1";
+
+  function saveLastPrompt({ sessionId, text, cwd }) {
+    const t = String(text || "").trim();
+    if (!t) return;
+    try {
+      sessionStorage.setItem(
+        LAST_PROMPT_KEY,
+        JSON.stringify({
+          sessionId: sessionId || null,
+          text: t,
+          cwd: cwd || "",
+          at: Date.now(),
+          pending: true,
+        })
+      );
+    } catch (_) {}
+  }
+
+  function loadLastPrompt() {
+    try {
+      const raw = sessionStorage.getItem(LAST_PROMPT_KEY);
+      if (!raw) return null;
+      const j = JSON.parse(raw);
+      if (!j || typeof j !== "object") return null;
+      if (!j.text || !String(j.text).trim()) return null;
+      return j;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function markLastPromptPending(pending) {
+    try {
+      const lp = loadLastPrompt();
+      if (!lp) return;
+      lp.pending = !!pending;
+      sessionStorage.setItem(LAST_PROMPT_KEY, JSON.stringify(lp));
+    } catch (_) {}
+  }
+
+  function clearLastPromptPending() {
+    markLastPromptPending(false);
+  }
+
+  /**
+   * One-tap Resend after hub process restart interrupted a live turn.
+   * Toast (with action) + durable error strip Resend button.
+   */
+  function offerInterruptedResend(lastPrompt, meta = {}) {
+    const stripMsg = "Hub restarted: live turn interrupted.";
+    const entry = {
+      at: new Date().toISOString(),
+      message: stripMsg,
+      sessionId: (lastPrompt && lastPrompt.sessionId) || null,
+      source: (meta && meta.source) || "reconnect",
+      level: "danger",
+      resend: true,
+    };
+    if (!state.errorLog) state.errorLog = [];
+    state.errorLog.unshift(entry);
+    if (state.errorLog.length > 40) state.errorLog.length = 40;
+    try {
+      console.error("[hub]", stripMsg, meta || {});
+    } catch (_) {}
+    toast("Hub restarted — turn interrupted", "danger", 30000, {
+      actionLabel: "Resend",
+      onAction: () => {
+        resendLastPrompt();
+        dismissErrorStrip();
+      },
+    });
+    updateErrorStrip(entry);
+  }
+
+  async function resendLastPrompt() {
+    const lp = loadLastPrompt();
+    if (!lp || !lp.text || !String(lp.text).trim()) {
+      toast("No stored prompt to resend", "danger");
+      return;
+    }
+    const text = String(lp.text).trim();
+    // Prefer the session that owned the last prompt when still in the list.
+    if (lp.sessionId && lp.sessionId !== state.selectedId) {
+      const row = (state.sessions || []).find(
+        (s) => s && s.sessionId === lp.sessionId
+      );
+      if (row) {
+        try {
+          await openSession(row);
+        } catch (_) {}
+      }
+    }
+    let cwd =
+      (state.selectedMeta && state.selectedMeta.cwd) ||
+      lp.cwd ||
+      "";
+    if (!cwd && state.selectedId && Array.isArray(state.sessions)) {
+      const row = state.sessions.find(
+        (s) => s && s.sessionId === state.selectedId
+      );
+      if (row && row.cwd) cwd = row.cwd;
+    }
+    if (state.selectedId && cwd) {
+      try {
+        await attachSessionLive(state.selectedId, cwd, {
+          showFailToast: false,
+          focusOnFail: false,
+        });
+      } catch (_) {}
+    }
+    if (!state.selectedId) {
+      toast("No session selected for resend", "danger");
+      return;
+    }
+    if (els.input) {
+      els.input.value = text;
+      autoGrow();
+    }
+    submitPrompt();
+  }
+
   function setTurnRunning(running, sessionId, opts) {
     if (!running && opts && opts.all) {
       clearStaleLiveTurns({ clearQuestions: !!opts.clearQuestions });
@@ -1872,6 +2058,15 @@
         state.turnRunning = false;
         state.turnStartedAt = null;
         state.lastTermLineAt = null;
+        // Best-effort: clear Resend pending once the client is fully idle.
+        try {
+          const lp = loadLastPrompt();
+          if (lp && lp.pending) {
+            if (!lp.sessionId || lp.sessionId === clearId || lp.sessionId === state.selectedId) {
+              clearLastPromptPending();
+            }
+          }
+        } catch (_) {}
         // Server reported no lives: force remaining working flags idle
         if (opts && opts.forceIdleFlags && state.sessionFlags) {
           for (const k of Object.keys(state.sessionFlags)) {
@@ -2220,15 +2415,17 @@
         pill.className = "session-pill subagent";
         pill.textContent = "subagent";
         titleRow.appendChild(pill);
-      } else if (s.isHubRemote) {
+      } else if (!s.isCli) {
+        // Hub-owned: hub_origin user|attach or currently hub remote
         const pill = document.createElement("span");
-        pill.className = "session-pill live";
-        pill.textContent = "live";
+        pill.className = "session-pill hub";
+        pill.textContent = "Hub";
         titleRow.appendChild(pill);
-      } else if (s.isNoise && state.sessionKindFilter === "all") {
+      } else {
+        // CLI-origin sessions get a source pill (preferred over noise)
         const pill = document.createElement("span");
-        pill.className = "session-pill noise";
-        pill.textContent = "noise";
+        pill.className = "session-pill cli";
+        pill.textContent = "CLI";
         titleRow.appendChild(pill);
       }
 
@@ -2809,8 +3006,14 @@
   function createToolLine({ title, status, summary, toolCallId }) {
     const row = document.createElement("details");
     row.className = "term-line tool";
-    row.open = false;
     const st = normalizeStatus(status || "pending");
+    // Running/pending tools auto-open so stream is visible (CLI-like).
+    // Completed tools stay open when they carry meaningful detail.
+    const snip = (summary || "").trim();
+    row.open = false;
+    if (st === "running" || st === "pending" || snip.length > 40) {
+      row.open = true;
+    }
     row.dataset.status = st;
     if (st === "running" || st === "pending") row.classList.add("running");
     if (toolCallId) row.dataset.toolCallId = toolCallId;
@@ -2831,7 +3034,6 @@
 
     const oneLiner = document.createElement("span");
     oneLiner.className = "tool-one-liner muted";
-    const snip = (summary || "").trim();
     const hideOne = toolOneLinerRedundant(displayTitle, snip);
     oneLiner.textContent = snip && !hideOne ? truncate(snip, 80) : "";
     oneLiner.hidden = hideOne;
@@ -2850,9 +3052,9 @@
 
   function updateToolLine(row, { title, status, summary }) {
     if (!row) return;
-    // Never force open on tools — preserve user expand state; stay closed by default.
+    let st = row.dataset.status || "pending";
     if (status != null) {
-      const st = normalizeStatus(status);
+      st = normalizeStatus(status);
       row.dataset.status = st;
       row.classList.toggle("running", st === "running" || st === "pending");
       const pill = row.querySelector(".term-status");
@@ -2887,6 +3089,13 @@
         oneLiner.textContent = full && !hideOne ? truncate(full, 80) : "";
         oneLiner.hidden = hideOne;
       }
+    }
+    // Auto-open while running/pending; keep open when detail has real content.
+    const detailLen = String(row._toolSummary || "").trim().length;
+    if (st === "running" || st === "pending") {
+      row.open = true;
+    } else if (detailLen > 40) {
+      row.open = true;
     }
   }
 
@@ -2943,7 +3152,7 @@
     if (role === "thought") {
       const details = document.createElement("details");
       details.className = "term-line thought";
-      // Default open for live progress; allow explicit close via opts.open === false
+      // Always open by default (CLI-like readable transcript); allow explicit close.
       details.open = opts.open !== false;
       const summary = document.createElement("summary");
       const prefix = document.createElement("span");
@@ -2951,11 +3160,12 @@
       prefix.textContent = formatTermPrefix("thought");
       const label = document.createElement("span");
       label.className = "thought-summary-label";
-      label.textContent = "thinking…";
+      label.textContent = opts.stream ? "thinking…" : "Thinking";
       summary.append(prefix, label);
       const body = document.createElement("div");
       body.className = "term-body";
       body.textContent = text;
+      body._rawText = text;
       details.append(summary, body);
       transcriptRoot().appendChild(details);
       if (opts.stream) state.streamBuffers.thoughtEl = details;
@@ -3073,11 +3283,17 @@
   }
 
   function extractText(content) {
-    if (!content) return "";
+    if (content == null || content === false) return "";
     if (typeof content === "string") return content;
+    if (typeof content === "number" || typeof content === "boolean") return String(content);
+    if (Array.isArray(content)) {
+      return content.map(extractText).join("");
+    }
     if (typeof content === "object") {
-      if (content.text) return String(content.text);
-      if (Array.isArray(content.content)) return content.content.map(extractText).join("");
+      if (content.text != null && content.text !== "") return String(content.text);
+      if (content.content != null) return extractText(content.content);
+      // Nested ACP: {type:"content", content:{type:"text", text:"..."}} already handled above.
+      // Fall through for plain {type, ...} with no extractable payload.
     }
     return "";
   }
@@ -3123,6 +3339,9 @@
 
   function processAcpSessionUpdate(kind, update) {
     if (kind === "agent_message_chunk") {
+      // Finalize thinking so the reply starts clean after a thought phase.
+      markThoughtComplete(state.streamBuffers);
+      state.streamBuffers.thoughtEl = null;
       const text = extractText(update.content);
       if (!text) return;
       let el = state.streamBuffers.assistantEl;
@@ -3147,12 +3366,18 @@
         el = appendMessage({ role: "thought", text: "" }, { stream: true, open: true });
         state.streamBuffers.thoughtEl = el;
         state.streamBuffers.thoughtOpen = true;
+        const body0 = el.querySelector(".term-body");
+        if (body0) body0._rawText = "";
       } else if (!el.open) {
+        // Force re-open if user closed while still streaming.
         el.open = true;
         state.streamBuffers.thoughtOpen = true;
       }
       const body = el.querySelector(".term-body");
-      if (body) body.textContent += text;
+      if (body) {
+        body._rawText = (body._rawText || body.textContent || "") + text;
+        body.textContent = body._rawText;
+      }
       const label = el.querySelector(".thought-summary-label");
       if (label) label.textContent = "thinking…";
       scrollIfSticky();
@@ -3171,6 +3396,9 @@
     }
 
     if (kind === "tool_call") {
+      // New tool ends the current thought "screen"; next thought is a new block.
+      markThoughtComplete(state.streamBuffers);
+      state.streamBuffers.thoughtEl = null;
       const id = update.toolCallId || "";
       const label = toolLabelFromUpdate(update);
       const summary = toolSummaryFromUpdate(update);
@@ -3196,9 +3424,10 @@
     if (kind === "tool_call_update") {
       const id = update.toolCallId || "";
       const status = normalizeStatus(update.status);
-      // Prefer short tool label for the name; keep path/snippet in one-liner/detail.
+      // Prefer short tool label for the name; keep full stream text in detail body.
       const label = toolLabelFromUpdate(update);
-      const snippet = extractToolContentSnippet(update) || toolSummaryFromUpdate(update);
+      const detailText =
+        extractToolContentSnippet(update, 8000) || toolSummaryFromUpdate(update);
       noteTermLineActivity();
       let row = id ? state.streamBuffers.tools.get(id) : null;
       if (!row || !row.isConnected) {
@@ -3206,20 +3435,35 @@
           {
             toolCallId: id,
             status,
-            summary: snippet,
-            detail: snippet,
+            summary: detailText,
+            detail: detailText,
             label,
           },
           label
         );
         if (id && row) state.streamBuffers.tools.set(id, row);
       } else {
-        updateToolLine(row, { title: label, status, summary: snippet });
+        updateToolLine(row, { title: label, status, summary: detailText });
       }
-      // Tools stay closed by default; never auto-open on completion.
       state.streamBuffers.lastToolTitle = label;
       scheduleTurnStrip();
       scrollIfSticky();
+      return;
+    }
+
+    if (kind === "subagent_spawned" || kind === "subagent_finished") {
+      const sid =
+        update.sessionId ||
+        update.agentId ||
+        update.subagentId ||
+        update.agentSessionId ||
+        "";
+      const label = kind.replace(/_/g, " ");
+      appendMessage({
+        role: "system",
+        text: sid ? `${label} (${sid})` : label,
+      });
+      return;
     }
   }
 
@@ -3675,6 +3919,9 @@
     if (bootId) {
       if (state.bootId && state.bootId !== bootId) {
         // Hub process restarted while page stayed open — drop stale mid-turn UI.
+        // Snapshot before clear so resume can detect interrupted live work.
+        const snap = snapshotLiveClientForRestart();
+        state._pendingRestartInterrupt = snapshotHadLive(snap);
         clearLiveClientStateAfterProcessRestart("bootId changed");
         state._hubProcessRestarted = true;
         state._resumeAfterReconnect = true;
@@ -3875,6 +4122,9 @@
     state.reconnectAttempt = 0;
     stopHealthProbe();
 
+    // Snapshot live client state before health merge (noteBootId may wipe flags).
+    const preSnap = snapshotLiveClientForRestart();
+    const lastPrompt = loadLastPrompt();
     // Prefer server truth for concurrent mid-turn projects after reconnect.
     // mergeHealthIntoState -> noteBootId may set _hubProcessRestarted + clear.
     const health = await mergeHealthIntoState();
@@ -3888,26 +4138,16 @@
 
     let interruptedByRestart = false;
     if (opts.wasReconnect && processRestart) {
-      // Capture live flags before clear so toast is danger only when a turn died.
-      const flagsBefore = state.sessionFlags || {};
+      // hadLive uses pre-merge snapshot (noteBootId may already have wiped state).
       const hadLiveBeforeClear =
-        !!state.turnRunning ||
-        !!(state.liveTurnSessionId) ||
-        !!(state.liveTurns && state.liveTurns.length) ||
-        Object.keys(flagsBefore).some((k) => flagsBefore[k] === "working") ||
-        (state.promptQueueLength || 0) > 0;
+        snapshotHadLive(preSnap) ||
+        !!state._pendingRestartInterrupt ||
+        !!(lastPrompt && lastPrompt.pending);
+      state._pendingRestartInterrupt = false;
       // After process restart, server has no in-flight turns/queues.
       clearLiveClientStateAfterProcessRestart("hub process restart");
       state._hubProcessRestarted = false;
       interruptedByRestart = true;
-      if (hadLiveBeforeClear) {
-        reportError(
-          "Hub restarted: live turns were interrupted. Re-send if a project was still working.",
-          { source: "reconnect" }
-        );
-      } else {
-        toast("Hub restarted · reconnected", "");
-      }
       // Auto-attach selected session so session/load runs without re-open.
       if (state.selectedId) {
         let cwd =
@@ -3929,6 +4169,21 @@
             // attach best-effort; user can re-open session
           }
         }
+      }
+      if (
+        hadLiveBeforeClear &&
+        lastPrompt &&
+        lastPrompt.text &&
+        String(lastPrompt.text).trim()
+      ) {
+        offerInterruptedResend(lastPrompt, { reason: "hub process restart" });
+      } else if (hadLiveBeforeClear) {
+        reportError(
+          "Hub restarted: live turn interrupted. No stored prompt — type again.",
+          { source: "reconnect" }
+        );
+      } else {
+        toast("Hub restarted · reconnected", "");
       }
     } else if (opts.wasReconnect && !serverHasLive) {
       // Soft reconnect: server idle but client may still show working · quiet · queue.
@@ -5572,6 +5827,9 @@
       return;
     }
     const sid = promptSessionId() || state.selectedId;
+    const cwd = (state.selectedMeta && state.selectedMeta.cwd) || "";
+    // Persist last prompt for one-tap Resend after hub process restart.
+    saveLastPrompt({ sessionId: sid, text, cwd });
     // Successful hub prompt path: if already hub-created, mark live immediately
     if (isHubCreatedSession(sid) || isHubCreatedSession(state.selectedId)) {
       setSessionMode("live-remote", {
@@ -5585,12 +5843,17 @@
     // Do not reset stream buffers when only queuing behind an active turn
     if (!alreadyRunning) {
       beginNewUserTurn();
+      // Optimistic user bubble for instant feedback (server echo dedupes).
+      const el = appendMessage({ role: "user", text }, { stream: true });
+      const body = el && el.querySelector(".term-body");
+      if (body) body._rawText = text;
+      scrollIfSticky();
     }
     sendWs({
       type: "prompt",
       sessionId: sid,
       text,
-      cwd: (state.selectedMeta && state.selectedMeta.cwd) || "",
+      cwd,
     });
     clearComposerDraft(state.selectedId);
     if (sid && sid !== state.selectedId) clearComposerDraft(sid);
@@ -6356,6 +6619,12 @@
     }
     if (els.btnErrorCopy) {
       els.btnErrorCopy.addEventListener("click", copyErrorStrip);
+    }
+    if (els.btnErrorResend) {
+      els.btnErrorResend.addEventListener("click", () => {
+        resendLastPrompt();
+        dismissErrorStrip();
+      });
     }
 
     document.addEventListener("visibilitychange", () => {
