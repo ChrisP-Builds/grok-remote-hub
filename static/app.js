@@ -9,7 +9,7 @@
     const r = String(role || "").trim().toLowerCase();
     if (r === "user") return "You:";
     if (r === "assistant") return "Grok:";
-    if (r === "thought") return "Thinking:";
+    // thought / tool / plan / system: status lives in thought-summary-label (or body)
     return "·";
   }
 
@@ -22,6 +22,9 @@
     if (snip && !label.includes(snip)) parts.push(snip);
     return parts.join(" ");
   }
+
+  const PLACEHOLDER_SHORT = "Message…";
+  const PLACEHOLDER_FULL = "Message… · / for commands";
 
   function shouldShowToolLine() {
     return true;
@@ -323,6 +326,7 @@
       activityEl: null,
       tools: new Map(),
       lastToolTitle: "",
+      activeUserEl: null,
     },
     slashOpen: false,
     slashIndex: 0,
@@ -425,6 +429,8 @@
     sitePreviewPath: $("#site-preview-path"),
     sitePreviewFrame: $("#site-preview-frame"),
     sitePreviewFrameWrap: $("#site-preview-frame-wrap"),
+    sitePreviewScaleShell: $("#site-preview-scale-shell"),
+    sitePreviewScale: $("#site-preview-scale"),
     btnSitePreviewOpen: $("#btn-site-preview-open"),
     projectList: $("#project-list"),
     projectSearch: $("#project-search"),
@@ -1186,24 +1192,64 @@
     return "";
   }
 
-  function extractToolContentSnippet(update, limit = 120) {
-    const content = update.content;
-    if (content == null) return "";
-    if (Array.isArray(content)) {
+  function snippetFromToolValue(value, limit = 120) {
+    if (value == null || value === false) return "";
+    if (typeof value === "string") return truncate(value, limit);
+    if (typeof value === "number" || typeof value === "boolean") {
+      return truncate(String(value), limit);
+    }
+    if (Array.isArray(value)) {
       const parts = [];
-      for (const item of content) {
-        if (item && typeof item === "object") {
-          const inner = item.content != null ? item.content : item;
-          const t = extractText(inner);
-          if (t.trim()) parts.push(t.trim());
-        } else {
-          const t = extractText(item);
-          if (t.trim()) parts.push(t.trim());
-        }
+      for (const item of value) {
+        const t = snippetFromToolValue(item, limit);
+        if (t) parts.push(t);
+        if (parts.join(" ").length >= limit) break;
       }
       return truncate(parts.join(" "), limit);
     }
-    return truncate(extractText(content), limit);
+    if (typeof value === "object") {
+      // Prefer readable text fields over dumping whole objects.
+      for (const key of [
+        "text",
+        "content",
+        "output",
+        "result",
+        "message",
+        "stdout",
+        "stderr",
+        "error",
+      ]) {
+        if (value[key] != null) {
+          const t = snippetFromToolValue(value[key], limit);
+          if (t) return t;
+        }
+      }
+      const fromText = extractText(value);
+      if (fromText && fromText.trim()) return truncate(fromText, limit);
+      try {
+        const json = JSON.stringify(value);
+        if (json && json !== "{}" && json !== "[]" && json !== "null") {
+          return truncate(json, limit);
+        }
+      } catch (_) {
+        /* ignore circular / non-serializable */
+      }
+    }
+    return "";
+  }
+
+  function extractToolContentSnippet(update, limit = 120) {
+    if (!update || typeof update !== "object") return "";
+    // Primary ACP shape
+    const fromContent = snippetFromToolValue(update.content, limit);
+    if (fromContent) return fromContent;
+    // Broader ACP / stream shapes (output payloads on tool_call_update)
+    for (const key of ["rawOutput", "raw_output", "output", "result"]) {
+      if (update[key] == null) continue;
+      const snip = snippetFromToolValue(update[key], limit);
+      if (snip) return snip;
+    }
+    return "";
   }
 
   function statusClass(status) {
@@ -1763,6 +1809,7 @@
     }
     if (allowType) forceComposerUnlocked();
     updateTurnStrip();
+    updateComposerPlaceholder();
   }
 
   function clearStallWatch() {
@@ -1851,10 +1898,14 @@
 
     if (state.sessionViews) {
       for (const v of state.sessionViews.values()) {
-        if (v && v.pane) markStalePlanItems(v.pane, true);
+        if (v && v.pane) {
+          markStalePlanItems(v.pane, true);
+          clearActiveUserPrompt(v.pane);
+        }
       }
     }
     if (state.activePane) markStalePlanItems(state.activePane, true);
+    clearActiveUserPrompt();
 
     setComposerEnabled(composerConnected());
     forceComposerUnlocked();
@@ -2046,11 +2097,19 @@
             v.streamBuffers.lastToolTitle = "";
             markThoughtComplete(v.streamBuffers);
           }
+          // Drop sticky active prompt for the session whose turn ended
+          if (v.pane) clearActiveUserPrompt(v.pane);
+        }
+        // Selected pane without a cached view entry
+        if (!v && (!clearId || clearId === state.selectedId)) {
+          clearActiveUserPrompt();
         }
         state.liveTurns = (state.liveTurns || []).filter(
           (t) => t && t.sessionId !== clearId
         );
         if (state.sessionFlags) state.sessionFlags[clearId] = "idle";
+      } else {
+        clearActiveUserPrompt();
       }
       // Keep liveTurnSessionId if other turns remain; full idle when none left
       if (!(state.liveTurns && state.liveTurns.length)) {
@@ -2058,6 +2117,7 @@
         state.turnRunning = false;
         state.turnStartedAt = null;
         state.lastTermLineAt = null;
+        clearActiveUserPrompt();
         // Best-effort: clear Resend pending once the client is fully idle.
         try {
           const lp = loadLastPrompt();
@@ -2547,6 +2607,7 @@
       activityEl: null,
       tools: new Map(),
       lastToolTitle: "",
+      activeUserEl: null,
     };
   }
 
@@ -2827,6 +2888,54 @@
     scrollTranscriptToBottom();
   }
 
+  /** Clear sticky active-prompt markers from a transcript root (or selected pane). */
+  function clearActiveUserPrompt(root) {
+    const r = root || transcriptRoot();
+    if (!r) return;
+    r.querySelectorAll(".term-line.user.active-prompt").forEach((el) => {
+      el.classList.remove("active-prompt");
+    });
+    if (state.streamBuffers) state.streamBuffers.activeUserEl = null;
+    if (state.sessionViews) {
+      for (const v of state.sessionViews.values()) {
+        if (v && v.pane === r && v.streamBuffers) v.streamBuffers.activeUserEl = null;
+      }
+    }
+  }
+
+  /**
+   * Pin the active user "You:" line (CLI turn focus).
+   * CSS sticky freezes it at the top while stickToBottom keeps the stream in view.
+   */
+  function activateUserPrompt(el, { scrollToTop = true } = {}) {
+    if (!el) return;
+    clearActiveUserPrompt(transcriptRoot());
+    el.classList.add("active-prompt");
+    if (state.streamBuffers) state.streamBuffers.activeUserEl = el;
+    if (scrollToTop) scrollActivePromptToTop(el);
+  }
+
+  /** Scroll so the active prompt sits near the top of #transcript (nested pane-safe). */
+  function scrollActivePromptToTop(el) {
+    const scroller = els.transcript;
+    if (!scroller || !el) return;
+    // Offscreen panes must not move the visible scroller.
+    if (state.activePane && state.activePane.hidden) return;
+    const setTop = () => {
+      const elRect = el.getBoundingClientRect();
+      const scRect = scroller.getBoundingClientRect();
+      const top = scroller.scrollTop + (elRect.top - scRect.top) - 8;
+      scroller.scrollTop = Math.max(0, top);
+    };
+    state._ignoreScroll = true;
+    setTop();
+    requestAnimationFrame(() => {
+      setTop();
+      state._ignoreScroll = false;
+      updateJumpLatestUiOnly();
+    });
+  }
+
   function setTermBodyContent(bodyEl, text) {
     const raw = text == null ? "" : String(text);
     const table = parseSimpleMarkdownTable(raw);
@@ -3003,17 +3112,28 @@
     return false;
   }
 
+  function setToolDetailBody(row, text) {
+    const detail = row.querySelector(".tool-detail") || row.querySelector(".term-body");
+    if (!detail) return;
+    const full = String(text || "").trim();
+    if (full) {
+      detail.textContent = full;
+      detail.hidden = false;
+      row.dataset.hasDetail = "1";
+    } else {
+      detail.textContent = "";
+      detail.hidden = true;
+      delete row.dataset.hasDetail;
+    }
+  }
+
   function createToolLine({ title, status, summary, toolCallId }) {
     const row = document.createElement("details");
     row.className = "term-line tool";
     const st = normalizeStatus(status || "pending");
-    // Running/pending tools auto-open so stream is visible (CLI-like).
-    // Completed tools stay open when they carry meaningful detail.
+    // Always start collapsed; user expands manually.
     const snip = (summary || "").trim();
     row.open = false;
-    if (st === "running" || st === "pending" || snip.length > 40) {
-      row.open = true;
-    }
     row.dataset.status = st;
     if (st === "running" || st === "pending") row.classList.add("running");
     if (toolCallId) row.dataset.toolCallId = toolCallId;
@@ -3042,11 +3162,11 @@
 
     const detail = document.createElement("div");
     detail.className = "term-body tool-detail";
-    detail.textContent = snip || "No detail";
-
     row.append(sum, detail);
+    setToolDetailBody(row, snip);
     row._toolTitle = displayTitle;
     row._toolSummary = snip;
+    refreshToolPreviewAction(row);
     return row;
   }
 
@@ -3078,8 +3198,7 @@
         oneLiner.textContent = full && !hideOne ? truncate(full, 80) : "";
         oneLiner.hidden = hideOne;
       }
-      const detail = row.querySelector(".tool-detail") || row.querySelector(".term-body");
-      if (detail) detail.textContent = full || "No detail";
+      setToolDetailBody(row, full);
     } else if (title) {
       // Title-only update: re-evaluate one-liner redundancy against stored summary.
       const full = String(row._toolSummary || "").trim();
@@ -3090,13 +3209,8 @@
         oneLiner.hidden = hideOne;
       }
     }
-    // Auto-open while running/pending; keep open when detail has real content.
-    const detailLen = String(row._toolSummary || "").trim().length;
-    if (st === "running" || st === "pending") {
-      row.open = true;
-    } else if (detailLen > 40) {
-      row.open = true;
-    }
+    // Never auto-open on update; user expands manually.
+    refreshToolPreviewAction(row);
   }
 
   function appendToolLine(meta, text) {
@@ -3160,7 +3274,7 @@
       prefix.textContent = formatTermPrefix("thought");
       const label = document.createElement("span");
       label.className = "thought-summary-label";
-      label.textContent = opts.stream ? "thinking…" : "Thinking";
+      label.textContent = opts.stream ? "Thinking…" : "Thinking";
       summary.append(prefix, label);
       const body = document.createElement("div");
       body.className = "term-body";
@@ -3299,12 +3413,14 @@
   }
 
   function beginNewUserTurn() {
+    clearActiveUserPrompt();
     state.streamBuffers.assistantEl = null;
     state.streamBuffers.thoughtEl = null;
     state.streamBuffers.planEl = null;
     state.streamBuffers.activityEl = null;
     state.streamBuffers.tools = new Map();
     state.streamBuffers.lastToolTitle = "";
+    state.streamBuffers.activeUserEl = null;
     updateTurnStrip();
   }
 
@@ -3379,7 +3495,7 @@
         body.textContent = body._rawText;
       }
       const label = el.querySelector(".thought-summary-label");
-      if (label) label.textContent = "thinking…";
+      if (label) label.textContent = "Thinking…";
       scrollIfSticky();
       return;
     }
@@ -3478,11 +3594,14 @@
       const existing = body._rawText != null ? String(body._rawText) : String(body.textContent || "");
       // Exact duplicate (hub echo + ACP full message)
       if (existing === text) {
+        // Keep the in-flight turn's You: line marked while running
+        if (state.turnRunning) activateUserPrompt(last, { scrollToTop: false });
         scrollIfSticky();
         return;
       }
       // Already have this text as prefix (ACP re-sends shorter/same)
       if (existing.startsWith(text)) {
+        if (state.turnRunning) activateUserPrompt(last, { scrollToTop: false });
         scrollIfSticky();
         return;
       }
@@ -3490,6 +3609,7 @@
       if (text.startsWith(existing)) {
         setTermBodyContent(body, text);
         body._rawText = text;
+        if (state.turnRunning) activateUserPrompt(last, { scrollToTop: false });
         scrollIfSticky();
         return;
       }
@@ -3500,6 +3620,8 @@
       const el = appendMessage({ role: "user", text }, { stream: true });
       const body = el && el.querySelector(".term-body");
       if (body) body._rawText = text;
+      // New user line for the live turn: pin as active prompt
+      activateUserPrompt(el, { scrollToTop: true });
     }
     scrollIfSticky();
   }
@@ -4970,6 +5092,16 @@
     closeAskUserModal();
   }
 
+  function updateComposerPlaceholder() {
+    const ta = els.input;
+    if (!ta) return;
+    const w = ta.clientWidth || 0;
+    const next = w >= 280 ? PLACEHOLDER_FULL : PLACEHOLDER_SHORT;
+    if (ta.getAttribute("placeholder") !== next) {
+      ta.setAttribute("placeholder", next);
+    }
+  }
+
   function autoGrow() {
     const ta = els.input;
     if (!ta) return;
@@ -4994,6 +5126,7 @@
     ta.scrollTop = 0;
     // Composer height changes #transcript clientHeight — re-stick same turn.
     if (state.stickToBottom) scrollIfSticky();
+    updateComposerPlaceholder();
   }
 
   function setRailTab(tab) {
@@ -5033,6 +5166,144 @@
     return /\.html?$/i.test(String(path || ""));
   }
 
+  /** First path-like token ending in .html/.htm; prefer longer/more absolute. */
+  function extractHtmlPreviewCandidate(text) {
+    if (text == null || text === "") return "";
+    const s = String(text);
+    const found = [];
+    const push = (raw) => {
+      const t = String(raw || "").trim();
+      if (!t || !isHtmlPath(t.replace(/^["'`]|["'`]$/g, ""))) return;
+      found.push(t);
+    };
+    // Quoted paths
+    const quoted = /["'`]([^"'`\n\r]+?\.html?)["'`]/gi;
+    let m;
+    while ((m = quoted.exec(s)) !== null) push(m[1]);
+    // file:// URLs
+    const fileUrl = /\bfile:\/\/\/?[^\s"'<>]+?\.html?\b/gi;
+    while ((m = fileUrl.exec(s)) !== null) push(m[0]);
+    // Windows abs, unix abs, relative with separators, or bare filename
+    const unquoted =
+      /(?:^|[\s=:({\[,;])((?:[A-Za-z]:[\\/]|[\\/]|\.{1,2}[\\/])?(?:[^\s"'<>|*?\n\r]+[\\/])*[^\s"'<>|*?\n\r\\/]+\.html?)\b/gi;
+    while ((m = unquoted.exec(s)) !== null) push(m[1]);
+    // Bare index.html-style tokens when nothing else matched
+    if (!found.length) {
+      const bare = /\b([A-Za-z0-9_.-]+\.html?)\b/gi;
+      while ((m = bare.exec(s)) !== null) push(m[1]);
+    }
+    if (!found.length) return "";
+    const absScore = (p) => {
+      const x = p.replace(/^["'`]|["'`]$/g, "");
+      if (/^file:/i.test(x) || /^[A-Za-z]:[\\/]/.test(x) || x.startsWith("/")) return 2;
+      if (/[\\/]/.test(x)) return 1;
+      return 0;
+    };
+    found.sort((a, b) => {
+      const d = absScore(b) - absScore(a);
+      if (d !== 0) return d;
+      return b.length - a.length;
+    });
+    return found[0] || "";
+  }
+
+  /** Normalize candidate to a session-relative path for startSitePreview, or "". */
+  function toSitePreviewRelPath(candidate) {
+    if (candidate == null || candidate === "") return "";
+    let p = String(candidate).trim();
+    if (
+      (p.startsWith('"') && p.endsWith('"')) ||
+      (p.startsWith("'") && p.endsWith("'")) ||
+      (p.startsWith("`") && p.endsWith("`"))
+    ) {
+      p = p.slice(1, -1).trim();
+    }
+    p = p.replace(/^file:\/\/\/?/i, "");
+    p = p.replace(/\\/g, "/");
+    // file:///C:/... sometimes leaves /C:/...
+    if (/^\/[A-Za-z]:\//.test(p)) p = p.slice(1);
+    p = p.replace(/\/{2,}/g, "/");
+    if (!isHtmlPath(p)) return "";
+
+    const rootRaw =
+      (state.fs && state.fs.root) ||
+      (state.selectedMeta && state.selectedMeta.cwd) ||
+      "";
+    const root = String(rootRaw).replace(/\\/g, "/").replace(/\/+$/, "");
+    const pLower = p.toLowerCase();
+    const rootLower = root.toLowerCase();
+
+    if (root && (pLower === rootLower || pLower.startsWith(rootLower + "/"))) {
+      const rel = p.slice(root.length).replace(/^\/+/, "");
+      return rel || p.split("/").filter(Boolean).pop() || "";
+    }
+
+    // Absolute outside session root: strip through project folder basename if present
+    if (/^[A-Za-z]:\//.test(p) || p.startsWith("/")) {
+      if (root) {
+        const base = root.split("/").filter(Boolean).pop() || "";
+        if (base) {
+          const needle = "/" + base.toLowerCase() + "/";
+          const idx = pLower.lastIndexOf(needle);
+          if (idx >= 0) {
+            return p.slice(idx + needle.length);
+          }
+        }
+      }
+      const parts = p.split("/").filter(Boolean);
+      if (parts.length && /^[A-Za-z]:$/.test(parts[0])) parts.shift();
+      if (!parts.length) return "";
+      // Relative tail: keep last segment(s) so nested sites still resolve under root
+      return parts.length > 1 ? parts.slice(-2).join("/") : parts[0];
+    }
+
+    return p.replace(/^\.\//, "");
+  }
+
+  function htmlPathFromToolRow(row) {
+    if (!row) return "";
+    const parts = [
+      row._toolSummary,
+      row._toolTitle,
+      row.querySelector?.(".tool-one-liner")?.textContent,
+      row.querySelector?.(".tool-detail")?.textContent,
+      row.querySelector?.(".tool-name")?.textContent,
+    ];
+    for (const part of parts) {
+      const c = extractHtmlPreviewCandidate(part);
+      const rel = toSitePreviewRelPath(c);
+      if (rel) return rel;
+    }
+    return "";
+  }
+
+  function refreshToolPreviewAction(row) {
+    if (!row) return;
+    const rel = htmlPathFromToolRow(row);
+    let btn = row.querySelector(".tool-preview-btn");
+    if (!rel) {
+      if (btn) btn.remove();
+      return;
+    }
+    const sum = row.querySelector("summary");
+    if (!sum) return;
+    if (!btn) {
+      btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn-ghost btn-sm tool-preview-btn";
+      btn.textContent = "Preview";
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const r = btn.dataset.previewRel || "";
+        if (r) startSitePreview(r);
+      });
+      sum.appendChild(btn);
+    }
+    btn.dataset.previewRel = rel;
+    btn.title = "Open site preview: " + rel;
+  }
+
   function rawFsUrl(root, rel) {
     const q =
       `/api/fs/raw?root=${encodeURIComponent(root)}` +
@@ -5042,45 +5313,111 @@
 
   let sitePreviewUrl = "";
   let sitePreviewDevice = "desktop";
+  let sitePreviewResizeObserver = null;
 
+  /** Logical layout sizes used for media queries inside the iframe. */
   const SITE_PREVIEW_DEVICE_DIMS = {
-    desktop: { width: null, height: null },
-    tablet: { width: 768, height: null },
+    desktop: { width: 1280, height: 800 },
+    tablet: { width: 768, height: 1024 },
     mobile: { width: 390, height: 844 },
   };
 
+  function updateSitePreviewScaleLabel(scale, logicalW, logicalH) {
+    const scaleEl = els.sitePreviewScale;
+    if (!scaleEl) return;
+    if (scale >= 0.995) {
+      scaleEl.textContent = "";
+      scaleEl.title = "";
+      scaleEl.classList.add("hidden");
+      return;
+    }
+    scaleEl.textContent = "Scaled " + Math.round(scale * 100) + "%";
+    scaleEl.title = logicalW + "\u00d7" + logicalH + " layout";
+    scaleEl.classList.remove("hidden");
+  }
+
+  /**
+   * Size the preview iframe to a logical device width so CSS media queries
+   * see desktop/tablet widths even on a narrow stage. When the stage is
+   * smaller than the logical frame, scale the frame down with CSS transform
+   * and shrink an outer shell so layout matches the visual size.
+   *
+   * scale = min(1, stageW/logicalW, stageH/logicalH)  for desktop/tablet
+   * Mobile stays 1:1 and clamps to stage (no transform).
+   * Desktop fills the stage 1:1 when stage is larger than 1280×800.
+   */
   function applySitePreviewIframeSize() {
     const wrap = els.sitePreviewFrameWrap;
     const iframe = els.sitePreviewFrame;
+    const shell = els.sitePreviewScaleShell;
     if (!wrap || !iframe) return;
 
     const d = sitePreviewDevice;
     const dims = SITE_PREVIEW_DEVICE_DIMS[d] || SITE_PREVIEW_DEVICE_DIMS.desktop;
-    const stage = wrap.parentElement;
-    const stageW = stage ? stage.clientWidth : wrap.clientWidth;
-    const stageH = stage ? stage.clientHeight : wrap.clientHeight;
+    const stage = shell
+      ? shell.parentElement
+      : wrap.parentElement && wrap.parentElement.classList.contains("site-preview-stage")
+        ? wrap.parentElement
+        : wrap.parentElement && wrap.parentElement.parentElement;
+    const stageW = stage ? stage.clientWidth : 0;
+    const stageH = stage ? stage.clientHeight : 0;
+    if (stageW <= 0 || stageH <= 0) return;
 
-    let w;
-    let h;
-    if (d === "desktop") {
-      w = stageW;
-      h = stageH;
+    let logicalW;
+    let logicalH;
+    let scale = 1;
+
+    if (d === "mobile") {
+      // True phone frame at 1:1; clamp only if stage is smaller than the frame.
+      logicalW = Math.min(dims.width, stageW);
+      logicalH = Math.min(dims.height, stageH);
+      scale = 1;
     } else if (d === "tablet") {
-      w = Math.min(dims.width, stageW || dims.width);
-      h = stageH || wrap.clientHeight;
+      logicalW = dims.width;
+      logicalH = dims.height;
+      scale = Math.min(1, stageW / logicalW, stageH / logicalH);
+      if (!Number.isFinite(scale) || scale <= 0) scale = 1;
     } else {
-      w = Math.min(dims.width, stageW || dims.width);
-      h = Math.min(dims.height, stageH || dims.height);
+      // Desktop: fill stage when room for 1280×800; otherwise logical + scale-to-fit.
+      if (stageW >= dims.width && stageH >= dims.height) {
+        logicalW = stageW;
+        logicalH = stageH;
+        scale = 1;
+      } else {
+        logicalW = dims.width;
+        logicalH = dims.height;
+        scale = Math.min(1, stageW / logicalW, stageH / logicalH);
+        if (!Number.isFinite(scale) || scale <= 0) scale = 1;
+      }
     }
 
-    if (w > 0) {
-      wrap.style.width = w + "px";
-      iframe.style.width = w + "px";
+    const scaled = scale < 0.995;
+    const visualW = Math.round(logicalW * scale);
+    const visualH = Math.round(logicalH * scale);
+
+    wrap.style.width = logicalW + "px";
+    wrap.style.height = logicalH + "px";
+    wrap.style.maxWidth = "none";
+    wrap.style.maxHeight = "none";
+    if (scaled) {
+      wrap.style.transform = "scale(" + scale + ")";
+      wrap.style.transformOrigin = "top left";
+      wrap.classList.add("is-scaled");
+    } else {
+      wrap.style.transform = "";
+      wrap.style.transformOrigin = "";
+      wrap.classList.remove("is-scaled");
     }
-    if (h > 0) {
-      wrap.style.height = h + "px";
-      iframe.style.height = h + "px";
+
+    iframe.style.width = logicalW + "px";
+    iframe.style.height = logicalH + "px";
+
+    if (shell) {
+      shell.style.width = visualW + "px";
+      shell.style.height = visualH + "px";
     }
+
+    updateSitePreviewScaleLabel(scale, logicalW, logicalH);
 
     try {
       if (iframe.contentWindow) {
@@ -5091,22 +5428,33 @@
     }
   }
 
+  function ensureSitePreviewResizeObserver() {
+    if (sitePreviewResizeObserver || typeof ResizeObserver === "undefined") return;
+    const stage =
+      (els.sitePreviewScaleShell && els.sitePreviewScaleShell.parentElement) ||
+      document.querySelector(".site-preview-stage");
+    if (!stage) return;
+    sitePreviewResizeObserver = new ResizeObserver(() => {
+      if (!els.modalSitePreview || els.modalSitePreview.classList.contains("hidden")) {
+        return;
+      }
+      applySitePreviewIframeSize();
+    });
+    sitePreviewResizeObserver.observe(stage);
+  }
+
   function setSitePreviewDevice(device) {
     const d =
       device === "tablet" || device === "mobile" ? device : "desktop";
     sitePreviewDevice = d;
     if (els.sitePreviewFrameWrap) {
       els.sitePreviewFrameWrap.dataset.device = d;
-      // Clear inline sizes so CSS device rules apply before measure
-      if (d === "desktop") {
-        els.sitePreviewFrameWrap.style.width = "";
-        els.sitePreviewFrameWrap.style.height = "";
-      }
     }
     $$(".site-preview-preset").forEach((btn) => {
       const on = btn.getAttribute("data-device") === d;
       btn.setAttribute("aria-pressed", on ? "true" : "false");
     });
+    ensureSitePreviewResizeObserver();
     requestAnimationFrame(() => {
       applySitePreviewIframeSize();
       requestAnimationFrame(applySitePreviewIframeSize);
@@ -5847,7 +6195,9 @@
       const el = appendMessage({ role: "user", text }, { stream: true });
       const body = el && el.querySelector(".term-body");
       if (body) body._rawText = text;
-      scrollIfSticky();
+      // Pin You: at top (CLI turn focus); stickToBottom still tracks stream below.
+      // Top pin wins first paint over appendMessage's scrollIfSticky.
+      activateUserPrompt(el, { scrollToTop: true });
     }
     sendWs({
       type: "prompt",
@@ -6269,6 +6619,7 @@
     const applyLayout = () => {
       applyOffset();
       autoGrow();
+      updateComposerPlaceholder();
       if (state.slashOpen) positionSlashPalette();
       if (state.stickToBottom) scrollIfSticky();
     };
@@ -6280,6 +6631,16 @@
       vv.addEventListener("scroll", applyOffset);
     }
     window.addEventListener("resize", applyLayout);
+    if (typeof ResizeObserver !== "undefined") {
+      const roTarget = els.input || (els.form && els.form.closest(".composer"));
+      if (roTarget) {
+        const ro = new ResizeObserver(() => {
+          updateComposerPlaceholder();
+        });
+        ro.observe(roTarget);
+      }
+    }
+    updateComposerPlaceholder();
     applyLayout();
   }
 

@@ -67,9 +67,19 @@ def test_js_term_line_structure() -> None:
     assert "tool-detail" in js
     assert "planHasActiveWork" in js
     assert 'createElement("details")' in js
-    # Tools start closed then open when running/pending or detail-rich
-    assert "row.open = false" in js
-    assert "row.open = true" in js
+    # Tools always start closed; user expands (never auto-open on create/update)
+    create_idx = js.find("function createToolLine")
+    assert create_idx >= 0
+    create_chunk = js[create_idx : create_idx + 900]
+    assert "row.open = false" in create_chunk
+    assert "row.open = true" not in create_chunk
+    update_idx = js.find("function updateToolLine")
+    assert update_idx >= 0
+    update_chunk = js[update_idx : update_idx + 900]
+    assert "row.open = true" not in update_chunk
+    assert "setToolDetailBody" in js
+    assert "data-has-detail" in js or "hasDetail" in js
+    assert "No detail" not in js
     assert "toolOneLinerRedundant" in js
     # Live tool_call must not build label+summary as title
     assert 'truncate(`${label} ${summary}`, 160)' not in js
@@ -86,6 +96,8 @@ def test_css_tool_plan_expand() -> None:
     # Closed tools/thoughts/plans hide non-summary children (WebKit/iOS)
     assert ".term-line.tool:not([open]) > :not(summary)" in css
     assert "display: none !important" in css
+    # No-detail tools mute expand affordance
+    assert ".term-line.tool:not([data-has-detail])" in css
     # Compact single-line tool summary row
     assert "flex-wrap: nowrap" in css
     assert ".term-line.tool .tool-name" in css
@@ -96,7 +108,7 @@ def test_format_term_prefix() -> None:
     assert format_term_prefix("user") == "You:"
     assert format_term_prefix("assistant") == "Grok:"
     assert format_term_prefix("tool") == "·"
-    assert format_term_prefix("thought") == "Thinking:"
+    assert format_term_prefix("thought") == "·"
     assert format_term_prefix("plan") == "·"
     assert format_term_prefix("system") == "·"
 
