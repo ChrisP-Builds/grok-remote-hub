@@ -1,17 +1,47 @@
 # Grok Remote Hub
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-f5a524.svg)](LICENSE)
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](https://www.python.org/)
-[![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](#requirements)
-[![Network: Tailscale](https://img.shields.io/badge/Network-Tailscale-242424.svg)](https://tailscale.com/)
-
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="Grok Remote Hub — always-on Tailscale UI for Grok Build sessions" width="100%">
+  <img src="docs/assets/logo.svg" alt="Grok Remote Hub logo" width="72" height="72">
 </p>
 
-**Always-on web UI for [Grok Build](https://x.ai/)** on your PC. Resume project sessions from phone or desktop, stream live agent turns to every open browser, and hydrate chat history from disk.
+<p align="center">
+  <strong>Always-on web UI for <a href="https://x.ai/">Grok Build</a></strong><br>
+  Resume sessions from phone or desktop · live multi-browser stream · history from disk
+</p>
 
-> **Security first:** the hub auto-approves agent tools. Anyone who can reach it can drive an agent with the same power as a local Grok session. Prefer Tailscale + an optional `hub_token`. See [Security](#security).
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-e6b84d?style=flat-square&labelColor=0a0c10" alt="MIT"></a>
+  <a href="#requirements"><img src="https://img.shields.io/badge/Python-3.11%2B-5ec8e8?style=flat-square&labelColor=0a0c10" alt="Python 3.11+"></a>
+  <a href="#requirements"><img src="https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&labelColor=0a0c10" alt="Windows"></a>
+  <a href="https://tailscale.com/"><img src="https://img.shields.io/badge/Network-Tailscale-6dca8d?style=flat-square&labelColor=0a0c10" alt="Tailscale"></a>
+  <a href="https://github.com/ChrisP-Builds/grok-remote-hub"><img src="https://img.shields.io/github/stars/ChrisP-Builds/grok-remote-hub?style=flat-square&labelColor=0a0c10&color=e6b84d" alt="Stars"></a>
+</p>
+
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="Grok Remote Hub product banner" width="100%">
+</p>
+
+> **Security first:** the hub auto-approves agent tools. Anyone who can reach it can drive an agent with the same power as a local Grok session. Prefer **Tailscale** + optional `hub_token`. See [Security](#security).
+
+---
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/assets/screenshot-session.png" alt="Desktop hub UI with sessions rail and live transcript" width="100%">
+  <br>
+  <em>Desktop — session rail, filters, live transcript, usage bars</em>
+</p>
+
+<p align="center">
+  <img src="docs/assets/screenshot-mobile.png" alt="Mobile hub UI on phone viewport" width="280">
+  &nbsp;&nbsp;&nbsp;
+  <img src="docs/assets/social-preview.png" alt="Wide product preview" width="62%">
+  <br>
+  <em>Phone viewport · wide product preview</em>
+</p>
+
+Demo content in screenshots is sanitized for the public repo (no personal paths or private session titles).
 
 ---
 
@@ -21,7 +51,7 @@ The stock Grok CLI TUI is excellent on the desktop, but it is a **single local p
 
 | You want… | Remote Hub |
 |---|---|
-| Chat from **Safari / phone** while the agent runs on the PC | Yes (over Tailscale) |
+| Chat from **Safari / phone** while the agent runs on the PC | Yes (Tailscale) |
 | **Phone + desktop browser** seeing the same live stream | Yes (WebSocket fan-out) |
 | Resume **saved sessions** and project history | Yes (`~/.grok/sessions`) |
 | Inject prompts into the **stock Grok TUI** | **No** (separate process) |
@@ -32,14 +62,34 @@ The stock Grok CLI TUI is excellent on the desktop, but it is a **single local p
 
 ## Features
 
-- **Session rail** — Working / Subagent / All filters, search, pin, rename, delete
+- **Session rail** — Working / Subagent / All, search, pin, rename, delete
 - **Live stream** — multi-browser WebSocket fan-out; mid-turn switch keeps continuity
 - **History** — hydrate from `updates.jsonl` when you open a session
 - **Composer** — multi-line input, slash palette, prompt queue while a turn runs
 - **Files** — sandboxed tree for the session cwd (edit, markdown + Mermaid, images)
-- **Usage** — session context bar + weekly plan bar (from local Grok login)
-- **Ops scripts** — detached start/stop/restart, firewall helper, optional logon task
+- **Usage** — session context + weekly plan bars (from local Grok login)
+- **Ops scripts** — detached start / stop / restart, firewall helper, logon task
 - **Terminal follower** — `follow.ps1` tails the same session in a desktop terminal
+
+---
+
+## Architecture
+
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="Browsers to Hub to grok agent serve" width="100%">
+</p>
+
+- **Sole ACP client** — browsers never talk to the agent directly
+- **Sole-writer prompts** — live turns use hub-owned `session/new`
+- **Dual browser, not dual TUI** — phone + desktop share this process; stock TUI is separate
+
+Design write-ups: **[docs/adr/](docs/adr/)** (ADR 001–008).
+
+| Path | Live together? | Notes |
+|---|---|---|
+| Safari hub ↔ desktop **browser** hub | Yes | Same process; WS fan-out |
+| Safari hub → **stock Grok CLI TUI** | No | Separate process |
+| Safari hub → **desktop terminal follower** | Yes | Read-only `updates.jsonl` tail |
 
 ---
 
@@ -69,7 +119,7 @@ copy config.example.toml config.toml
 .\start-hub.ps1
 ```
 
-Open the URL printed by the script (port **8787**), for example:
+Open the URL printed by the script (port **8787**):
 
 ```text
 http://100.x.y.z:8787          # Tailscale
@@ -82,7 +132,7 @@ http://127.0.0.1:8787          # this PC only
 | Restart (safe from a hub session) | `.\restart-hub.ps1` |
 | Start at Windows logon | `.\install-startup.ps1` |
 
-> **Do not** run bare `stop-hub.ps1` from inside a live hub/agent turn. Use `restart-hub.ps1` so stop+start is scheduled and survives the hub process exiting.
+> **Do not** run bare `stop-hub.ps1` from inside a live hub/agent turn. Use `restart-hub.ps1` so stop+start is scheduled and survives the hub exiting.
 
 ---
 
@@ -90,15 +140,13 @@ http://127.0.0.1:8787          # this PC only
 
 1. Install **Tailscale** on the PC and phone (same account / tailnet).
 2. Start the hub on the PC. Confirm it prints `Hub is up` and health checks show `OK`.
-3. **Once, as Administrator**, open the firewall for the hub:
+3. **Once, as Administrator**, open the firewall:
 
    ```powershell
    .\fix-firewall.ps1
    ```
 
-   Without this, Safari often cannot connect even when the PC can open the same URL.
-
-4. On the phone (Tailscale connected), open:
+4. On the phone (Tailscale connected):
 
    ```text
    http://<tailscale-ip>:8787
@@ -125,8 +173,6 @@ Without Tailscale the hub binds **localhost only** and the UI shows **Local only
 
 **This hub auto-approves agent tools** (`grok agent --always-approve serve`). Treat network access like handing someone your keyboard.
 
-**Mitigations:**
-
 1. Prefer **Tailscale only** (default never binds `0.0.0.0`).
 2. Set optional **`hub_token`** in `config.toml`:
 
@@ -139,9 +185,7 @@ Without Tailscale the hub binds **localhost only** and the UI shows **Local only
 
 3. Agent listens on **`127.0.0.1` only**; secret file `data/agent.secret` is gitignored.
 
-Full policy and reporting: **[SECURITY.md](SECURITY.md)**.
-
-Copy `config.example.toml` → `config.toml` for local overrides (`config.toml` is never committed).
+Full policy: **[SECURITY.md](SECURITY.md)**.
 
 ---
 
@@ -156,45 +200,13 @@ Copy `config.example.toml` → `config.toml` for local overrides (`config.toml` 
 | `hub.sessions_root` | `~/.grok/sessions` | On-disk session index |
 | `agent.bind` / `port` | `127.0.0.1:2419` | Local `grok agent serve` |
 
-After a **CLI upgrade**, check the **Hub · CLI** badge in the rail footer, or:
+Copy `config.example.toml` → `config.toml` for local overrides.
 
-- `GET /api/compat`
-- `POST /api/compat/refresh`
-
-Smoke checks are structural (versions, agent/ACP, sessions root, static UI). They do **not** spend a paid model turn.
+After a **CLI upgrade**, check the **Hub · CLI** badge, or `GET /api/compat` / `POST /api/compat/refresh`.
 
 ---
 
-## Architecture (short)
-
-```text
-  Phone / desktop browsers
-           │  HTTP + WebSocket
-           ▼
-   ┌───────────────────┐         ACP WebSocket          ┌────────────────────┐
-   │  Grok Remote Hub  │ ─────────────────────────────► │  grok agent serve  │
-   │  SPA · REST · WS  │   sole client (permissions,    │  127.0.0.1:2419    │
-   └───────────────────┘   fs, terminal, prompts)       └────────────────────┘
-           │
-           ├── ~/.grok/sessions/**/summary.json   (list)
-           └── updates.jsonl                      (history hydrate + follow)
-```
-
-- **Sole ACP client** — browsers never talk to the agent directly.
-- **Sole-writer prompts** — live turns use hub-owned `session/new`; the hub does not `session/load` foreign/CLI ids for prompting.
-- **Dual browser, not dual TUI** — phone + desktop browsers share this process; stock Grok TUI is separate.
-
-Design decisions: **[docs/adr/](docs/adr/)** (ADR 001–008).
-
-### What is live together?
-
-| Path | Live together? | Notes |
-|---|---|---|
-| Safari hub ↔ desktop **browser** hub | Yes | Same process; WS fan-out |
-| Safari hub → **stock Grok CLI TUI** | No | Separate process |
-| Safari hub → **desktop terminal follower** | Yes | Read-only tail of `updates.jsonl` |
-
-### Desktop terminal follower
+## Desktop terminal follower
 
 ```powershell
 .\follow.ps1
@@ -223,19 +235,17 @@ python -m playwright install chromium
 python -m pytest tests/test_e2e_smoke.py -v
 ```
 
-Prefer **Python Playwright**. Optional Node Playwright (`package.json`) can hang on some Windows/Node builds; do not block on it.
+Prefer **Python Playwright**. Optional Node Playwright can hang on some Windows/Node builds.
 
-Contributing guide: **[CONTRIBUTING.md](CONTRIBUTING.md)**.  
-Internal release checklist: **[docs/RELEASE_READINESS.md](docs/RELEASE_READINESS.md)**.
+See **[CONTRIBUTING.md](CONTRIBUTING.md)** and **[docs/RELEASE_READINESS.md](docs/RELEASE_READINESS.md)**.
 
 ---
 
 ## Known limits (v0.2)
 
-- **One live turn at a time** (sole ACP connection); multi-session UI continuity is not multi-agent concurrency
+- **One live turn at a time** (sole ACP connection)
 - Cancel is best-effort (depends on agent support)
-- History capped (~200 normalized messages in the UI path; config can raise index caps)
-- Session list capped at recent useful sessions (default 80)
+- History / session list caps (defaults suitable for a personal hub)
 - **Windows-first** ops scripts
 
 ---
@@ -250,4 +260,4 @@ The hub may read `~/.grok/auth.json` on this machine (same login as the Grok CLI
 
 [MIT](LICENSE) © ChrisP-Builds
 
-Issues and PRs welcome. Please keep secrets and personal machine paths out of the tree.
+Issues and PRs welcome. Keep secrets and personal machine paths out of the tree.

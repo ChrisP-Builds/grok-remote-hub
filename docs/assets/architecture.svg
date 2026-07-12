@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="320" viewBox="0 0 960 320" role="img" aria-label="Architecture diagram">
+  <defs>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#151b24"/>
+      <stop offset="100%" stop-color="#0f1318"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#e6b84d"/>
+    </marker>
+  </defs>
+  <rect width="960" height="320" rx="16" fill="#0a0c10" stroke="#243041"/>
+
+  <!-- browsers -->
+  <rect x="40" y="48" width="200" height="100" rx="12" fill="url(#card)" stroke="#243041"/>
+  <text x="140" y="88" text-anchor="middle" fill="#e6b84d" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="13" font-weight="600">Phone browser</text>
+  <text x="140" y="112" text-anchor="middle" fill="#7d8b9c" font-family="IBM Plex Mono, monospace" font-size="11">Safari · Home Screen</text>
+
+  <rect x="40" y="172" width="200" height="100" rx="12" fill="url(#card)" stroke="#243041"/>
+  <text x="140" y="212" text-anchor="middle" fill="#5ec8e8" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="13" font-weight="600">Desktop browser</text>
+  <text x="140" y="236" text-anchor="middle" fill="#7d8b9c" font-family="IBM Plex Mono, monospace" font-size="11">Chrome · Edge</text>
+
+  <!-- hub -->
+  <rect x="340" y="88" width="260" height="144" rx="14" fill="url(#card)" stroke="#e6b84d" stroke-opacity="0.55"/>
+  <text x="470" y="132" text-anchor="middle" fill="#d6deea" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="16" font-weight="600">Grok Remote Hub</text>
+  <text x="470" y="158" text-anchor="middle" fill="#7d8b9c" font-family="IBM Plex Mono, monospace" font-size="11">SPA · REST · WebSocket</text>
+  <text x="470" y="182" text-anchor="middle" fill="#7d8b9c" font-family="IBM Plex Mono, monospace" font-size="11">port 8787 · Tailscale</text>
+  <text x="470" y="206" text-anchor="middle" fill="#e6b84d" font-family="IBM Plex Mono, monospace" font-size="11">sole ACP client</text>
+
+  <!-- agent -->
+  <rect x="700" y="110" width="220" height="100" rx="12" fill="url(#card)" stroke="#243041"/>
+  <text x="810" y="150" text-anchor="middle" fill="#6dca8d" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="14" font-weight="600">grok agent serve</text>
+  <text x="810" y="176" text-anchor="middle" fill="#7d8b9c" font-family="IBM Plex Mono, monospace" font-size="11">127.0.0.1:2419</text>
+
+  <!-- arrows -->
+  <path d="M240 98 H330" stroke="#e6b84d" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M240 222 H330" stroke="#5ec8e8" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+  <path d="M600 160 H690" stroke="#e6b84d" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+
+  <text x="480" y="300" text-anchor="middle" fill="#7d8b9c" font-family="IBM Plex Sans, system-ui, sans-serif" font-size="12">Browsers never talk to the agent directly · history from ~/.grok/sessions</text>
+</svg>

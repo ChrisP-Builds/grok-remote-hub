@@ -13,6 +13,9 @@ venv/
 # Personal / local-only notes (not for public GitHub)
 SESSION_LOG.md
 docs/superpowers/
+# Local asset capture helpers / scratch
+docs/assets/_*.py
+docs/assets/_*.txt
 # Local probes / dumps (never ship)
 _probe*
 _scan*
