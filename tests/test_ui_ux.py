@@ -345,13 +345,15 @@ def test_js_report_error_and_error_strip() -> None:
     assert "btn-error-copy" in html
     assert ".error-strip" in css
     assert ".error-strip.info" in css
-    # Recoverable turn-clear regex covers stall / send again
+    # Recoverable turn-clear regex covers stall / send again / auto-retry
     rec_idx = js.find("function isRecoverableTurnClear")
     assert rec_idx >= 0
-    rec_chunk = js[rec_idx : rec_idx + 350]
+    rec_chunk = js[rec_idx : rec_idx + 450]
     assert "send again" in rec_chunk
     assert "stalled mid-turn" in rec_chunk
     assert "no activity" in rec_chunk
+    assert "recovering" in rec_chunk
+    assert "retrying" in rec_chunk
     # reportInfo: non-danger toast + info strip + 12s auto-dismiss
     info_idx = js.find("function reportInfo")
     assert info_idx >= 0
@@ -363,11 +365,13 @@ def test_js_report_error_and_error_strip() -> None:
     strip_chunk = js[strip_idx : strip_idx + 1200]
     assert 'classList.toggle("info"' in strip_chunk or 'classList.toggle("info",' in strip_chunk
     assert "12000" in strip_chunk
-    # type===error still goes through reportError; turn idle uses recoverable branch
+    # type===error: hard failures reportError; recovering/soft use reportInfo
     err_idx = js.find('if (type === "error")')
     assert err_idx >= 0
-    err_chunk = js[err_idx : err_idx + 700]
+    err_chunk = js[err_idx : err_idx + 900]
     assert "reportError" in err_chunk
+    assert "reportInfo" in err_chunk
+    assert "recovering" in err_chunk
     assert "reportError(msg.error" in js or 'reportError(msg.error' in js
     # danger toasts last longer than info toasts
     toast_idx = js.find("function toast(")

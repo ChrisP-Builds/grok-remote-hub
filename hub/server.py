@@ -53,10 +53,12 @@ from hub.session_policy import (
     STUCK_TURN_SECONDS,
     cwd_key,
     is_hub_resume_candidate,
+    is_no_output_error_message,
     load_hub_session_ids,
     load_remote_sessions,
     resolve_ensure_action,
     save_remote_sessions,
+    should_auto_retry_no_output,
 )
 from hub.session_tailer import EventDedupe, SessionTailer
 from hub.skills_index import list_skills
@@ -72,6 +74,10 @@ REMOTE_SESSION_SYSTEM_NOTE = (
 REMOTE_SESSION_SAME_NOTE = "Live remote session"
 NO_OUTPUT_USER_MSG = (
     "Agent produced no output. Same session kept — send again."
+)
+NO_OUTPUT_RECOVERING_MSG = "Recovering session — retrying…"
+NO_OUTPUT_RETRY_FAILED_MSG = (
+    "Agent still not responding after automatic retry. Try again in a moment."
 )
 MID_TURN_STALL_USER_MSG = (
     "Agent stalled mid-turn (no activity). Turn cleared — you can send again."
@@ -1687,10 +1693,7 @@ class Hub:
             log.exception("background cancel task failed")
 
     def _is_no_output_error(self, exc: BaseException) -> bool:
-        msg = str(exc).lower()
-        return "no acp session/update" in msg or (
-            "force-cleared" in msg and "session/update" in msg
-        )
+        return is_no_output_error_message(exc)
 
     def _is_mid_turn_stall_error(self, exc: BaseException) -> bool:
         msg = str(exc).lower()
@@ -1902,6 +1905,118 @@ class Hub:
         )
         await self.broadcast(self.status_payload())
 
+    async def _heal_session_for_no_output_retry(
+        self, session_id: str, cwd: str
+    ) -> bool:
+        """session/load same id; reconnect ACP once if needed. Never session/new."""
+        if await self._try_session_load(session_id, cwd):
+            self._record_hub_session(session_id, cwd)
+            self._stamp_origin_sync(session_id, "attach")
+            log.info("no-output heal: session/load ok session=%s", session_id)
+            return True
+        log.warning(
+            "no-output heal: session/load failed session=%s; reconnecting ACP",
+            session_id,
+        )
+        try:
+            await self.acp.reconnect(timeout=10.0)
+        except Exception as exc:
+            log.warning("no-output heal: ACP reconnect failed: %s", exc)
+            return False
+        if await self._try_session_load(session_id, cwd):
+            self._record_hub_session(session_id, cwd)
+            self._stamp_origin_sync(session_id, "attach")
+            log.info(
+                "no-output heal: session/load ok after reconnect session=%s",
+                session_id,
+            )
+            return True
+        log.warning(
+            "no-output heal: session/load still failed session=%s", session_id
+        )
+        return False
+
+    async def _no_output_auto_retry(
+        self,
+        *,
+        session_id: str,
+        view_session_id: str,
+        text: str,
+        cwd: str,
+        cwd_key: str,
+    ) -> bool:
+        """Force-clear, heal same session, re-prompt once. True if retry succeeded."""
+        if self.acp.is_session_active(session_id):
+            self.acp.force_clear_turn(
+                "no-output recovery: clear stuck turn, same session",
+                session_id=session_id,
+            )
+        log.warning(
+            "no-output: auto-retry starting session=%s (no session/new, no map rewrite)",
+            session_id,
+        )
+        await self._broadcast_turn(
+            session_id,
+            "running",
+            NO_OUTPUT_RECOVERING_MSG,
+            also_session_id=view_session_id,
+        )
+        await self.broadcast(self.status_payload())
+
+        healed = await self._heal_session_for_no_output_retry(
+            session_id, cwd or ""
+        )
+        if not healed:
+            log.warning(
+                "no-output heal incomplete session=%s; still retrying prompt",
+                session_id,
+            )
+
+        try:
+            await self.acp.session_prompt(
+                session_id,
+                text,
+                cwd=cwd or None,
+                allow_load=False,
+                cwd_key=cwd_key,
+                no_output_seconds=90,
+            )
+            log.info("no-output: auto-retry ok session=%s", session_id)
+            await self._broadcast_turn(
+                session_id, "idle", None, also_session_id=view_session_id
+            )
+            return True
+        except Exception as retry_exc:
+            log.exception(
+                "no-output: auto-retry failed session=%s", session_id
+            )
+            if self.acp.is_session_active(session_id):
+                self.acp.force_clear_turn(
+                    f"no-output auto-retry failed: {retry_exc}",
+                    session_id=session_id,
+                )
+            if self._is_no_output_error(retry_exc):
+                err_msg = NO_OUTPUT_RETRY_FAILED_MSG
+            elif self._is_mid_turn_stall_error(retry_exc):
+                err_msg = MID_TURN_STALL_USER_MSG
+            elif self._is_max_turn_error(retry_exc):
+                err_msg = MAX_TURN_USER_MSG
+            elif "force-cleared" in str(retry_exc).lower():
+                err_msg = MID_TURN_STALL_USER_MSG
+            else:
+                err_msg = NO_OUTPUT_RETRY_FAILED_MSG
+            if self.acp.last_force_clear_reason:
+                self._last_broadcast_force_clear = (
+                    self.acp.last_force_clear_reason
+                )
+            await self._broadcast_turn(
+                session_id, "idle", err_msg, also_session_id=view_session_id
+            )
+            await self._emit_error(
+                err_msg, session_id=session_id, level="warning"
+            )
+            return False
+
     async def _execute_prompt(
         self,
         view_session_id: str,
@@ -1911,6 +2026,7 @@ class Hub:
         ws: web.WebSocketResponse | None = None,
         echo_user: bool = True,
         cwd_key: str = "",
+        _auto_retry: bool = True,
     ) -> None:
         """Run one prompt turn. Does not enqueue; caller drains queues after."""
         session = find_session(self.config.sessions_root, view_session_id)
@@ -1997,35 +2113,50 @@ class Hub:
                     f"prompt exception: {exc}", session_id=session_id
                 )
 
-            err_msg = str(exc)
-            # Hang with zero output: keep same session; do not fork or rebind map.
-            if self._is_no_output_error(exc):
-                err_msg = NO_OUTPUT_USER_MSG
-                if self.acp.is_session_active(session_id):
-                    self.acp.force_clear_turn(
-                        "no-output recovery: clear stuck turn, same session",
-                        session_id=session_id,
-                    )
-                log.warning(
-                    "no-output: kept session %s (no session/new, no map rewrite)",
-                    session_id,
+            # Hang with zero output: heal + auto-retry once on same session.
+            if should_auto_retry_no_output(exc, already_retried=not _auto_retry):
+                await self._no_output_auto_retry(
+                    session_id=session_id,
+                    view_session_id=view_session_id,
+                    text=text,
+                    cwd=cwd,
+                    cwd_key=cwd_key,
                 )
-            elif self._is_mid_turn_stall_error(exc):
-                err_msg = MID_TURN_STALL_USER_MSG
-            elif self._is_max_turn_error(exc):
-                err_msg = MAX_TURN_USER_MSG
-            elif "force-cleared" in str(exc).lower():
-                err_msg = MID_TURN_STALL_USER_MSG
+            else:
+                err_msg = str(exc)
+                if self._is_no_output_error(exc):
+                    err_msg = (
+                        NO_OUTPUT_RETRY_FAILED_MSG
+                        if not _auto_retry
+                        else NO_OUTPUT_USER_MSG
+                    )
+                    if self.acp.is_session_active(session_id):
+                        self.acp.force_clear_turn(
+                            "no-output recovery: clear stuck turn, same session",
+                            session_id=session_id,
+                        )
+                    log.warning(
+                        "no-output: kept session %s (no session/new, no map rewrite)",
+                        session_id,
+                    )
+                elif self._is_mid_turn_stall_error(exc):
+                    err_msg = MID_TURN_STALL_USER_MSG
+                elif self._is_max_turn_error(exc):
+                    err_msg = MAX_TURN_USER_MSG
+                elif "force-cleared" in str(exc).lower():
+                    err_msg = MID_TURN_STALL_USER_MSG
 
-            if self.acp.last_force_clear_reason:
-                self._last_broadcast_force_clear = self.acp.last_force_clear_reason
+                if self.acp.last_force_clear_reason:
+                    self._last_broadcast_force_clear = (
+                        self.acp.last_force_clear_reason
+                    )
 
-            await self._broadcast_turn(
-                session_id, "idle", err_msg, also_session_id=view_session_id
-            )
-            await self._emit_error(
-                err_msg, session_id=session_id, level="warning"
-            )
+                await self._broadcast_turn(
+                    session_id, "idle", err_msg, also_session_id=view_session_id
+                )
+                await self._emit_error(
+                    err_msg, session_id=session_id, level="warning"
+                )
         finally:
             # Always re-assert idle unlock path via status (success already idled above)
             if self.acp.is_session_active(session_id):

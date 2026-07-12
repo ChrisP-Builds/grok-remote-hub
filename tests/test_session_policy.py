@@ -13,6 +13,7 @@ from hub.session_policy import (
     STUCK_TURN_SECONDS,
     cwd_key,
     is_hub_resume_candidate,
+    is_no_output_error_message,
     is_turn_stuck_for_new_prompt,
     load_hub_session_ids,
     load_remote_sessions,
@@ -20,6 +21,7 @@ from hub.session_policy import (
     resolve_ensure_action,
     resolve_live_session_id,
     save_remote_sessions,
+    should_auto_retry_no_output,
     should_force_clear_turn,
 )
 
@@ -530,6 +532,40 @@ def test_should_force_clear_no_output() -> None:
     )
     assert reason is not None
     assert "no ACP session/update" in reason
+
+
+def test_is_no_output_error_message() -> None:
+    assert is_no_output_error_message(
+        "no ACP session/update for 60.0s after prompt (threshold=60.0s)"
+    )
+    assert is_no_output_error_message(
+        RuntimeError("force-cleared: no ACP session/update for 61.2s")
+    )
+    assert not is_no_output_error_message("mid-turn stall (120s)")
+    assert not is_no_output_error_message("force-cleared: user cancel")
+    assert not is_no_output_error_message("")
+    assert not is_no_output_error_message(None)
+
+
+def test_should_auto_retry_no_output() -> None:
+    exc = RuntimeError(
+        "no ACP session/update for 60.1s after prompt (threshold=60.0s)"
+    )
+    assert should_auto_retry_no_output(exc, already_retried=False) is True
+    assert should_auto_retry_no_output(exc, already_retried=True) is False
+    assert (
+        should_auto_retry_no_output(
+            "force-cleared turn: no ACP session/update for 90s",
+            already_retried=False,
+        )
+        is True
+    )
+    assert (
+        should_auto_retry_no_output(
+            RuntimeError("mid-turn stall"), already_retried=False
+        )
+        is False
+    )
 
 
 def test_should_force_clear_mid_turn_stall() -> None:
