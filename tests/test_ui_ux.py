@@ -127,6 +127,24 @@ def test_html_composer_spellcheck() -> None:
     assert meta_i > html.find("</header>", topbar_i), "meta-popover must be outside topbar"
 
 
+def test_composer_placeholder_responsive() -> None:
+    """Short default placeholder; JS swaps full form by width; CSS ellipsizes."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+
+    # Default attribute is short (no long parenthetical baked into HTML)
+    assert 'placeholder="Message…"' in html
+    assert 'placeholder="Message… (/ for commands)"' not in html
+
+    assert "updateComposerPlaceholder" in js
+    assert 'PLACEHOLDER_SHORT = "Message…"' in js or 'PLACEHOLDER_SHORT="Message…"' in js
+    assert "PLACEHOLDER_FULL" in js
+    assert "/ for commands" in js
+
+    assert "composer-input::placeholder" in css or "text-overflow: ellipsis" in css
+
+
 def test_css_meta_popover_not_clipped() -> None:
     css = (STATIC / "app.css").read_text(encoding="utf-8")
     assert "position: fixed" in css
@@ -267,10 +285,11 @@ def test_js_stream_parity_thought_and_tools() -> None:
     assert "content.text" in extract_chunk
     assert "map(extractText)" in extract_chunk or "extractText(content.content)" in extract_chunk
 
-    # Thought prefix + labels
-    assert 'if (r === "thought") return "Thinking:"' in js
-    assert 'label.textContent = opts.stream ? "thinking…" : "Thinking"' in js
+    # Thought prefix is muted ·; status text lives only in thought-summary-label
+    assert 'if (r === "thought") return "Thinking:"' not in js
+    assert 'label.textContent = opts.stream ? "Thinking…" : "Thinking"' in js
     assert 'if (label) label.textContent = "Thinking"' in js
+    assert 'if (label) label.textContent = "Thinking…"' in js
 
     # New thought "screen" after tools / before assistant reply
     tool_call_idx = js.find('if (kind === "tool_call")')
@@ -293,15 +312,21 @@ def test_js_stream_parity_thought_and_tools() -> None:
     assert "body._rawText" in thought_chunk
     assert "open: true" in thought_chunk
 
-    # Tools auto-open when running/pending; detail limit 8000
+    # Tools collapsed by default (never auto-open for running/pending)
     create_idx = js.find("function createToolLine")
     assert create_idx >= 0
-    create_chunk = js[create_idx : create_idx + 700]
-    assert 'st === "running" || st === "pending"' in create_chunk
-    assert "row.open = true" in create_chunk
+    create_chunk = js[create_idx : create_idx + 900]
+    assert "row.open = false" in create_chunk
+    assert "row.open = true" not in create_chunk
+    assert "setToolDetailBody" in js
+    assert "No detail" not in js
 
     assert "extractToolContentSnippet(update, 8000)" in js
     assert "function extractToolContentSnippet(update, limit = 120)" in js
+    # Broader ACP payload shapes for tool detail
+    assert "rawOutput" in js
+    assert "raw_output" in js
+    assert "snippetFromToolValue" in js
 
     # Subagent activity lines
     assert 'kind === "subagent_spawned"' in js
@@ -411,6 +436,48 @@ def test_js_last_prompt_resend_and_optimistic_user() -> None:
     assert "btn-error-resend" in html
     assert "btnErrorResend" in js
     assert "toast-with-action" in css or "toast-action" in css
+
+
+def test_js_active_user_prompt_sticky() -> None:
+    """CLI-like active You: line: sticky pin while turn runs, clear when idle."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+
+    assert "function activateUserPrompt" in js
+    assert "function clearActiveUserPrompt" in js
+    assert "function scrollActivePromptToTop" in js
+    assert "active-prompt" in js
+    assert "activeUserEl" in js
+
+    # CSS sticky pin for active user line
+    assert ".term-line.user.active-prompt" in css
+    assert "position: sticky" in css
+
+    # submitPrompt activates only on !alreadyRunning (not queue-only echoes)
+    submit_idx = js.find("function submitPrompt")
+    assert submit_idx >= 0
+    submit_chunk = js[submit_idx : submit_idx + 2200]
+    assert "activateUserPrompt" in submit_chunk
+    assert "alreadyRunning" in submit_chunk
+    assert "scrollToTop: true" in submit_chunk
+
+    # processUserMessageChunk: new line + exact dedupe while running
+    umc_idx = js.find("function processUserMessageChunk")
+    assert umc_idx >= 0
+    umc_chunk = js[umc_idx : umc_idx + 1600]
+    assert "activateUserPrompt" in umc_chunk
+    assert "state.turnRunning" in umc_chunk
+
+    # Idle / turn end clears active prompt
+    set_idx = js.find("function setTurnRunning")
+    assert set_idx >= 0
+    set_chunk = js[set_idx : set_idx + 2200]
+    assert "clearActiveUserPrompt" in set_chunk
+
+    clear_idx = js.find("function clearStaleLiveTurns")
+    assert clear_idx >= 0
+    clear_chunk = js[clear_idx : clear_idx + 1600]
+    assert "clearActiveUserPrompt" in clear_chunk
 
 
 def test_js_attach_session_live_helper() -> None:
@@ -768,3 +835,39 @@ def test_js_composer_drafts_per_session() -> None:
     assert submit_idx >= 0
     submit_chunk = js[submit_idx : submit_idx + 2200]
     assert "clearComposerDraft" in submit_chunk
+
+
+def test_js_tool_html_preview_discovery() -> None:
+    """Tool rows surface Preview when summary/detail mentions an .html path."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+
+    assert "function extractHtmlPreviewCandidate" in js
+    assert "function toSitePreviewRelPath" in js
+    assert "function htmlPathFromToolRow" in js
+    assert "function refreshToolPreviewAction" in js
+    assert "tool-preview-btn" in js
+    assert "startSitePreview" in js
+    assert "async function startSitePreview" in js
+
+    # Wired from create/update tool lines (user click only; no auto-open)
+    create_idx = js.find("function createToolLine")
+    assert create_idx >= 0
+    create_chunk = js[create_idx : create_idx + 2200]
+    assert "refreshToolPreviewAction" in create_chunk
+
+    update_idx = js.find("function updateToolLine")
+    assert update_idx >= 0
+    update_chunk = js[update_idx : update_idx + 2200]
+    assert "refreshToolPreviewAction" in update_chunk
+
+    refresh_idx = js.find("function refreshToolPreviewAction")
+    assert refresh_idx >= 0
+    refresh_chunk = js[refresh_idx : refresh_idx + 900]
+    assert "startSitePreview" in refresh_chunk
+    assert "tool-preview-btn" in refresh_chunk
+    assert "preventDefault" in refresh_chunk
+    assert "stopPropagation" in refresh_chunk
+
+    assert ".tool-preview-btn" in css
+    assert ".term-line.tool .tool-preview-btn" in css

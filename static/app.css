@@ -1345,7 +1345,8 @@ a {
   min-width: 0;
   max-width: 100%;
   width: 100%;
-  overflow-x: hidden;
+  /* clip (not hidden) so sticky active-prompt can stick to #transcript */
+  overflow-x: clip;
   box-sizing: border-box;
 }
 
@@ -1751,6 +1752,19 @@ a {
   color: var(--user);
 }
 
+/* Active user turn: freeze "You:" at top of transcript while agent streams */
+.term-line.user.active-prompt {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--surface);
+  border-bottom: 1px solid color-mix(in srgb, var(--user) 35%, var(--border));
+  padding-top: 6px;
+  padding-bottom: 8px;
+  margin-bottom: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+}
+
 .term-line.assistant .term-prefix {
   color: var(--assistant);
 }
@@ -1928,6 +1942,15 @@ a {
   white-space: nowrap;
 }
 
+.term-line.tool .tool-preview-btn {
+  flex-shrink: 0;
+  margin-left: 0.35ch;
+  font-size: 11px;
+  padding: 0 6px;
+  min-height: 22px;
+  line-height: 1.2;
+}
+
 .term-line.tool .term-status {
   flex-shrink: 0;
 }
@@ -1954,6 +1977,15 @@ a {
 
 .term-line.tool > summary::before {
   color: var(--muted);
+}
+
+/* No expandable payload yet: mute chevron, default cursor */
+.term-line.tool:not([data-has-detail]) > summary {
+  cursor: default;
+}
+
+.term-line.tool:not([data-has-detail]) > summary::before {
+  color: color-mix(in srgb, var(--muted) 55%, transparent);
 }
 
 .term-line.thought .term-body {
@@ -2299,6 +2331,22 @@ a {
   display: block;
 }
 
+.composer-input::placeholder {
+  color: var(--muted);
+  opacity: 0.72;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.composer-input::-webkit-input-placeholder {
+  color: var(--muted);
+  opacity: 0.72;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .composer-actions {
   display: flex;
   gap: 6px;
@@ -2554,6 +2602,19 @@ a {
   background: rgba(91, 156, 255, 0.1);
 }
 
+.site-preview-scale {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--accent, #5b9cff);
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(91, 156, 255, 0.12);
+  border: 1px solid rgba(91, 156, 255, 0.28);
+  white-space: nowrap;
+  line-height: 1.4;
+  flex: 0 0 auto;
+}
+
 .site-preview-stage {
   flex: 1 1 auto;
   min-height: 0;
@@ -2567,44 +2628,42 @@ a {
   padding: 0;
 }
 
+/* Outer box matches visual size after transform:scale (layout box ≠ scaled paint) */
+.site-preview-scale-shell {
+  flex: 0 0 auto;
+  position: relative;
+  overflow: hidden;
+  margin: 0 auto;
+}
+
 .site-preview-frame-wrap {
   flex: 0 0 auto;
   min-width: 0;
   width: 100%;
-  max-width: 100%;
   height: 100%;
-  margin: 0 auto;
+  margin: 0;
   background: #fff;
-  transition: width 160ms ease, max-width 160ms ease, height 160ms ease;
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04);
   overflow: hidden;
-}
-
-.site-preview-frame-wrap[data-device="desktop"] {
-  width: 100%;
-  max-width: 100%;
-  height: 100%;
-}
-
-.site-preview-frame-wrap[data-device="tablet"] {
-  width: 768px;
-  max-width: min(768px, 100%);
-  height: 100%;
+  transform-origin: top left;
 }
 
 .site-preview-frame-wrap[data-device="mobile"] {
-  width: 390px;
-  max-width: min(390px, 100%);
-  height: min(844px, 100%);
   border-radius: 12px;
+}
+
+.site-preview-frame-wrap.is-scaled {
+  box-shadow:
+    0 0 0 1px rgba(91, 156, 255, 0.35),
+    0 0 0 1px rgba(255, 255, 255, 0.04);
 }
 
 .site-preview-frame {
   display: block;
-  width: 100% !important;
+  width: 100%;
   height: 100%;
   min-width: 0;
-  min-height: 280px;
+  min-height: 0;
   border: 0;
   background: #fff;
 }
@@ -2624,6 +2683,11 @@ a {
   .site-preview-toolbar {
     width: 100%;
     justify-content: space-between;
+  }
+
+  .site-preview-scale {
+    font-size: 10px;
+    padding: 2px 6px;
   }
 }
 

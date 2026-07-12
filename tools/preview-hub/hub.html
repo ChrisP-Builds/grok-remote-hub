@@ -209,45 +209,43 @@
       padding: 16px;
     }
 
+    /* Outer box matches visual size after transform:scale */
+    .scale-shell {
+      flex: 0 0 auto;
+      position: relative;
+      overflow: hidden;
+      margin: 0 auto;
+    }
+
     .frame-wrap {
       flex: 0 0 auto;
       min-width: 0;
       width: 100%;
-      max-width: 100%;
       height: 100%;
       display: flex;
       flex-direction: column;
-      transition: width 0.25s ease, max-width 0.25s ease, height 0.25s ease;
       box-shadow:
         0 0 0 1px var(--border),
         0 16px 48px rgba(0, 0, 0, 0.45);
       border-radius: 10px;
       overflow: hidden;
       background: #fff;
-    }
-
-    .frame-wrap[data-device="desktop"] {
-      width: 100%;
-      max-width: 100%;
-      height: 100%;
-    }
-
-    .frame-wrap[data-device="tablet"] {
-      width: 768px;
-      max-width: min(768px, 100%);
-      height: 100%;
+      transform-origin: top left;
     }
 
     .frame-wrap[data-device="mobile"] {
-      width: 390px;
-      max-width: min(390px, 100%);
-      height: min(844px, 100%);
       border-radius: 16px;
+    }
+
+    .frame-wrap.is-scaled {
+      box-shadow:
+        0 0 0 1px rgba(196, 163, 90, 0.45),
+        0 16px 48px rgba(0, 0, 0, 0.45);
     }
 
     .viewport {
       flex: 1 1 auto;
-      width: 100% !important;
+      width: 100%;
       height: 100%;
       min-width: 0;
       border: none;
@@ -336,13 +334,15 @@
     </header>
 
     <main class="stage">
-      <div class="frame-wrap" id="frameWrap" data-device="desktop">
-        <iframe
-          class="viewport"
-          id="viewport"
-          title="Site preview"
-          sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
-        ></iframe>
+      <div class="scale-shell" id="scaleShell">
+        <div class="frame-wrap" id="frameWrap" data-device="desktop">
+          <iframe
+            class="viewport"
+            id="viewport"
+            title="Site preview"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+          ></iframe>
+        </div>
       </div>
     </main>
 
@@ -360,6 +360,7 @@
     (function () {
       const viewport = document.getElementById('viewport');
       const frameWrap = document.getElementById('frameWrap');
+      const scaleShell = document.getElementById('scaleShell');
       const urlInput = document.getElementById('urlInput');
       const statusUrl = document.getElementById('statusUrl');
       const statusSize = document.getElementById('statusSize');
@@ -460,40 +461,87 @@
         return n || '/';
       }
 
+      /** Logical layout sizes for media queries inside the iframe. */
       const DEVICE_DIMS = {
-        desktop: { width: null, height: null },
-        tablet: { width: 768, height: null },
+        desktop: { width: 1280, height: 800 },
+        tablet: { width: 768, height: 1024 },
         mobile: { width: 390, height: 844 },
       };
 
+      /**
+       * scale = min(1, stageW/logicalW, stageH/logicalH) for desktop/tablet.
+       * Mobile: 1:1 clamp, no transform. Desktop fills stage when room for 1280×800.
+       */
       function applyDeviceViewport() {
         const device = frameWrap.getAttribute('data-device') || 'desktop';
         const dims = DEVICE_DIMS[device] || DEVICE_DIMS.desktop;
-        const stage = frameWrap.parentElement;
-        const stageW = stage ? stage.clientWidth - 32 : frameWrap.clientWidth;
-        const stageH = stage ? stage.clientHeight - 32 : frameWrap.clientHeight;
+        const stage = scaleShell ? scaleShell.parentElement : frameWrap.parentElement;
+        // Stage has padding: 16px (8px on narrow); use content box via clientWidth.
+        const stageW = stage ? stage.clientWidth : 0;
+        const stageH = stage ? stage.clientHeight : 0;
+        // Subtract stage padding so frame fits inside padded area
+        const style = stage ? getComputedStyle(stage) : null;
+        const padX = style
+          ? (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0)
+          : 0;
+        const padY = style
+          ? (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0)
+          : 0;
+        const availW = Math.max(0, stageW - padX);
+        const availH = Math.max(0, stageH - padY);
+        if (availW <= 0 || availH <= 0) return;
 
-        let w;
-        let h;
-        if (device === 'desktop') {
-          w = Math.max(0, stageW);
-          h = Math.max(0, stageH);
-          frameWrap.style.width = '';
-          frameWrap.style.height = '';
+        let logicalW;
+        let logicalH;
+        let scale = 1;
+
+        if (device === 'mobile') {
+          logicalW = Math.min(dims.width, availW);
+          logicalH = Math.min(dims.height, availH);
+          scale = 1;
         } else if (device === 'tablet') {
-          w = Math.min(dims.width, Math.max(0, stageW) || dims.width);
-          h = Math.max(0, stageH);
-          frameWrap.style.width = w + 'px';
-          frameWrap.style.height = h > 0 ? h + 'px' : '';
+          logicalW = dims.width;
+          logicalH = dims.height;
+          scale = Math.min(1, availW / logicalW, availH / logicalH);
+          if (!Number.isFinite(scale) || scale <= 0) scale = 1;
         } else {
-          w = Math.min(dims.width, Math.max(0, stageW) || dims.width);
-          h = Math.min(dims.height, Math.max(0, stageH) || dims.height);
-          frameWrap.style.width = w + 'px';
-          frameWrap.style.height = h + 'px';
+          if (availW >= dims.width && availH >= dims.height) {
+            logicalW = availW;
+            logicalH = availH;
+            scale = 1;
+          } else {
+            logicalW = dims.width;
+            logicalH = dims.height;
+            scale = Math.min(1, availW / logicalW, availH / logicalH);
+            if (!Number.isFinite(scale) || scale <= 0) scale = 1;
+          }
         }
 
-        if (w > 0) viewport.style.width = w + 'px';
-        if (h > 0) viewport.style.height = h + 'px';
+        const scaled = scale < 0.995;
+        const visualW = Math.round(logicalW * scale);
+        const visualH = Math.round(logicalH * scale);
+
+        frameWrap.style.width = logicalW + 'px';
+        frameWrap.style.height = logicalH + 'px';
+        frameWrap.style.maxWidth = 'none';
+        frameWrap.style.maxHeight = 'none';
+        if (scaled) {
+          frameWrap.style.transform = 'scale(' + scale + ')';
+          frameWrap.style.transformOrigin = 'top left';
+          frameWrap.classList.add('is-scaled');
+        } else {
+          frameWrap.style.transform = '';
+          frameWrap.style.transformOrigin = '';
+          frameWrap.classList.remove('is-scaled');
+        }
+
+        viewport.style.width = logicalW + 'px';
+        viewport.style.height = logicalH + 'px';
+
+        if (scaleShell) {
+          scaleShell.style.width = visualW + 'px';
+          scaleShell.style.height = visualH + 'px';
+        }
 
         try {
           if (viewport.contentWindow) {
@@ -501,13 +549,17 @@
           }
         } catch { /* not ready or cross-origin */ }
 
-        updateSize();
+        updateSize(logicalW, logicalH, scale);
       }
 
-      function updateSize() {
-        const w = Math.round(viewport.clientWidth || frameWrap.clientWidth);
-        const h = Math.round(viewport.clientHeight || frameWrap.clientHeight);
-        statusSize.textContent = w + ' × ' + h;
+      function updateSize(logicalW, logicalH, scale) {
+        const w = Math.round(logicalW || viewport.clientWidth || frameWrap.clientWidth);
+        const h = Math.round(logicalH || viewport.clientHeight || frameWrap.clientHeight);
+        let text = w + ' \u00d7 ' + h;
+        if (typeof scale === 'number' && scale < 0.995) {
+          text += ' \u00b7 Scaled ' + Math.round(scale * 100) + '%';
+        }
+        statusSize.textContent = text;
       }
 
       goBtn.addEventListener('click', () => navigate(urlInput.value || '/'));
@@ -551,7 +603,7 @@
       const ro = new ResizeObserver(() => {
         applyDeviceViewport();
       });
-      ro.observe(frameWrap.parentElement || frameWrap);
+      ro.observe((scaleShell && scaleShell.parentElement) || frameWrap.parentElement || frameWrap);
 
       // Initial load
       navigate('/');

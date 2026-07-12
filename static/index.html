@@ -151,7 +151,7 @@
               id="composer-input"
               class="composer-input"
               rows="1"
-              placeholder="Message… (/ for commands)"
+              placeholder="Message…"
               disabled
               enterkeyhint="send"
               spellcheck="true"
@@ -241,18 +241,21 @@
             <button type="button" class="btn btn-ghost btn-sm site-preview-preset" data-device="tablet" aria-pressed="false">Tablet</button>
             <button type="button" class="btn btn-ghost btn-sm site-preview-preset" data-device="mobile" aria-pressed="false">Mobile</button>
           </div>
+          <span id="site-preview-scale" class="site-preview-scale hidden" aria-live="polite"></span>
           <button type="button" id="btn-site-preview-open" class="btn btn-ghost btn-sm" title="Open in new tab">Open tab</button>
           <button type="button" class="btn btn-ghost btn-icon" data-close="modal-site-preview" aria-label="Close">×</button>
         </div>
       </header>
       <div class="site-preview-stage">
-        <div id="site-preview-frame-wrap" class="site-preview-frame-wrap" data-device="desktop">
-          <iframe
-            id="site-preview-frame"
-            class="site-preview-frame"
-            title="Site preview"
-            sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
-          ></iframe>
+        <div id="site-preview-scale-shell" class="site-preview-scale-shell">
+          <div id="site-preview-frame-wrap" class="site-preview-frame-wrap" data-device="desktop">
+            <iframe
+              id="site-preview-frame"
+              class="site-preview-frame"
+              title="Site preview"
+              sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+            ></iframe>
+          </div>
         </div>
       </div>
     </div>
