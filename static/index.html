@@ -226,6 +226,37 @@
     </div>
   </div>
 
+  <div id="modal-site-preview" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-site-preview-title">
+    <div class="modal-backdrop" data-close="modal-site-preview"></div>
+    <div class="modal-card modal-card-site-preview">
+      <header class="modal-header site-preview-header">
+        <div class="site-preview-title-wrap">
+          <h2 id="modal-site-preview-title">Site preview</h2>
+          <span id="site-preview-path" class="site-preview-path muted" title=""></span>
+        </div>
+        <div class="site-preview-toolbar">
+          <div class="site-preview-presets" role="group" aria-label="Device width">
+            <button type="button" class="btn btn-ghost btn-sm site-preview-preset" data-device="desktop" aria-pressed="true">Desktop</button>
+            <button type="button" class="btn btn-ghost btn-sm site-preview-preset" data-device="tablet" aria-pressed="false">Tablet</button>
+            <button type="button" class="btn btn-ghost btn-sm site-preview-preset" data-device="mobile" aria-pressed="false">Mobile</button>
+          </div>
+          <button type="button" id="btn-site-preview-open" class="btn btn-ghost btn-sm" title="Open in new tab">Open tab</button>
+          <button type="button" class="btn btn-ghost btn-icon" data-close="modal-site-preview" aria-label="Close">×</button>
+        </div>
+      </header>
+      <div class="site-preview-stage">
+        <div id="site-preview-frame-wrap" class="site-preview-frame-wrap" data-device="desktop">
+          <iframe
+            id="site-preview-frame"
+            class="site-preview-frame"
+            title="Site preview"
+            sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+          ></iframe>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Fixed outside topbar so overflow:hidden does not clip the bubble -->
   <div id="meta-popover" class="meta-popover hidden" role="tooltip" aria-live="polite"></div>
 

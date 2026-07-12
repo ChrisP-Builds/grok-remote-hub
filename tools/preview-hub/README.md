@@ -4,6 +4,12 @@ Lightweight local companion for viewing **static sites** (and optional SPAs) in 
 
 **Not** the Python Remote Hub agent UI (that process listens on `:8787`). Preview Hub is a separate Node process.
 
+## Prefer in-hub preview when possible
+
+If you already have the Python hub open with a session on your project: in the **Files** tree, double-click an `.html` / `.htm` file or tap **Preview**. The hub serves that folder same-origin (relative CSS/JS work; Tailscale/phone friendly). Closing the modal stops the preview. No Node required for that path.
+
+Use this CLI companion when you want a standalone preview outside the hub, SPA fallback flags, or a fixed port without a live hub session.
+
 Node **stdlib only**. No extra `npm install` for runtime. Requires **Node 18+** (ES modules).
 
 ## Desktop (recommended)

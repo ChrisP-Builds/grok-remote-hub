@@ -418,6 +418,11 @@
     askUserBody: $("#ask-user-body"),
     btnAskUserSubmit: $("#btn-ask-user-submit"),
     btnAskUserCancel: $("#btn-ask-user-cancel"),
+    modalSitePreview: $("#modal-site-preview"),
+    sitePreviewPath: $("#site-preview-path"),
+    sitePreviewFrame: $("#site-preview-frame"),
+    sitePreviewFrameWrap: $("#site-preview-frame-wrap"),
+    btnSitePreviewOpen: $("#btn-site-preview-open"),
     projectList: $("#project-list"),
     projectSearch: $("#project-search"),
     projectEmpty: $("#project-empty"),
@@ -4757,11 +4762,147 @@
     return /\.(png|jpe?g|gif|webp|bmp|svg|ico)$/i.test(String(path || ""));
   }
 
+  function isHtmlPath(path) {
+    return /\.html?$/i.test(String(path || ""));
+  }
+
   function rawFsUrl(root, rel) {
     const q =
       `/api/fs/raw?root=${encodeURIComponent(root)}` +
       `&path=${encodeURIComponent(rel)}`;
     return apiUrl(q);
+  }
+
+  let sitePreviewUrl = "";
+  let sitePreviewDevice = "desktop";
+
+  const SITE_PREVIEW_DEVICE_DIMS = {
+    desktop: { width: null, height: null },
+    tablet: { width: 768, height: null },
+    mobile: { width: 390, height: 844 },
+  };
+
+  function applySitePreviewIframeSize() {
+    const wrap = els.sitePreviewFrameWrap;
+    const iframe = els.sitePreviewFrame;
+    if (!wrap || !iframe) return;
+
+    const d = sitePreviewDevice;
+    const dims = SITE_PREVIEW_DEVICE_DIMS[d] || SITE_PREVIEW_DEVICE_DIMS.desktop;
+    const stage = wrap.parentElement;
+    const stageW = stage ? stage.clientWidth : wrap.clientWidth;
+    const stageH = stage ? stage.clientHeight : wrap.clientHeight;
+
+    let w;
+    let h;
+    if (d === "desktop") {
+      w = stageW;
+      h = stageH;
+    } else if (d === "tablet") {
+      w = Math.min(dims.width, stageW || dims.width);
+      h = stageH || wrap.clientHeight;
+    } else {
+      w = Math.min(dims.width, stageW || dims.width);
+      h = Math.min(dims.height, stageH || dims.height);
+    }
+
+    if (w > 0) {
+      wrap.style.width = w + "px";
+      iframe.style.width = w + "px";
+    }
+    if (h > 0) {
+      wrap.style.height = h + "px";
+      iframe.style.height = h + "px";
+    }
+
+    try {
+      if (iframe.contentWindow) {
+        iframe.contentWindow.dispatchEvent(new Event("resize"));
+      }
+    } catch (_) {
+      /* cross-origin or not ready */
+    }
+  }
+
+  function setSitePreviewDevice(device) {
+    const d =
+      device === "tablet" || device === "mobile" ? device : "desktop";
+    sitePreviewDevice = d;
+    if (els.sitePreviewFrameWrap) {
+      els.sitePreviewFrameWrap.dataset.device = d;
+      // Clear inline sizes so CSS device rules apply before measure
+      if (d === "desktop") {
+        els.sitePreviewFrameWrap.style.width = "";
+        els.sitePreviewFrameWrap.style.height = "";
+      }
+    }
+    $$(".site-preview-preset").forEach((btn) => {
+      const on = btn.getAttribute("data-device") === d;
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+    requestAnimationFrame(() => {
+      applySitePreviewIframeSize();
+      requestAnimationFrame(applySitePreviewIframeSize);
+    });
+  }
+
+  async function startSitePreview(rel) {
+    const root =
+      state.fs.root || (state.selectedMeta && state.selectedMeta.cwd) || "";
+    if (!root) {
+      toast("No project root for this session", "danger");
+      return;
+    }
+    if (!isHtmlPath(rel)) {
+      toast("Preview only works for .html files", "danger");
+      return;
+    }
+    try {
+      const res = await fetch(apiUrl("/api/preview/start"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root, path: rel }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(data.error || `Preview failed (HTTP ${res.status})`, "danger");
+        return;
+      }
+      const previewUrl = data.previewUrl || "/preview-site/";
+      sitePreviewUrl = apiUrl(previewUrl);
+      if (els.sitePreviewFrame) {
+        els.sitePreviewFrame.src = sitePreviewUrl;
+      }
+      if (els.sitePreviewPath) {
+        els.sitePreviewPath.textContent = rel;
+        els.sitePreviewPath.title = rel;
+      }
+      setSitePreviewDevice("desktop");
+      if (els.modalSitePreview) {
+        els.modalSitePreview.classList.remove("hidden");
+      }
+      // Re-measure after modal is visible so stage has real dimensions
+      requestAnimationFrame(() => {
+        setSitePreviewDevice(sitePreviewDevice);
+      });
+    } catch (err) {
+      toast(String(err && err.message ? err.message : err), "danger");
+    }
+  }
+
+  async function stopSitePreview() {
+    if (els.sitePreviewFrame) {
+      els.sitePreviewFrame.src = "about:blank";
+    }
+    sitePreviewUrl = "";
+    if (els.modalSitePreview) {
+      els.modalSitePreview.classList.add("hidden");
+    }
+    try {
+      await fetch(apiUrl("/api/preview/stop"), { method: "POST" });
+    } catch (_) {
+      /* ignore network errors on close */
+    }
   }
 
   function hideImagePreview() {
@@ -5159,10 +5300,36 @@
           btn.appendChild(meta);
         }
 
+        if (type === "file" && isHtmlPath(name)) {
+          // span, not button: file row is already a <button>
+          const prevBtn = document.createElement("span");
+          prevBtn.className = "file-preview-btn";
+          prevBtn.textContent = "Preview";
+          prevBtn.title = "Preview site (relative CSS/JS)";
+          prevBtn.setAttribute("role", "button");
+          prevBtn.tabIndex = 0;
+          const runPreview = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            startSitePreview(rel);
+          };
+          prevBtn.addEventListener("click", runPreview);
+          prevBtn.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" || e.key === " ") runPreview(e);
+          });
+          btn.appendChild(prevBtn);
+        }
+
         if (type === "dir") {
           btn.addEventListener("click", () => toggleDir(rel));
         } else {
           btn.addEventListener("click", () => openFile(rel));
+          if (isHtmlPath(name)) {
+            btn.addEventListener("dblclick", (e) => {
+              e.preventDefault();
+              startSitePreview(rel);
+            });
+          }
         }
         els.fileTree.appendChild(btn);
 
@@ -5932,6 +6099,14 @@
           closeLightbox();
           return;
         }
+        if (
+          els.modalSitePreview &&
+          !els.modalSitePreview.classList.contains("hidden")
+        ) {
+          e.preventDefault();
+          stopSitePreview();
+          return;
+        }
         if (els.modalAskUser && !els.modalAskUser.classList.contains("hidden")) {
           e.preventDefault();
           cancelAskUserQuestion();
@@ -5966,8 +6141,20 @@
         const id = el.getAttribute("data-close");
         if (id === "modal-new") closeNewModal();
         if (id === "modal-ask-user") cancelAskUserQuestion();
+        if (id === "modal-site-preview") stopSitePreview();
       });
     });
+    $$(".site-preview-preset").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        setSitePreviewDevice(btn.getAttribute("data-device") || "desktop");
+      });
+    });
+    if (els.btnSitePreviewOpen) {
+      els.btnSitePreviewOpen.addEventListener("click", () => {
+        if (!sitePreviewUrl) return;
+        window.open(sitePreviewUrl, "_blank", "noopener,noreferrer");
+      });
+    }
     if (els.btnAskUserSubmit) {
       els.btnAskUserSubmit.addEventListener("click", () => {
         submitAskUserAnswers();

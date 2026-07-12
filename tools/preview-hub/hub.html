@@ -204,19 +204,20 @@
       background:
         radial-gradient(ellipse at 50% 0%, #1c2030 0%, var(--bg) 55%);
       display: flex;
-      align-items: stretch;
+      align-items: center;
       justify-content: center;
       padding: 16px;
     }
 
     .frame-wrap {
-      flex: 0 1 auto;
+      flex: 0 0 auto;
+      min-width: 0;
       width: 100%;
       max-width: 100%;
       height: 100%;
       display: flex;
       flex-direction: column;
-      transition: max-width 0.25s ease;
+      transition: width 0.25s ease, max-width 0.25s ease, height 0.25s ease;
       box-shadow:
         0 0 0 1px var(--border),
         0 16px 48px rgba(0, 0, 0, 0.45);
@@ -225,14 +226,30 @@
       background: #fff;
     }
 
-    .frame-wrap[data-device="tablet"] { max-width: 768px; }
-    .frame-wrap[data-device="mobile"] { max-width: 390px; }
-    .frame-wrap[data-device="desktop"] { max-width: 100%; }
+    .frame-wrap[data-device="desktop"] {
+      width: 100%;
+      max-width: 100%;
+      height: 100%;
+    }
+
+    .frame-wrap[data-device="tablet"] {
+      width: 768px;
+      max-width: min(768px, 100%);
+      height: 100%;
+    }
+
+    .frame-wrap[data-device="mobile"] {
+      width: 390px;
+      max-width: min(390px, 100%);
+      height: min(844px, 100%);
+      border-radius: 16px;
+    }
 
     .viewport {
-      flex: 1;
-      width: 100%;
+      flex: 1 1 auto;
+      width: 100% !important;
       height: 100%;
+      min-width: 0;
       border: none;
       display: block;
       background: #fff;
@@ -443,9 +460,53 @@
         return n || '/';
       }
 
+      const DEVICE_DIMS = {
+        desktop: { width: null, height: null },
+        tablet: { width: 768, height: null },
+        mobile: { width: 390, height: 844 },
+      };
+
+      function applyDeviceViewport() {
+        const device = frameWrap.getAttribute('data-device') || 'desktop';
+        const dims = DEVICE_DIMS[device] || DEVICE_DIMS.desktop;
+        const stage = frameWrap.parentElement;
+        const stageW = stage ? stage.clientWidth - 32 : frameWrap.clientWidth;
+        const stageH = stage ? stage.clientHeight - 32 : frameWrap.clientHeight;
+
+        let w;
+        let h;
+        if (device === 'desktop') {
+          w = Math.max(0, stageW);
+          h = Math.max(0, stageH);
+          frameWrap.style.width = '';
+          frameWrap.style.height = '';
+        } else if (device === 'tablet') {
+          w = Math.min(dims.width, Math.max(0, stageW) || dims.width);
+          h = Math.max(0, stageH);
+          frameWrap.style.width = w + 'px';
+          frameWrap.style.height = h > 0 ? h + 'px' : '';
+        } else {
+          w = Math.min(dims.width, Math.max(0, stageW) || dims.width);
+          h = Math.min(dims.height, Math.max(0, stageH) || dims.height);
+          frameWrap.style.width = w + 'px';
+          frameWrap.style.height = h + 'px';
+        }
+
+        if (w > 0) viewport.style.width = w + 'px';
+        if (h > 0) viewport.style.height = h + 'px';
+
+        try {
+          if (viewport.contentWindow) {
+            viewport.contentWindow.dispatchEvent(new Event('resize'));
+          }
+        } catch { /* not ready or cross-origin */ }
+
+        updateSize();
+      }
+
       function updateSize() {
-        const w = Math.round(frameWrap.clientWidth);
-        const h = Math.round(frameWrap.clientHeight);
+        const w = Math.round(viewport.clientWidth || frameWrap.clientWidth);
+        const h = Math.round(viewport.clientHeight || frameWrap.clientHeight);
         statusSize.textContent = w + ' × ' + h;
       }
 
@@ -480,17 +541,21 @@
           const device = btn.getAttribute('data-device') || 'desktop';
           frameWrap.setAttribute('data-device', device);
           presets.forEach((b) => b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'));
-          requestAnimationFrame(updateSize);
-          setTimeout(updateSize, 280);
+          requestAnimationFrame(() => {
+            applyDeviceViewport();
+            requestAnimationFrame(applyDeviceViewport);
+          });
         });
       });
 
-      const ro = new ResizeObserver(updateSize);
-      ro.observe(frameWrap);
+      const ro = new ResizeObserver(() => {
+        applyDeviceViewport();
+      });
+      ro.observe(frameWrap.parentElement || frameWrap);
 
       // Initial load
       navigate('/');
-      updateSize();
+      requestAnimationFrame(applyDeviceViewport);
     })();
   </script>
 </body>
