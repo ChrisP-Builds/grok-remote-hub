@@ -70,6 +70,15 @@ The stock Grok CLI TUI is excellent on the desktop, but it is a **single local p
 - **Usage** — session context + weekly plan bars (from local Grok login)
 - **Ops scripts** — detached start / stop / restart, firewall helper, logon task
 - **Terminal follower** — `follow.ps1` tails the same session in a desktop terminal
+- **Browser Preview Hub** — optional Node companion for static sites / SPAs (iframe chrome, device presets) when the editor has no Simple Browser; see [tools/preview-hub/README.md](tools/preview-hub/README.md)
+
+```bash
+npm run preview
+# or
+node tools/preview-hub/server.mjs --open
+```
+
+Node 18+ (ES modules), stdlib only. Separate from the Python hub on `:8787`.
 
 ---
 
@@ -241,9 +250,9 @@ See **[CONTRIBUTING.md](CONTRIBUTING.md)** and **[docs/RELEASE_READINESS.md](doc
 
 ---
 
-## Known limits (v0.2)
+## Known limits (v0.3)
 
-- **One live turn at a time** (sole ACP connection)
+- **Multi-project concurrent live turns** supported (default max 3 different project cwds; configure `max_concurrent_turns` under `[hub]`). Same-project follow-ups still queue. Sole ACP connection; multi-process agent pool is a future scale-out if needed.
 - Cancel is best-effort (depends on agent support)
 - History / session list caps (defaults suitable for a personal hub)
 - **Windows-first** ops scripts

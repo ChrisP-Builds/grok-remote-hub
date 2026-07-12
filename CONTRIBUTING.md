@@ -28,6 +28,8 @@ python -m pytest tests/test_e2e_smoke.py -v
 
 Prefer the **Python** Playwright suite. Optional Node Playwright (`package.json`) can hang on some Windows/Node builds.
 
+Optional **Preview Hub** (`tools/preview-hub/`) is a Node stdlib companion for static-site preview in browser chrome. Not required for Python tests or the agent hub.
+
 ## After hub code changes
 
 Use detached restart (safe from a hub-owned agent session):

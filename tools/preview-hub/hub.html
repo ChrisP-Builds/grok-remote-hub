@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Preview Hub — Grok Remote Hub</title>
+  <style>
+    :root {
+      --bg: #12141a;
+      --bg-elevated: #1a1d26;
+      --bg-bar: #0e1015;
+      --border: #2a2e3a;
+      --text: #e8e6e1;
+      --text-muted: #9a968c;
+      --accent: #c4a35a;
+      --accent-dim: #8a7340;
+      --accent-soft: rgba(196, 163, 90, 0.15);
+      --danger: #c45a5a;
+      --radius: 8px;
+      --font: "Segoe UI", system-ui, -apple-system, sans-serif;
+      --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      overflow: hidden;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      height: 100%;
+      min-height: 100dvh;
+    }
+
+    /* ── Top bar ── */
+    .topbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 14px;
+      padding: 10px 14px;
+      background: var(--bg-bar);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .wordmark {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+      user-select: none;
+    }
+
+    .wordmark-mark {
+      width: 22px;
+      height: 22px;
+      border-radius: 4px;
+      background: linear-gradient(145deg, var(--accent) 0%, var(--accent-dim) 100%);
+      box-shadow: 0 0 0 1px rgba(196, 163, 90, 0.35);
+    }
+
+    .wordmark-text {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text);
+    }
+
+    .wordmark-text span {
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    .nav-cluster {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 1 1 280px;
+      min-width: 0;
+    }
+
+    .url-field {
+      flex: 1 1 auto;
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 0;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      transition: border-color 0.15s ease;
+    }
+
+    .url-field:focus-within {
+      border-color: var(--accent-dim);
+      box-shadow: 0 0 0 2px var(--accent-soft);
+    }
+
+    .url-prefix {
+      padding: 0 0 0 10px;
+      color: var(--text-muted);
+      font-family: var(--mono);
+      font-size: 12px;
+      flex-shrink: 0;
+    }
+
+    .url-input {
+      flex: 1;
+      min-width: 0;
+      border: none;
+      background: transparent;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 13px;
+      padding: 8px 10px 8px 4px;
+      outline: none;
+    }
+
+    .url-input::placeholder { color: var(--text-muted); }
+
+    .btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--bg-elevated);
+      color: var(--text);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 500;
+      padding: 8px 12px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+    }
+
+    .btn:hover {
+      background: #222632;
+      border-color: #3a4050;
+    }
+
+    .btn:active { transform: translateY(1px); }
+
+    .btn-primary {
+      background: var(--accent-soft);
+      border-color: var(--accent-dim);
+      color: var(--accent);
+    }
+
+    .btn-primary:hover {
+      background: rgba(196, 163, 90, 0.25);
+      border-color: var(--accent);
+    }
+
+    .btn-icon {
+      padding: 8px 10px;
+      line-height: 1;
+    }
+
+    .presets {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex-shrink: 0;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 3px;
+    }
+
+    .preset {
+      appearance: none;
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      font: inherit;
+      font-size: 12px;
+      font-weight: 500;
+      padding: 6px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background 0.12s ease, color 0.12s ease;
+    }
+
+    .preset:hover { color: var(--text); }
+
+    .preset[aria-pressed="true"] {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    /* ── Stage ── */
+    .stage {
+      position: relative;
+      overflow: auto;
+      background:
+        radial-gradient(ellipse at 50% 0%, #1c2030 0%, var(--bg) 55%);
+      display: flex;
+      align-items: stretch;
+      justify-content: center;
+      padding: 16px;
+    }
+
+    .frame-wrap {
+      flex: 0 1 auto;
+      width: 100%;
+      max-width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      transition: max-width 0.25s ease;
+      box-shadow:
+        0 0 0 1px var(--border),
+        0 16px 48px rgba(0, 0, 0, 0.45);
+      border-radius: 10px;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .frame-wrap[data-device="tablet"] { max-width: 768px; }
+    .frame-wrap[data-device="mobile"] { max-width: 390px; }
+    .frame-wrap[data-device="desktop"] { max-width: 100%; }
+
+    .viewport {
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+      background: #fff;
+    }
+
+    /* ── Status ── */
+    .statusbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px 16px;
+      padding: 6px 14px;
+      background: var(--bg-bar);
+      border-top: 1px solid var(--border);
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: var(--mono);
+    }
+
+    .status-item strong {
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      box-shadow: 0 0 6px var(--accent-dim);
+      flex-shrink: 0;
+    }
+
+    .status-msg {
+      color: var(--danger);
+      display: none;
+    }
+
+    .status-msg.is-visible { display: inline; }
+
+    .grow { flex: 1; }
+
+    @media (max-width: 720px) {
+      .topbar { padding: 8px 10px; }
+      .wordmark-text { display: none; }
+      .presets .preset { padding: 6px 8px; font-size: 11px; }
+      .btn { padding: 8px 10px; }
+      .stage { padding: 8px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="wordmark" title="Grok Remote Hub · Preview">
+        <div class="wordmark-mark" aria-hidden="true"></div>
+        <div class="wordmark-text">Preview <span>Hub</span></div>
+      </div>
+
+      <div class="nav-cluster">
+        <div class="url-field">
+          <span class="url-prefix" aria-hidden="true">/</span>
+          <input
+            id="urlInput"
+            class="url-input"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="path within site (e.g. about or css/styles.css)"
+            value=""
+            aria-label="Path within site"
+          />
+        </div>
+        <button type="button" class="btn btn-primary" id="goBtn">Go</button>
+        <button type="button" class="btn btn-icon" id="reloadBtn" title="Reload iframe">Reload</button>
+        <button type="button" class="btn" id="openTabBtn" title="Open current path in a new tab">Open tab</button>
+      </div>
+
+      <div class="presets" role="group" aria-label="Device width">
+        <button type="button" class="preset" data-device="desktop" aria-pressed="true">Desktop</button>
+        <button type="button" class="preset" data-device="tablet" aria-pressed="false">Tablet</button>
+        <button type="button" class="preset" data-device="mobile" aria-pressed="false">Mobile</button>
+      </div>
+    </header>
+
+    <main class="stage">
+      <div class="frame-wrap" id="frameWrap" data-device="desktop">
+        <iframe
+          class="viewport"
+          id="viewport"
+          title="Site preview"
+          sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+        ></iframe>
+      </div>
+    </main>
+
+    <footer class="statusbar">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span class="status-item">URL <strong id="statusUrl">/</strong></span>
+      <span class="status-item">Viewport <strong id="statusSize">—</strong></span>
+      <span class="grow"></span>
+      <span class="status-msg" id="statusMsg" role="status"></span>
+      <span class="status-item">same-origin only</span>
+    </footer>
+  </div>
+
+  <script>
+    (function () {
+      const viewport = document.getElementById('viewport');
+      const frameWrap = document.getElementById('frameWrap');
+      const urlInput = document.getElementById('urlInput');
+      const statusUrl = document.getElementById('statusUrl');
+      const statusSize = document.getElementById('statusSize');
+      const statusMsg = document.getElementById('statusMsg');
+      const goBtn = document.getElementById('goBtn');
+      const reloadBtn = document.getElementById('reloadBtn');
+      const openTabBtn = document.getElementById('openTabBtn');
+      const presets = document.querySelectorAll('.preset');
+
+      // Preserve preview token for same-origin navigations when auth is on
+      const hubParams = new URLSearchParams(location.search);
+      const token = hubParams.get('token') || '';
+
+      function withToken(path) {
+        if (!token) return path;
+        const u = new URL(path, location.origin);
+        if (!u.searchParams.has('token')) u.searchParams.set('token', token);
+        return u.pathname + u.search + u.hash;
+      }
+
+      function showMsg(text) {
+        if (!text) {
+          statusMsg.textContent = '';
+          statusMsg.classList.remove('is-visible');
+          return;
+        }
+        statusMsg.textContent = text;
+        statusMsg.classList.add('is-visible');
+      }
+
+      /**
+       * Normalize user input to a same-origin path.
+       * Accepts: "/", "about", "/css/x.css", full same-origin URL.
+       * Rejects external hosts.
+       */
+      function normalizePath(raw) {
+        const s = (raw || '').trim();
+        if (!s || s === '/') return '/';
+
+        // Absolute URL?
+        if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s)) {
+          let u;
+          try {
+            u = new URL(s);
+          } catch {
+            return { error: 'Invalid URL' };
+          }
+          if (u.origin !== location.origin) {
+            return { error: 'External URLs blocked (same-origin only)' };
+          }
+          return u.pathname + u.search + u.hash;
+        }
+
+        // Protocol-relative
+        if (s.startsWith('//')) {
+          return { error: 'External URLs blocked (same-origin only)' };
+        }
+
+        let path = s.startsWith('/') ? s : '/' + s;
+        // Block path tricks that leave origin in the address bar sense
+        if (path.includes('://')) {
+          return { error: 'Invalid path' };
+        }
+        return path;
+      }
+
+      function setStatusFromPath(path) {
+        statusUrl.textContent = path || '/';
+      }
+
+      function navigate(raw) {
+        const result = normalizePath(raw);
+        if (result && typeof result === 'object' && result.error) {
+          showMsg(result.error);
+          return;
+        }
+        showMsg('');
+        const path = result;
+        const target = withToken(path);
+        viewport.src = target;
+        // Show clean path in UI (without forcing token into the field)
+        // Keep leading slash out of the input since prefix shows "/"
+        let fieldVal = path;
+        if (fieldVal.startsWith('/')) fieldVal = fieldVal.slice(1);
+        // Strip token from field display if present
+        try {
+          const u = new URL(path, location.origin);
+          u.searchParams.delete('token');
+          fieldVal = (u.pathname + u.search + u.hash).replace(/^\//, '');
+        } catch { /* keep */ }
+        urlInput.value = fieldVal;
+        setStatusFromPath(path.startsWith('/') ? path : '/' + path);
+      }
+
+      function currentPath() {
+        const n = normalizePath(urlInput.value || '/');
+        if (n && typeof n === 'object' && n.error) return '/';
+        return n || '/';
+      }
+
+      function updateSize() {
+        const w = Math.round(frameWrap.clientWidth);
+        const h = Math.round(frameWrap.clientHeight);
+        statusSize.textContent = w + ' × ' + h;
+      }
+
+      goBtn.addEventListener('click', () => navigate(urlInput.value || '/'));
+      urlInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          navigate(urlInput.value || '/');
+        }
+      });
+
+      reloadBtn.addEventListener('click', () => {
+        try {
+          // Prefer reload of current iframe document
+          if (viewport.contentWindow) {
+            viewport.contentWindow.location.reload();
+          } else {
+            navigate(currentPath());
+          }
+        } catch {
+          navigate(currentPath());
+        }
+      });
+
+      openTabBtn.addEventListener('click', () => {
+        const path = currentPath();
+        window.open(withToken(path), '_blank', 'noopener,noreferrer');
+      });
+
+      presets.forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const device = btn.getAttribute('data-device') || 'desktop';
+          frameWrap.setAttribute('data-device', device);
+          presets.forEach((b) => b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'));
+          requestAnimationFrame(updateSize);
+          setTimeout(updateSize, 280);
+        });
+      });
+
+      const ro = new ResizeObserver(updateSize);
+      ro.observe(frameWrap);
+
+      // Initial load
+      navigate('/');
+      updateSize();
+    })();
+  </script>
+</body>
+</html>
