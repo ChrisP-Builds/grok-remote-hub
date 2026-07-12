@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import re
 import secrets
 import subprocess
@@ -23,6 +24,11 @@ from hub.fs_browser import (
     read_text as fs_read_text,
     resolve_file_for_read,
     write_text as fs_write_text,
+)
+from hub.site_preview import (
+    SitePreviewError,
+    SitePreviewManager,
+    build_preview_plan,
 )
 from hub.history import load_session_history
 from hub.projects import ProjectError, create_project
@@ -177,6 +183,7 @@ class Hub:
         self._max_concurrent_turns = max(1, int(getattr(config, "max_concurrent_turns", 3) or 3))
         self._app: web.Application | None = None
         self._status_resync_task: asyncio.Task | None = None
+        self.site_preview = SitePreviewManager()
         self._last_broadcast_force_clear: str | None = None
         self.cli_version: str | None = None
         self.compat: dict[str, Any] = {
@@ -850,6 +857,13 @@ class Hub:
         app.router.add_get("/api/fs/read", self.handle_fs_read)
         app.router.add_get("/api/fs/raw", self.handle_fs_raw)
         app.router.add_put("/api/fs/write", self.handle_fs_write)
+        app.router.add_post("/api/preview/start", self.handle_preview_start)
+        app.router.add_post("/api/preview/stop", self.handle_preview_stop)
+        app.router.add_get("/api/preview/status", self.handle_preview_status)
+        # Register before static / so preview paths are not swallowed.
+        app.router.add_get("/preview-site", self.handle_preview_site)
+        app.router.add_get("/preview-site/", self.handle_preview_site)
+        app.router.add_get("/preview-site/{path:.*}", self.handle_preview_site)
         app.router.add_get("/ws", self.handle_ws)
         static_dir = Path(self.config.static_dir)
         if static_dir.is_dir():
@@ -911,6 +925,7 @@ class Hub:
                 await task
             except asyncio.CancelledError:
                 pass
+        self.site_preview.stop()
         await self.tailer.stop()
         await self.acp.stop()
         # Leave agent serve up across hub bounce (code deploy / restart-hub).
@@ -1277,6 +1292,87 @@ class Hub:
             log.exception("fs write failed")
             return web.json_response({"error": "internal error"}, status=500)
         return web.json_response(result)
+
+    async def handle_preview_start(self, request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid json"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "invalid json"}, status=400)
+        root = body.get("root")
+        if root is None or not str(root).strip():
+            return web.json_response({"error": "root required"}, status=400)
+        path = body.get("path")
+        if path is None or not str(path).strip():
+            return web.json_response({"error": "path required"}, status=400)
+        try:
+            plan = build_preview_plan(
+                self.config.projects_root, str(root).strip(), str(path).strip()
+            )
+            self.site_preview.start(plan)
+        except SitePreviewError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception:
+            log.exception("preview start failed")
+            return web.json_response({"error": "internal error"}, status=500)
+        entry = plan["entry_url_path"]
+        return web.json_response(
+            {
+                "ok": True,
+                "siteRoot": str(plan["site_root"]),
+                "entryPath": entry,
+                "previewUrl": f"/preview-site/{entry}",
+                "hubUrl": "/preview-site/",
+            }
+        )
+
+    async def handle_preview_stop(self, request: web.Request) -> web.Response:
+        self.site_preview.stop()
+        return web.json_response({"ok": True})
+
+    async def handle_preview_status(self, request: web.Request) -> web.Response:
+        return web.json_response(self.site_preview.status())
+
+    async def handle_preview_site(self, request: web.Request) -> web.Response:
+        if not self.site_preview.active:
+            return web.Response(
+                text="no active preview",
+                status=404,
+                content_type="text/plain",
+                headers={"Cache-Control": "no-store"},
+            )
+        # Prefer named path param; fall back to path after /preview-site/
+        url_path = request.match_info.get("path")
+        if url_path is None:
+            raw = request.path or ""
+            prefix = "/preview-site"
+            if raw.startswith(prefix):
+                url_path = raw[len(prefix) :].lstrip("/")
+            else:
+                url_path = ""
+        file_path = self.site_preview.resolve_file(url_path or "")
+        if file_path is None:
+            return web.Response(
+                text="not found",
+                status=404,
+                content_type="text/plain",
+                headers={"Cache-Control": "no-store"},
+            )
+        ctype, _ = mimetypes.guess_type(str(file_path))
+        if not ctype:
+            ctype = "application/octet-stream"
+        # HTML: charset so scripts/CSS parse reliably
+        if ctype == "text/html":
+            ctype = "text/html; charset=utf-8"
+        return web.FileResponse(
+            path=file_path,
+            headers={
+                "Content-Type": ctype,
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     async def handle_new_session(self, request: web.Request) -> web.Response:
         try:

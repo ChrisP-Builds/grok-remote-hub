@@ -67,10 +67,11 @@ The stock Grok CLI TUI is excellent on the desktop, but it is a **single local p
 - **History** — hydrate from `updates.jsonl` when you open a session
 - **Composer** — multi-line input, slash palette, prompt queue while a turn runs
 - **Files** — sandboxed tree for the session cwd (edit, markdown + Mermaid, images)
+- **Site preview** — double-click or **Preview** on `.html` / `.htm` in the Files tree; same-origin Python serve (relative CSS/JS work on Tailscale/phone); Close stops the preview
 - **Usage** — session context + weekly plan bars (from local Grok login)
 - **Ops scripts** — detached start / stop / restart, firewall helper, logon task
 - **Terminal follower** — `follow.ps1` tails the same session in a desktop terminal
-- **Browser Preview Hub** — optional Node companion for static sites / SPAs (iframe chrome, device presets) when the editor has no Simple Browser; see [tools/preview-hub/README.md](tools/preview-hub/README.md)
+- **Browser Preview Hub** — optional standalone Node companion for static sites / SPAs (iframe chrome, device presets) outside the hub UI; see [tools/preview-hub/README.md](tools/preview-hub/README.md). Prefer in-hub Preview for files under a session cwd.
 
 ```bash
 npm run preview
@@ -246,7 +247,7 @@ python -m pytest tests/test_e2e_smoke.py -v
 
 Prefer **Python Playwright**. Optional Node Playwright can hang on some Windows/Node builds.
 
-See **[CONTRIBUTING.md](CONTRIBUTING.md)** and **[docs/RELEASE_READINESS.md](docs/RELEASE_READINESS.md)**.
+See **[CHANGELOG.md](CHANGELOG.md)** (public release history), **[CONTRIBUTING.md](CONTRIBUTING.md)**, and **[docs/RELEASE_READINESS.md](docs/RELEASE_READINESS.md)**.
 
 ---
 
