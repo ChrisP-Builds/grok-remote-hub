@@ -169,6 +169,26 @@ def _find_summary_path(sessions_root: Path, session_id: str) -> Path | None:
     return None
 
 
+def read_hub_origin(sessions_root: Path, session_id: str) -> str:
+    """Read summary hub_origin (user|attach) or empty string."""
+    if not session_id or not _is_uuid_like(str(session_id).strip()):
+        return ""
+    summary_path = _find_summary_path(sessions_root, str(session_id).strip())
+    if not summary_path:
+        return ""
+    try:
+        with summary_path.open("r", encoding="utf-8") as f:
+            summary = json.load(f)
+        if not isinstance(summary, dict):
+            return ""
+        origin = str(summary.get("hub_origin") or "").strip()
+        if origin not in ("user", "attach"):
+            return ""
+        return origin
+    except (OSError, json.JSONDecodeError, TypeError, ValueError, UnicodeError):
+        return ""
+
+
 def stamp_hub_origin(sessions_root: Path, session_id: str, origin: str) -> bool:
     """Write hub_origin on summary.json (user|attach). Returns True if wrote."""
     if origin not in ("user", "attach"):

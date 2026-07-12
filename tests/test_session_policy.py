@@ -12,9 +12,12 @@ from hub.session_policy import (
     NO_OUTPUT_SECONDS,
     STUCK_TURN_SECONDS,
     cwd_key,
+    is_hub_resume_candidate,
     is_turn_stuck_for_new_prompt,
+    load_hub_session_ids,
     load_remote_sessions,
     needs_fresh_agent_session,
+    resolve_ensure_action,
     resolve_live_session_id,
     save_remote_sessions,
     should_force_clear_turn,
@@ -53,6 +56,62 @@ def test_created_set_is_process_local_without_restore() -> None:
     assert needs_fresh_agent_session("hub-from-prior-process", set()) is True
 
 
+def test_is_hub_resume_candidate_true_paths() -> None:
+    created = {"live-1"}
+    remote_ids = {"map-1"}
+    assert is_hub_resume_candidate(
+        "live-1", created_set=created, remote_map_ids=remote_ids
+    )
+    assert is_hub_resume_candidate(
+        "map-1", created_set=created, remote_map_ids=remote_ids
+    )
+    assert is_hub_resume_candidate(
+        "stamped",
+        created_set=set(),
+        remote_map_ids=set(),
+        hub_origin="user",
+    )
+    assert is_hub_resume_candidate(
+        "stamped",
+        created_set=set(),
+        remote_map_ids=set(),
+        hub_origin="attach",
+    )
+
+
+def test_is_hub_resume_candidate_false_foreign() -> None:
+    assert (
+        is_hub_resume_candidate(
+            "cli-foreign",
+            created_set=set(),
+            remote_map_ids=set(),
+            hub_origin=None,
+        )
+        is False
+    )
+    assert (
+        is_hub_resume_candidate(
+            "cli-foreign",
+            created_set={"other"},
+            remote_map_ids={"other-map"},
+            hub_origin="",
+        )
+        is False
+    )
+    assert (
+        is_hub_resume_candidate(
+            None, created_set=set(), remote_map_ids=set(), hub_origin="user"
+        )
+        is False
+    )
+    assert (
+        is_hub_resume_candidate(
+            "x", created_set=set(), remote_map_ids=set(), hub_origin="other"
+        )
+        is False
+    )
+
+
 def test_resolve_live_foreign_needs_new() -> None:
     created: set[str] = set()
     remote: dict[str, str] = {}
@@ -82,6 +141,62 @@ def test_resolve_live_foreign_reuses_cwd_remote() -> None:
     assert live != "cli-foreign-id"
 
 
+def test_disk_remote_map_does_not_skip_session_new() -> None:
+    """After restart: remote map alone must not silent-reuse; may select load."""
+    dead_id = "019f53c6-6107-76d2-99e9-ec7a09970671"
+    remote = {cwd_key(r"D:\Projects\equine website"): dead_id}
+    created: set[str] = set()  # process-local; disk must not seed this
+
+    # Process-live-only resolver still requires session/new (no silent reuse).
+    live, needs_new, reason = resolve_live_session_id(
+        dead_id,
+        r"D:\Projects\equine website",
+        created,
+        remote,
+    )
+    assert needs_new is True
+    assert live is None
+    assert reason == "need_session_new"
+
+    # Ensure action: view equals map id → view resume candidate (resume_view).
+    target, action, ensure_reason = resolve_ensure_action(
+        dead_id,
+        r"D:\Projects\equine website",
+        created,
+        remote,
+    )
+    assert action == "load"
+    assert target == dead_id
+    assert ensure_reason == "resume_view"
+    assert action != "reuse"
+
+
+def test_process_local_created_reuses_without_session_new() -> None:
+    """Same hub process: view process-live wins → hub_session (even if byCwd same)."""
+    hub_id = "019f53c6-6107-76d2-99e9-ec7a09970671"
+    remote = {cwd_key(r"D:\Projects\equine website"): hub_id}
+    created = {hub_id}
+    live, needs_new, reason = resolve_live_session_id(
+        hub_id,
+        r"D:\Projects\equine website",
+        created,
+        remote,
+    )
+    assert needs_new is False
+    assert live == hub_id
+    assert reason == "hub_session"
+
+    target, action, ensure_reason = resolve_ensure_action(
+        hub_id,
+        r"D:\Projects\equine website",
+        created,
+        remote,
+    )
+    assert action == "reuse"
+    assert target == hub_id
+    assert ensure_reason == "hub_session"
+
+
 def test_resolve_live_hub_session_same() -> None:
     created = {"hub-aaa"}
     live, needs_new, reason = resolve_live_session_id(
@@ -95,8 +210,117 @@ def test_resolve_live_hub_session_same() -> None:
     assert reason == "hub_session"
 
 
+def test_resolve_ensure_process_live_reuse() -> None:
+    created = {"hub-aaa"}
+    target, action, reason = resolve_ensure_action(
+        "hub-aaa",
+        r"D:\Projects\Demo",
+        created,
+        {},
+    )
+    assert target == "hub-aaa"
+    assert action == "reuse"
+    assert reason == "hub_session"
+
+
+def test_resolve_ensure_view_preferred_over_bycwd() -> None:
+    """View hub resume candidate wins over a different byCwd map id."""
+    viewed = "viewed-hub-id"
+    mapped = "mapped-other-id"
+    remote = {cwd_key(r"D:\Projects\Demo"): mapped}
+    created: set[str] = set()
+    target, action, reason = resolve_ensure_action(
+        viewed,
+        r"D:\Projects\Demo",
+        created,
+        remote,
+        view_hub_origin="user",
+        remote_hub_origin="attach",
+    )
+    assert target == viewed
+    assert action == "load"
+    assert reason == "resume_view"
+    assert target != mapped
+
+
+def test_resolve_ensure_view_process_live_over_bycwd_live() -> None:
+    """View process-live wins over a different byCwd process-live id."""
+    viewed = "viewed-live"
+    mapped = "mapped-live"
+    remote = {cwd_key(r"D:\Projects\Demo"): mapped}
+    created = {viewed, mapped}
+    target, action, reason = resolve_ensure_action(
+        viewed,
+        r"D:\Projects\Demo",
+        created,
+        remote,
+    )
+    assert target == viewed
+    assert action == "reuse"
+    assert reason == "hub_session"
+    assert target != mapped
+
+
+def test_resolve_ensure_empty_created_remote_map_loads() -> None:
+    """Empty created + view equals remote map → resume_view (view wins)."""
+    sid = "prior-process-hub"
+    remote = {cwd_key(r"D:\Projects\X"): sid}
+    target, action, reason = resolve_ensure_action(
+        sid,
+        r"D:\Projects\X",
+        set(),
+        remote,
+    )
+    assert target == sid
+    assert action == "load"
+    assert reason == "resume_view"
+
+
+def test_resolve_ensure_foreign_new() -> None:
+    target, action, reason = resolve_ensure_action(
+        "cli-foreign-id",
+        r"D:\Projects\Demo",
+        set(),
+        {},
+        view_hub_origin=None,
+    )
+    assert target is None
+    assert action == "new"
+    assert reason == "need_session_new"
+
+
+def test_resolve_ensure_resume_cwd_when_view_foreign() -> None:
+    mapped = "hub-from-map"
+    remote = {cwd_key(r"D:\Projects\Demo"): mapped}
+    target, action, reason = resolve_ensure_action(
+        "cli-foreign",
+        r"D:\Projects\Demo",
+        set(),
+        remote,
+        view_hub_origin=None,
+        remote_hub_origin="attach",
+    )
+    assert target == mapped
+    assert action == "load"
+    assert reason == "resume_cwd"
+
+
+def test_resolve_ensure_reuse_cwd_process_live() -> None:
+    live = "hub-live-cwd"
+    remote = {cwd_key(r"D:\Projects\Demo"): live}
+    target, action, reason = resolve_ensure_action(
+        "cli-foreign",
+        r"D:\Projects\Demo",
+        {live},
+        remote,
+    )
+    assert target == live
+    assert action == "reuse"
+    assert reason == "reuse_cwd"
+
+
 def test_multi_turn_same_hub_session_no_fresh() -> None:
-    """Two prompts on same hub session: needs_fresh stays false."""
+    """Two prompts on same hub session: needs_fresh stays false; view live → hub_session."""
     hub_id = "hub-multi-turn"
     created = {hub_id}
     remote = {cwd_key(r"D:\Projects\X"): hub_id}
@@ -123,16 +347,132 @@ def test_remote_sessions_json_roundtrip(tmp_path: Path) -> None:
     loaded = load_remote_sessions(path)
     assert loaded[cwd_key(r"D:\Projects\A")] == "sess-a"
     assert loaded[cwd_key(r"D:\Projects\B")] == "sess-b"
+    # byCwd values land in hubIds
+    hub_ids = load_hub_session_ids(path)
+    assert "sess-a" in hub_ids
+    assert "sess-b" in hub_ids
+
+
+def test_remote_sessions_hub_ids_roundtrip(tmp_path: Path) -> None:
+    """hubIds persist across saves; load_remote_sessions stays byCwd-only."""
+    path = tmp_path / "remote-sessions.json"
+    mapping = {cwd_key(r"D:\Projects\A"): "current-map-id"}
+    save_remote_sessions(
+        path,
+        mapping,
+        hub_ids={"current-map-id", "older-hub-id-not-in-bycwd"},
+    )
+    loaded = load_remote_sessions(path)
+    assert loaded == {cwd_key(r"D:\Projects\A"): "current-map-id"}
+    assert "hubIds" not in loaded  # byCwd dict only
+
+    hub_ids = load_hub_session_ids(path)
+    assert "current-map-id" in hub_ids
+    assert "older-hub-id-not-in-bycwd" in hub_ids
+
+    # Save without hub_ids arg preserves prior hubIds
+    save_remote_sessions(path, {cwd_key(r"D:\Projects\A"): "newer-id"})
+    hub_ids2 = load_hub_session_ids(path)
+    assert "older-hub-id-not-in-bycwd" in hub_ids2
+    assert "newer-id" in hub_ids2
+    assert "current-map-id" in hub_ids2  # preserved even after map overwrite
+
+
+def test_resolve_ensure_hub_ids_view_wins_over_bycwd() -> None:
+    """Older viewed in hubIds wins over newer byCwd (view is continuity)."""
+    viewed = "019f4d9f-older-hub-owned"
+    mapped = "019f578a-current-bycwd"
+    remote = {cwd_key(r"D:\Projects\Grok Remote Hub"): mapped}
+    hub_owned = {viewed, mapped}
+    target, action, reason = resolve_ensure_action(
+        viewed,
+        r"D:\Projects\Grok Remote Hub",
+        set(),  # post-restart empty process-live
+        remote,
+        view_hub_origin=None,  # stamp missing
+        remote_hub_origin=None,
+        hub_owned_ids=hub_owned,
+    )
+    assert target == viewed
+    assert action == "load"
+    assert reason == "resume_view"
+    assert target != mapped
+
+
+def test_resolve_ensure_view_in_hub_ids_when_bycwd_empty() -> None:
+    """View in hubIds with empty byCwd → resume_view."""
+    viewed = "019f4d9f-older-hub-owned"
+    hub_owned = {viewed}
+    target, action, reason = resolve_ensure_action(
+        viewed,
+        r"D:\Projects\Grok Remote Hub",
+        set(),
+        {},  # no byCwd entry for this cwd
+        view_hub_origin=None,
+        remote_hub_origin=None,
+        hub_owned_ids=hub_owned,
+    )
+    assert target == viewed
+    assert action == "load"
+    assert reason == "resume_view"
+
+
+def test_resolve_ensure_foreign_view_falls_to_bycwd() -> None:
+    """Foreign/not-resumeable view falls through to byCwd resume."""
+    viewed = "019f4d9f-older-hub-owned"
+    mapped = "019f578a-current-bycwd"
+    remote = {cwd_key(r"D:\Projects\Grok Remote Hub"): mapped}
+    target, action, reason = resolve_ensure_action(
+        viewed,
+        r"D:\Projects\Grok Remote Hub",
+        set(),
+        remote,
+        view_hub_origin=None,
+        remote_hub_origin=None,
+        hub_owned_ids=None,
+    )
+    assert target == mapped
+    assert action == "load"
+    assert reason == "resume_cwd"
+
+
+def test_resolve_ensure_empty_view_uses_bycwd() -> None:
+    """Empty view → byCwd path (process-live or resume)."""
+    mapped = "hub-from-map"
+    remote = {cwd_key(r"D:\Projects\Demo"): mapped}
+    # Process-live byCwd
+    target, action, reason = resolve_ensure_action(
+        None,
+        r"D:\Projects\Demo",
+        {mapped},
+        remote,
+    )
+    assert target == mapped
+    assert action == "reuse"
+    assert reason == "reuse_cwd"
+    # Resume candidate byCwd
+    target2, action2, reason2 = resolve_ensure_action(
+        "",
+        r"D:\Projects\Demo",
+        set(),
+        remote,
+        remote_hub_origin="attach",
+    )
+    assert target2 == mapped
+    assert action2 == "load"
+    assert reason2 == "resume_cwd"
 
 
 def test_remote_sessions_load_missing_empty(tmp_path: Path) -> None:
     assert load_remote_sessions(tmp_path / "nope.json") == {}
+    assert load_hub_session_ids(tmp_path / "nope.json") == set()
 
 
 def test_remote_sessions_load_invalid_empty(tmp_path: Path) -> None:
     path = tmp_path / "bad.json"
     path.write_text("not-json{{{", encoding="utf-8")
     assert load_remote_sessions(path) == {}
+    assert load_hub_session_ids(path) == set()
 
 
 def test_cwd_key_normalizes() -> None:

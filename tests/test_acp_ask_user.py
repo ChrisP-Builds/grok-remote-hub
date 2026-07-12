@@ -112,60 +112,77 @@ def test_normalize_empty_params() -> None:
 def test_build_accepted_result_shape() -> None:
     result = build_accepted_result({"q0": ["opt0", "other text"], "q1": ["only"]})
     assert result == {
-        "outcome": {
-            "outcome": "accepted",
-            "answers": {
-                "q0": {"values": ["opt0", "other text"]},
-                "q1": {"values": ["only"]},
-            },
-        }
+        "outcome": "accepted",
+        "answers": {
+            "q0": ["opt0", "other text"],
+            "q1": ["only"],
+        },
+        "partial_answers": {},
     }
 
 
 def test_build_accepted_already_shaped() -> None:
+    """Legacy {"values": [...]} input is unwrapped to list[str] (StringOrVec)."""
     result = build_accepted_result({"q0": {"values": ["a", "b"]}})
-    assert result["outcome"]["outcome"] == "accepted"
-    assert result["outcome"]["answers"]["q0"]["values"] == ["a", "b"]
+    assert result["outcome"] == "accepted"
+    assert result["answers"]["q0"] == ["a", "b"]
+    assert result["partial_answers"] == {}
 
 
 def test_build_accepted_empty() -> None:
-    empty = {"outcome": {"outcome": "accepted", "answers": {}}}
+    empty = {
+        "outcome": "accepted",
+        "answers": {},
+        "partial_answers": {},
+    }
     assert build_accepted_result(None) == empty
     assert build_accepted_result({}) == empty
 
 
 def test_build_cancelled_result_shape() -> None:
     result = build_cancelled_result()
-    assert result == {"outcome": {"outcome": "cancelled"}}
-    assert result["outcome"]["outcome"] == "cancelled"
+    assert result == {"outcome": "cancelled"}
+    assert result["outcome"] == "cancelled"
+
+
+def test_outcome_is_string_not_dict() -> None:
+    """Agent deserializes as internally tagged enum; outcome must be str, not map."""
+    accepted = build_accepted_result({"q0": ["opt0"]})
+    cancelled = build_cancelled_result()
+
+    assert isinstance(accepted["outcome"], str)
+    assert not isinstance(accepted["outcome"], dict)
+    assert accepted["outcome"] == "accepted"
+
+    assert isinstance(cancelled["outcome"], str)
+    assert not isinstance(cancelled["outcome"], dict)
+    assert cancelled["outcome"] == "cancelled"
 
 
 def test_multi_values_list() -> None:
     result = build_accepted_result({"q-multi": ["opt0", "opt2", "custom"]})
-    assert result["outcome"]["outcome"] == "accepted"
-    values = result["outcome"]["answers"]["q-multi"]["values"]
+    assert result["outcome"] == "accepted"
+    values = result["answers"]["q-multi"]
     assert values == ["opt0", "opt2", "custom"]
     assert isinstance(values, list)
+    # Must be StringOrVec, not {"values": [...]}
+    assert not isinstance(values, dict)
 
 
-def test_permission_style_nesting() -> None:
-    """Mirrors permission shape: outer outcome is dict; inner has string outcome key."""
+def test_internally_tagged_enum_shape() -> None:
+    """Accepted puts answers/partial_answers at top level beside outcome string."""
     accepted = build_accepted_result({"q0": ["opt0"]})
     cancelled = build_cancelled_result()
 
-    assert isinstance(accepted["outcome"], dict)
-    assert isinstance(accepted["outcome"]["outcome"], str)
-    assert accepted["outcome"]["outcome"] == "accepted"
-    assert "answers" in accepted["outcome"]
+    assert set(accepted.keys()) == {"outcome", "answers", "partial_answers"}
+    assert accepted["outcome"] == "accepted"
+    assert accepted["answers"] == {"q0": ["opt0"]}
+    assert accepted["partial_answers"] == {}
 
-    assert isinstance(cancelled["outcome"], dict)
-    assert isinstance(cancelled["outcome"]["outcome"], str)
-    assert cancelled["outcome"]["outcome"] == "cancelled"
+    assert set(cancelled.keys()) == {"outcome"}
+    assert cancelled["outcome"] == "cancelled"
 
-    # Same nesting pattern as permission selected:
-    # {"outcome": {"outcome": "selected", "optionId": ...}}
+    # Permission replies stay nested; ask_user must not mirror that shape.
     permission_like = {"outcome": {"outcome": "selected", "optionId": "allow"}}
-    assert set(permission_like["outcome"].keys()) >= {"outcome"}
-    assert isinstance(permission_like["outcome"]["outcome"], str)
-    assert set(accepted["outcome"].keys()) >= {"outcome"}
-    assert isinstance(accepted["outcome"]["outcome"], str)
+    assert isinstance(permission_like["outcome"], dict)
+    assert not isinstance(accepted["outcome"], dict)
