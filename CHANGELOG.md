@@ -17,6 +17,8 @@ This file is the **public narrative**. Session chat context is not required to u
 - Tools stay **collapsed** by default; empty expand no longer shows “No detail.”
 - Thinking summary no longer doubles the word “Thinking.”
 - Composer placeholder adapts to width (short vs slash-hint) with CSS ellipsis.
+- Status pill distinguishes agent process up vs ACP disconnected; auto-reconnect ACP when process is up (capped retries).
+- Mobile transcript GFM tables re-parse from raw stream text and scroll horizontally.
 
 ---
 
