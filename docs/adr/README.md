@@ -34,3 +34,4 @@ a new ADR.
 | 007 | Classify subagent sessions via session_kind | Accepted | 2026-07-11 |
 | 008 | Persist hub renames as hub_title in summary.json | Accepted | 2026-07-11 |
 | 009 | KeepAgent default + view-first continuity (no no-output fork) | Accepted | 2026-07-12 |
+| 010 | File-first site preview, not cloud or chat artifacts | Accepted | 2026-07-12 |
