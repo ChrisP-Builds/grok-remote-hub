@@ -33,6 +33,16 @@ def test_css_terminal_tokens() -> None:
     assert "margin-left: auto" not in css or css.count(".term-line") > 0
     assert ".term-line" in css
     assert "@media (max-width: 899px)" in css
+    # Tables: transcript must allow horizontal scroll (not overflow-x:hidden only)
+    assert ".term-table-wrap" in css
+    assert ".term-table" in css
+    assert "-webkit-overflow-scrolling: touch" in css
+    # .transcript block uses overflow-x: auto so .term-table-wrap can scroll on mobile
+    idx = css.find(".transcript {")
+    assert idx >= 0
+    chunk = css[idx : idx + 350]
+    assert "overflow-x: auto" in chunk
+    assert "overflow-x: hidden" not in chunk
 
 
 def test_html_turn_strip_and_empty_state() -> None:
@@ -58,6 +68,8 @@ def test_js_term_line_structure() -> None:
     assert "formatTermPrefix" in js
     assert "formatToolLine" in js
     assert "parseSimpleMarkdownTable" in js
+    assert "finalizeAssistantTables" in js
+    assert "bodyEl._rawText = raw" in js
     assert "shouldShowToolLine" in js
     # Tools always visible path
     assert "shouldShowToolLine" in js
@@ -84,6 +96,50 @@ def test_js_term_line_structure() -> None:
     # Live tool_call must not build label+summary as title
     assert 'truncate(`${label} ${summary}`, 160)' not in js
     assert "truncate(`${label} ${summary}`, 160)" not in js
+
+
+def test_js_mobile_table_raw_text_contracts() -> None:
+    """GFM tables: _rawText is source of truth; finalize on idle/history/stale clear."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    # setTermBodyContent always stores raw before parse/render
+    set_idx = js.find("function setTermBodyContent")
+    assert set_idx >= 0
+    set_fn = js[set_idx : set_idx + 400]
+    assert "bodyEl._rawText = raw" in set_fn
+
+    # appendToBody accumulates from _rawText, not table textContent alone
+    app_idx = js.find("function appendToBody")
+    assert app_idx >= 0
+    app_fn = js[app_idx : app_idx + 700]
+    assert "body._rawText" in app_fn
+    assert "const prev = body._rawText != null" in app_fn
+    assert "const next = prev + text" in app_fn
+    # Must not rebuild next solely from textContent when table present
+    assert "querySelector(\".term-table\")" not in app_fn or "textContent" in app_fn
+
+    # finalizeAssistantTables re-parses from _rawText when pipes present
+    fin_idx = js.find("function finalizeAssistantTables")
+    assert fin_idx >= 0
+    fin_fn = js[fin_idx : fin_idx + 550]
+    assert "body._rawText" in fin_fn
+    assert 'raw.includes("|")' in fin_fn
+    assert "setTermBodyContent(body, raw)" in fin_fn
+    assert ".term-line.assistant .term-body" in fin_fn
+
+    # Call sites: turn idle (setTurnRunning), history batch end, clear stale live
+    assert "finalizeAssistantTables" in js
+    idle_hook = js.find("Turn ended: re-parse any assistant tables")
+    assert idle_hook >= 0
+    assert "finalizeAssistantTables(idleRoot)" in js[idle_hook : idle_hook + 500]
+    hist_hook = js.find("ensure GFM tables in loaded history")
+    assert hist_hook >= 0
+    assert "finalizeAssistantTables(transcriptRoot())" in js[hist_hook : hist_hook + 200]
+    # clearStaleLiveTurns finalizes panes + root
+    stale_idx = js.find("function clearStaleLiveTurns")
+    assert stale_idx >= 0
+    stale_chunk = js[stale_idx : stale_idx + 1200]
+    assert "finalizeAssistantTables" in stale_chunk
 
 
 def test_css_tool_plan_expand() -> None:
@@ -143,6 +199,13 @@ def test_parse_simple_markdown_table() -> None:
 
     assert parse_simple_markdown_table("no table here") is None
     assert parse_simple_markdown_table("") is None
+
+    # GFM sample with alignment colons + CRLF (stream-like)
+    gfm = "| A | B |\r\n| :--- | ---: |\r\n| 1 | 2 |\r\n"
+    gfm_rows = parse_simple_markdown_table(gfm)
+    assert gfm_rows is not None
+    assert gfm_rows[0] == ["A", "B"]
+    assert gfm_rows[1] == ["1", "2"]
 
 
 def test_format_plan_summary() -> None:

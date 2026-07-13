@@ -1655,7 +1655,8 @@ a {
   min-height: 0;
   max-width: 100%;
   overflow-y: auto;
-  overflow-x: hidden;
+  /* auto (not hidden): child .term-table-wrap horizontal scroll fails under overflow-x:hidden */
+  overflow-x: auto;
   padding: 14px 16px 12px;
   overscroll-behavior: contain;
   scroll-behavior: auto;
@@ -2213,14 +2214,17 @@ a {
 /* Markdown tables inside term-body */
 .term-table-wrap {
   overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
   max-width: 100%;
   margin: 6px 0;
+  display: block;
 }
 
 .term-table {
   border-collapse: collapse;
   width: max-content;
-  max-width: 100%;
+  min-width: min(100%, 280px);
+  max-width: none; /* allow horizontal scroll instead of squish-to-zero */
   font-size: 12px;
   font-family: var(--font);
 }
@@ -3215,6 +3219,26 @@ a {
 
   .transcript {
     padding: 10px 10px;
+    overflow-x: auto;
+  }
+
+  .term-table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    max-width: 100%;
+  }
+
+  .term-table {
+    width: max-content;
+    min-width: min(100%, 280px);
+    max-width: none;
+    font-size: 11px;
+  }
+
+  .term-table th,
+  .term-table td {
+    border: 1px solid var(--border);
+    padding: 4px 6px;
   }
 
   .term-line {
