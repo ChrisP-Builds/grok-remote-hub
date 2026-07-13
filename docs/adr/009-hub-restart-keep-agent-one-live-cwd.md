@@ -8,7 +8,7 @@
 
 After hub process restart, multi-turn continuity depends on (1) the agent process still holding sessions and (2) ensure policy picking the session the user was working on.
 
-An earlier byCwd-first order rewrote the project map away from the open conversation on map drift or no-output recovery (`session/new` + `session_switch` reason `no_output_retry`). That forked continuity (e.g. `019f578a` → `019f57a5`).
+An earlier byCwd-first order rewrote the project map away from the open conversation on map drift or no-output recovery (`session/new` + `session_switch` reason `no_output_retry`). That forked continuity (e.g. live hub session A → accidental new session B for the same cwd).
 
 Ops: `restart-hub.ps1` defaults to KeepAgent so agent serve survives hub bounce.
 

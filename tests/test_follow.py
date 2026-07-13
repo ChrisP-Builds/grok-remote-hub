@@ -96,7 +96,7 @@ def test_resolve_session_by_id_and_cwd(tmp_path: Path) -> None:
     sess = tmp_path / "sessions" / "encoded" / sid
     sess.mkdir(parents=True)
     summary = {
-        "generated_title": "Circana test",
+        "generated_title": "Demo project test",
         "updated_at": "2026-07-09T12:00:00Z",
         "num_chat_messages": 2,
         "info": {"id": sid, "cwd": cwd},
@@ -109,7 +109,7 @@ def test_resolve_session_by_id_and_cwd(tmp_path: Path) -> None:
     by_id = resolve_session(root, session_id=sid)
     assert by_id is not None
     assert by_id.sessionId == sid
-    assert by_id.title == "Circana test"
+    assert by_id.title == "Demo project test"
 
     by_cwd = resolve_session(root, cwd=cwd)
     assert by_cwd is not None
