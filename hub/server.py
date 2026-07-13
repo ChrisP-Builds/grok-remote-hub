@@ -48,6 +48,7 @@ from hub.session_index import (
     stamp_hub_origin,
 )
 from hub.billing_usage import fetch_credits_usage
+from hub.status_view import map_agent_status
 from hub.session_signals import read_session_signals, read_signals_file, find_signals_path
 from hub.session_policy import (
     STUCK_TURN_SECONDS,
@@ -274,16 +275,9 @@ class Hub:
         return out
 
     def status_payload(self) -> dict[str, Any]:
-        agent = "up" if self.agent_status == "up" and self.acp_connected else (
-            "up" if self.agent_status == "up" else "down"
+        mapped = map_agent_status(
+            self.agent_status == "up", self.acp_connected
         )
-        # Prefer reporting agent down if process/port is down; if port up but ACP not yet connected, still down-ish
-        if self.agent_status != "up":
-            agent = "down"
-        elif not self.acp_connected:
-            agent = "down"
-        else:
-            agent = "up"
         compat = self.compat or {}
         issues = list(compat.get("issues") or [])
         live_turns = [
@@ -294,10 +288,12 @@ class Hub:
         session_flags = self._session_flags_map()
         return {
             "type": "status",
-            "agent": agent,
+            "agent": mapped["agent"],
+            "agentProcess": mapped["agentProcess"],
+            "agentDetail": mapped["agentDetail"],
             "bind": self.bind_mode,
             "tailscaleIp": self.tailscale_ip,
-            "acpConnected": self.acp_connected,
+            "acpConnected": mapped["acpConnected"],
             "loadedSessionId": self.acp.loaded_session_id,
             "turnRunning": self.acp.turn_running,
             "turnSessionId": self.acp.turn_session_id,
@@ -977,10 +973,15 @@ class Hub:
 
     async def handle_health(self, request: web.Request) -> web.Response:
         compat = self.compat or {}
+        mapped = map_agent_status(
+            self.agent_status == "up", self.acp_connected
+        )
         body = {
             "ok": True,
-            "agent": self.agent_status,
-            "acpConnected": self.acp_connected,
+            "agent": mapped["agent"],
+            "agentProcess": mapped["agentProcess"],
+            "agentDetail": mapped["agentDetail"],
+            "acpConnected": mapped["acpConnected"],
             "bind": self.bind_mode,
             "host": self.bind_host,
             "hosts": list(self.bind_hosts),
