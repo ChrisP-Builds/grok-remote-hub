@@ -266,6 +266,8 @@
       agentProcess: null,
       agentDetail: null,
       acpConnected: false,
+      acpHealAttempts: 0,
+      acpHealError: null,
       bind: "local",
       tailscaleIp: null,
       loadedSessionId: null,
@@ -1385,8 +1387,17 @@
         stateKey = "agent-down";
         text = "Agent down";
       } else if (acpOnlyDown) {
-        stateKey = "acp-down";
-        text = "Agent reconnecting…";
+        // After heal exhaustion, stop implying a silent reconnect is still running.
+        const healAttempts = Number(state.status.acpHealAttempts) || 0;
+        const healExhausted =
+          !!state.status.acpHealError || healAttempts >= 3;
+        if (healExhausted) {
+          stateKey = "acp-hung";
+          text = "Agent hung — restart";
+        } else {
+          stateKey = "acp-down";
+          text = "Agent reconnecting…";
+        }
       } else if (state.status.bind === "local") {
         stateKey = "local";
         text = "Local only";
@@ -4508,6 +4519,9 @@
         agentProcess: msg.agentProcess || null,
         agentDetail: msg.agentDetail || null,
         acpConnected: msg.acpConnected === true,
+        acpHealAttempts:
+          msg.acpHealAttempts != null ? Number(msg.acpHealAttempts) || 0 : 0,
+        acpHealError: msg.acpHealError || null,
         bind: msg.bind || "local",
         tailscaleIp: msg.tailscaleIp || null,
         loadedSessionId: msg.loadedSessionId || null,

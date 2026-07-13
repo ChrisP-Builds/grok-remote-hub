@@ -765,17 +765,27 @@ def test_js_honest_agent_vs_acp_status_pill() -> None:
     assert 'stateKey = "acp-down"' in chunk
     assert "Agent down" in chunk
     assert 'stateKey = "agent-down"' in chunk
+    # Heal exhausted: process up, ACP down, stop saying reconnecting
+    assert "Agent hung — restart" in chunk
+    assert 'stateKey = "acp-hung"' in chunk
+    assert "acpHealError" in chunk
+    assert "acpHealAttempts" in chunk
     # Status merge carries new fields
     assert "agentProcess: msg.agentProcess" in js
     assert "acpConnected: msg.acpConnected" in js
     assert "agentDetail: msg.agentDetail" in js
-    # Distinct warn style for ACP-only path
+    assert "acpHealAttempts" in js
+    assert "acpHealError: msg.acpHealError" in js
+    # Distinct warn style for ACP-only path; danger for hung
     assert 'data-state="acp-down"' in css
+    assert 'data-state="acp-hung"' in css
     # Server wires helper into payload + health
     src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
     assert "map_agent_status" in src
     assert "agentProcess" in src
     assert "agentDetail" in src
+    assert "acpHealAttempts" in src
+    assert "acpHealError" in src
 
 
 def test_js_history_batch_depth() -> None:
