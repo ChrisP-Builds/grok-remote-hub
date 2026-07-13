@@ -752,6 +752,32 @@ def test_server_status_resync_near_streaming() -> None:
     assert "status_payload()" in bt_chunk
 
 
+def test_js_honest_agent_vs_acp_status_pill() -> None:
+    """Pill distinguishes process-down from ACP-only disconnect."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    idx = js.find("function updateStatusPill")
+    assert idx >= 0
+    chunk = js[idx : idx + 2200]
+    assert "agentProcess" in chunk
+    assert "acpConnected" in chunk
+    assert "Agent reconnecting" in chunk
+    assert 'stateKey = "acp-down"' in chunk
+    assert "Agent down" in chunk
+    assert 'stateKey = "agent-down"' in chunk
+    # Status merge carries new fields
+    assert "agentProcess: msg.agentProcess" in js
+    assert "acpConnected: msg.acpConnected" in js
+    assert "agentDetail: msg.agentDetail" in js
+    # Distinct warn style for ACP-only path
+    assert 'data-state="acp-down"' in css
+    # Server wires helper into payload + health
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    assert "map_agent_status" in src
+    assert "agentProcess" in src
+    assert "agentDetail" in src
+
+
 def test_js_history_batch_depth() -> None:
     """History rebuilds batch scroll/turn-strip updates via begin/endHistoryBatch."""
     js = (STATIC / "app.js").read_text(encoding="utf-8")

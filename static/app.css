@@ -1567,6 +1567,16 @@ a {
   background: var(--danger);
 }
 
+/* Process up, ACP not yet connected — warn, not hard-down */
+.status-pill[data-state="acp-down"] {
+  color: var(--warn);
+  border-color: rgba(230, 184, 77, 0.35);
+}
+
+.status-pill[data-state="acp-down"] .status-dot {
+  background: var(--warn);
+}
+
 .status-pill[data-state="local"] {
   color: var(--muted);
 }

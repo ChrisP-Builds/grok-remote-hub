@@ -263,6 +263,9 @@
 
     status: {
       agent: "down",
+      agentProcess: null,
+      agentDetail: null,
+      acpConnected: false,
       bind: "local",
       tailscaleIp: null,
       loadedSessionId: null,
@@ -1368,9 +1371,22 @@
         text = state.wsState === "reconnecting" ? "Reconnecting" : "Connecting";
       }
     } else if (state.wsState === "open") {
-      if (state.status.agent !== "up") {
+      // Honest split: process down vs ACP-only disconnect (not "Agent down").
+      const ap = state.status.agentProcess;
+      const acp = state.status.acpConnected;
+      const processDown =
+        ap === "down" || (ap == null && state.status.agent !== "up");
+      const acpOnlyDown =
+        ap === "up" &&
+        (acp === false ||
+          state.status.agentDetail === "acp-disconnected" ||
+          state.status.agent !== "up");
+      if (processDown) {
         stateKey = "agent-down";
         text = "Agent down";
+      } else if (acpOnlyDown) {
+        stateKey = "acp-down";
+        text = "Agent reconnecting…";
       } else if (state.status.bind === "local") {
         stateKey = "local";
         text = "Local only";
@@ -4489,6 +4505,9 @@
     if (type === "status") {
       state.status = {
         agent: msg.agent || "down",
+        agentProcess: msg.agentProcess || null,
+        agentDetail: msg.agentDetail || null,
+        acpConnected: msg.acpConnected === true,
         bind: msg.bind || "local",
         tailscaleIp: msg.tailscaleIp || null,
         loadedSessionId: msg.loadedSessionId || null,
