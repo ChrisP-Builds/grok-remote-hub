@@ -201,13 +201,29 @@
         <button type="button" class="btn btn-ghost btn-icon" data-close="modal-new" aria-label="Close">×</button>
       </header>
       <p class="muted modal-help">Pick a project working directory.</p>
-      <div class="project-create">
-        <input type="text" id="project-new-name" class="input" placeholder="New folder name" autocomplete="off" />
-        <button type="button" id="btn-create-project" class="btn btn-sm btn-accent">Create</button>
+      <div id="project-list-view">
+        <div class="project-create">
+          <input type="text" id="project-new-name" class="input" placeholder="New folder name" autocomplete="off" />
+          <button type="button" id="btn-create-project" class="btn btn-sm btn-accent">Create</button>
+        </div>
+        <div class="project-browse-toggle">
+          <button type="button" id="btn-browse-folders" class="btn btn-sm btn-ghost">Browse folders</button>
+        </div>
+        <input type="search" id="project-search" class="input" placeholder="Filter projects" autocomplete="off" />
+        <div id="project-list" class="project-list" role="list"></div>
+        <p id="project-empty" class="muted hidden">No projects found under the configured root.</p>
       </div>
-      <input type="search" id="project-search" class="input" placeholder="Filter projects" autocomplete="off" />
-      <div id="project-list" class="project-list" role="list"></div>
-      <p id="project-empty" class="muted hidden">No projects found under the configured root.</p>
+      <div id="project-browser" class="project-browser hidden">
+        <div class="project-browser-bar">
+          <span id="project-browser-path" class="project-browser-path" title="">/</span>
+          <button type="button" id="btn-browse-up" class="btn btn-sm btn-ghost" disabled>Up</button>
+        </div>
+        <div id="project-browser-list" class="project-list project-browser-list" role="list"></div>
+        <div class="project-browser-actions">
+          <button type="button" id="btn-browse-start" class="btn btn-sm btn-accent">Start session here</button>
+          <button type="button" id="btn-browse-back" class="btn btn-sm btn-ghost">Back to list</button>
+        </div>
+      </div>
     </div>
   </div>
 

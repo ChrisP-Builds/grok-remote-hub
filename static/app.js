@@ -344,6 +344,10 @@
     _skillsLoaded: false,
     _skillsFetching: false,
     projects: [],
+    /** New-session modal: "list" | "browse" */
+    projectModalMode: "list",
+    /** Current folder browser payload from /api/projects/browse */
+    projectBrowse: null,
     pendingUserQuestion: null, // { requestId, sessionId, questions, toolCallId }
     turnStartedAt: 0,
     lastTermLineAt: 0,
@@ -437,11 +441,19 @@
     sitePreviewScaleShell: $("#site-preview-scale-shell"),
     sitePreviewScale: $("#site-preview-scale"),
     btnSitePreviewOpen: $("#btn-site-preview-open"),
+    projectListView: $("#project-list-view"),
     projectList: $("#project-list"),
     projectSearch: $("#project-search"),
     projectEmpty: $("#project-empty"),
     projectNewName: $("#project-new-name"),
     btnCreateProject: $("#btn-create-project"),
+    btnBrowseFolders: $("#btn-browse-folders"),
+    projectBrowser: $("#project-browser"),
+    projectBrowserPath: $("#project-browser-path"),
+    projectBrowserList: $("#project-browser-list"),
+    btnBrowseUp: $("#btn-browse-up"),
+    btnBrowseStart: $("#btn-browse-start"),
+    btnBrowseBack: $("#btn-browse-back"),
     toastHost: $("#toast-host"),
     errorStrip: $("#error-strip"),
     errorStripTime: $("#error-strip-time"),
@@ -6564,6 +6576,7 @@
     els.modalNew.classList.remove("hidden");
     els.projectSearch.value = "";
     if (els.projectNewName) els.projectNewName.value = "";
+    setProjectModalMode("list");
     await refreshProjects();
     if (els.projectNewName) els.projectNewName.focus();
     else els.projectSearch.focus();
@@ -6571,6 +6584,14 @@
 
   function closeNewModal() {
     els.modalNew.classList.add("hidden");
+    setProjectModalMode("list");
+  }
+
+  function setProjectModalMode(mode) {
+    state.projectModalMode = mode === "browse" ? "browse" : "list";
+    const browse = state.projectModalMode === "browse";
+    if (els.projectListView) els.projectListView.classList.toggle("hidden", browse);
+    if (els.projectBrowser) els.projectBrowser.classList.toggle("hidden", !browse);
   }
 
   async function refreshProjects() {
@@ -6606,6 +6627,73 @@
       btn.addEventListener("click", () => createSession(p.path));
       els.projectList.appendChild(btn);
     }
+  }
+
+  async function loadProjectBrowse(rel) {
+    const path = rel == null ? "" : String(rel);
+    try {
+      const q = path ? `?path=${encodeURIComponent(path)}` : "";
+      const res = await fetch(apiUrl(`/api/projects/browse${q}`));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(data.error || "Failed to browse folders", "danger");
+        return null;
+      }
+      state.projectBrowse = data;
+      renderProjectBrowse();
+      return data;
+    } catch (err) {
+      toast("Failed to browse folders: " + err, "danger");
+      return null;
+    }
+  }
+
+  function renderProjectBrowse() {
+    const data = state.projectBrowse;
+    if (!els.projectBrowserList) return;
+    els.projectBrowserList.innerHTML = "";
+    if (!data) {
+      if (els.projectBrowserPath) {
+        els.projectBrowserPath.textContent = "/";
+        els.projectBrowserPath.title = "";
+      }
+      if (els.btnBrowseUp) els.btnBrowseUp.disabled = true;
+      return;
+    }
+    const rel = data.path || "";
+    const label = rel ? `/${rel}` : "/";
+    if (els.projectBrowserPath) {
+      els.projectBrowserPath.textContent = label;
+      els.projectBrowserPath.title = data.absolute || label;
+    }
+    if (els.btnBrowseUp) {
+      els.btnBrowseUp.disabled = data.parent === null || data.parent === undefined;
+    }
+    const entries = data.entries || [];
+    for (const e of entries) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "project-row";
+      btn.setAttribute("role", "listitem");
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = e.name || e.path || "";
+      btn.append(name);
+      btn.addEventListener("click", () => {
+        loadProjectBrowse(e.path || "");
+      });
+      els.projectBrowserList.appendChild(btn);
+    }
+  }
+
+  async function openProjectBrowser() {
+    setProjectModalMode("browse");
+    await loadProjectBrowse("");
+  }
+
+  function closeProjectBrowser() {
+    state.projectBrowse = null;
+    setProjectModalMode("list");
   }
 
   async function createProjectFolder() {
@@ -6888,6 +6976,33 @@
           e.preventDefault();
           createProjectFolder();
         }
+      });
+    }
+    if (els.btnBrowseFolders) {
+      els.btnBrowseFolders.addEventListener("click", () => {
+        openProjectBrowser();
+      });
+    }
+    if (els.btnBrowseBack) {
+      els.btnBrowseBack.addEventListener("click", () => {
+        closeProjectBrowser();
+      });
+    }
+    if (els.btnBrowseUp) {
+      els.btnBrowseUp.addEventListener("click", () => {
+        const data = state.projectBrowse;
+        if (!data || data.parent === null || data.parent === undefined) return;
+        loadProjectBrowse(data.parent);
+      });
+    }
+    if (els.btnBrowseStart) {
+      els.btnBrowseStart.addEventListener("click", () => {
+        const abs = state.projectBrowse && state.projectBrowse.absolute;
+        if (!abs) {
+          toast("No folder selected", "danger");
+          return;
+        }
+        createSession(abs);
       });
     }
 
