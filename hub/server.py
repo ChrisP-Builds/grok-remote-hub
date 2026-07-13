@@ -31,7 +31,7 @@ from hub.site_preview import (
     build_preview_plan,
 )
 from hub.history import load_session_history
-from hub.projects import ProjectError, create_project
+from hub.projects import ProjectError, create_project, list_project_browse
 from hub.multi_turn import (
     STATUS_IDLE,
     can_start_concurrent_turn,
@@ -886,6 +886,7 @@ class Hub:
         app.router.add_post("/api/admin/reset-turn", self.handle_reset_turn)
         app.router.add_post("/api/admin/reconnect-acp", self.handle_reconnect_acp)
         app.router.add_get("/api/projects", self.handle_projects)
+        app.router.add_get("/api/projects/browse", self.handle_projects_browse)
         app.router.add_post("/api/projects", self.handle_create_project)
         app.router.add_get("/api/skills", self.handle_skills)
         app.router.add_get("/api/fs/list", self.handle_fs_list)
@@ -1345,6 +1346,21 @@ class Hub:
         sessions = self._scan_sessions()
         items = list_projects(self.config.projects_root, sessions)
         return web.json_response({"items": items})
+
+    async def handle_projects_browse(self, request: web.Request) -> web.Response:
+        path = request.query.get("path") or ""
+        try:
+            result = await asyncio.to_thread(
+                list_project_browse, self.config.projects_root, path
+            )
+        except ProjectError as exc:
+            msg = str(exc)
+            status = 404 if "not found" in msg.lower() else 400
+            return web.json_response({"error": msg}, status=status)
+        except OSError as exc:
+            log.exception("projects browse failed")
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(result)
 
     async def handle_skills(self, request: web.Request) -> web.Response:
         try:

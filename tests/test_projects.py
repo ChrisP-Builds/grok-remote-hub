@@ -9,6 +9,7 @@ import pytest
 from hub.projects import (
     ProjectError,
     create_project,
+    list_project_browse,
     resolve_under_root,
     sanitize_project_name,
 )
@@ -117,3 +118,59 @@ def test_create_project_path_body(tmp_path: Path) -> None:
     result = create_project(root, path=str(target))
     assert result["created"] is True
     assert Path(str(result["path"])).is_dir()
+
+
+def test_list_project_browse_nested_and_parent(tmp_path: Path) -> None:
+    root = tmp_path / "Projects"
+    nested = root / "App" / "src"
+    nested.mkdir(parents=True)
+    (root / "App" / "README.md").write_text("x", encoding="utf-8")
+    (root / ".hidden").mkdir()
+    (root / "Other").mkdir()
+
+    top = list_project_browse(root, "")
+    assert top["projectsRoot"] == str(root.resolve())
+    assert top["path"] == ""
+    assert top["parent"] is None
+    assert Path(str(top["absolute"])) == root.resolve()
+    names = {e["name"] for e in top["entries"]}  # type: ignore[index]
+    assert names == {"App", "Other"}
+    assert all("absolute" in e and "path" in e for e in top["entries"])  # type: ignore[union-attr]
+
+    app = list_project_browse(root, "App")
+    assert app["path"] == "App"
+    assert app["parent"] == ""
+    app_names = {e["name"] for e in app["entries"]}  # type: ignore[index]
+    assert app_names == {"src"}
+    assert Path(str(app["absolute"])) == (root / "App").resolve()
+
+    src = list_project_browse(root, "App/src")
+    assert src["path"] == "App/src"
+    assert src["parent"] == "App"
+    assert src["entries"] == []
+    assert Path(str(src["absolute"])) == nested.resolve()
+
+    # parent="" loads root again
+    back = list_project_browse(root, str(src["parent"]))
+    assert back["path"] == "App"
+
+
+def test_list_project_browse_escape(tmp_path: Path) -> None:
+    root = tmp_path / "Projects"
+    root.mkdir()
+    with pytest.raises(ProjectError, match="escapes"):
+        list_project_browse(root, "..")
+    with pytest.raises(ProjectError, match="escapes"):
+        list_project_browse(root, "../Outside")
+    with pytest.raises(ProjectError, match="escapes"):
+        list_project_browse(root, "foo/../../Outside")
+
+
+def test_list_project_browse_not_found_and_not_dir(tmp_path: Path) -> None:
+    root = tmp_path / "Projects"
+    root.mkdir()
+    (root / "file.txt").write_text("x", encoding="utf-8")
+    with pytest.raises(ProjectError, match="not found"):
+        list_project_browse(root, "missing")
+    with pytest.raises(ProjectError, match="not a directory"):
+        list_project_browse(root, "file.txt")

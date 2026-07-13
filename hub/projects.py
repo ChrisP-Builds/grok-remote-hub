@@ -95,3 +95,74 @@ def create_project(
 
     target.mkdir(parents=True, exist_ok=True)
     return {"path": str(target), "name": folder_name, "created": True}
+
+
+def list_project_browse(projects_root: Path, rel: str = "") -> dict[str, object]:
+    """List directories under projects_root for the New Session folder browser.
+
+    Sandboxed: ``rel`` must resolve under ``projects_root`` only.
+    Returns directories only; skips names starting with ``.``.
+    """
+    root = Path(projects_root).expanduser().resolve()
+    raw = (rel or "").strip().replace("\\", "/").strip("/")
+
+    if not raw:
+        target = root
+        rel_posix = ""
+        parent: str | None = None
+    else:
+        target = resolve_under_root(projects_root, path=raw)
+        try:
+            rel_posix = target.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise ProjectError("path escapes projects root") from exc
+        if rel_posix in (".", ""):
+            rel_posix = ""
+            parent = None
+        else:
+            parent_parts = Path(rel_posix).parts[:-1]
+            parent = "/".join(parent_parts) if parent_parts else ""
+
+    if not target.exists():
+        raise ProjectError("not found")
+    if not target.is_dir():
+        raise ProjectError("not a directory")
+
+    entries: list[dict[str, str]] = []
+    try:
+        children = list(target.iterdir())
+    except OSError as exc:
+        raise ProjectError(f"cannot list directory: {exc}") from exc
+
+    for child in children:
+        if child.name.startswith("."):
+            continue
+        try:
+            if not child.is_dir():
+                continue
+            child_abs = child.resolve(strict=False)
+        except OSError:
+            continue
+        if not _is_under(child_abs, root):
+            continue
+        try:
+            child_rel = child_abs.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        entries.append(
+            {
+                "name": child.name,
+                "path": child_rel,
+                "absolute": str(child_abs),
+            }
+        )
+
+    entries.sort(key=lambda e: e["name"].casefold())
+
+    return {
+        "projectsRoot": str(root),
+        "path": rel_posix,
+        "absolute": str(target.resolve(strict=False)),
+        "parent": parent,
+        "entries": entries,
+    }

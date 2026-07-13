@@ -907,3 +907,39 @@ def test_js_tool_html_preview_discovery() -> None:
 
     assert ".tool-preview-btn" in css
     assert ".term-line.tool .tool-preview-btn" in css
+
+
+def test_new_session_folder_browser_contract() -> None:
+    """New Session modal exposes sandboxed folder browser under projects_root."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    server = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    projects = (ROOT / "hub" / "projects.py").read_text(encoding="utf-8")
+
+    assert 'id="btn-browse-folders"' in html
+    assert "Browse folders" in html
+    assert 'id="project-browser"' in html
+    assert 'id="project-browser-path"' in html
+    assert 'id="btn-browse-up"' in html
+    assert "Start session here" in html
+    assert "Back to list" in html
+    assert 'id="btn-browse-start"' in html
+    assert 'id="btn-browse-back"' in html
+    assert 'id="project-browser-list"' in html
+
+    assert "/api/projects/browse" in js
+    assert "function loadProjectBrowse" in js
+    assert "function renderProjectBrowse" in js
+    assert "function openProjectBrowser" in js
+    assert "function closeProjectBrowser" in js
+    assert "function setProjectModalMode" in js
+    assert "createSession(abs)" in js or "createSession(absolute)" in js
+
+    assert 'add_get("/api/projects/browse"' in server or 'add_get("/api/projects/browse"' in server
+    assert "handle_projects_browse" in server
+    assert "list_project_browse" in server
+    assert "def list_project_browse" in projects
+
+    assert ".project-browser" in css
+    assert ".project-browser-list" in css or ".project-browser" in css

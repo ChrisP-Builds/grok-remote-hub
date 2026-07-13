@@ -2861,6 +2861,53 @@ a {
   flex: 1;
 }
 
+.project-browse-toggle {
+  margin-top: 8px;
+  display: flex;
+  justify-content: flex-start;
+}
+
+.project-browser {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  margin-top: 4px;
+}
+
+.project-browser.hidden {
+  display: none !important;
+}
+
+.project-browser-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.project-browser-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  font-family: var(--font);
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.project-browser-list {
+  margin-top: 8px;
+}
+
+.project-browser-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
 .project-row {
   display: flex;
   flex-direction: column;
@@ -2888,6 +2935,20 @@ a {
   font-size: 11px;
   font-family: var(--font);
   color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.project-browser-list .project-row {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.project-browser-list .project-row .name {
+  flex: 1 1 auto;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
