@@ -67,7 +67,7 @@ The stock Grok CLI TUI is excellent on the desktop, but it is a **single local p
 - **History** — hydrate from `updates.jsonl` when you open a session
 - **Composer** — multi-line input, slash palette, prompt queue while a turn runs
 - **Files** — sandboxed tree for the session cwd (edit, markdown + Mermaid, images)
-- **Site preview** — double-click or **Preview** on `.html` / `.htm` in the Files tree; same-origin Python serve (relative CSS/JS work on Tailscale/phone); Close stops the preview
+- **Site preview** — double-click or **Preview** on `.html` / `.htm` in the Files tree, or **Preview** on a tool row when an HTML path is present; same-origin Python serve (relative CSS/JS work on Tailscale/phone); Close stops the preview
 - **Usage** — session context + weekly plan bars (from local Grok login)
 - **Ops scripts** — detached start / stop / restart, firewall helper, logon task
 - **Terminal follower** — `follow.ps1` tails the same session in a desktop terminal

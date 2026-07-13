@@ -9,6 +9,15 @@ This file is the **public narrative**. Session chat context is not required to u
 
 ## [Unreleased]
 
+### Added
+- **Tool-row site Preview** — when a tool summary/path ends in `.html`/`.htm`, a compact **Preview** control opens the existing in-hub site preview (file-first; ADR 010).
+- **Sticky active user prompt** — current **You:** line pins to the top of the transcript while the turn runs.
+
+### Fixed
+- Tools stay **collapsed** by default; empty expand no longer shows “No detail.”
+- Thinking summary no longer doubles the word “Thinking.”
+- Composer placeholder adapts to width (short vs slash-hint) with CSS ellipsis.
+
 ---
 
 ## [0.3.2] — 2026-07-12
