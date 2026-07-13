@@ -1577,6 +1577,16 @@ a {
   background: var(--warn);
 }
 
+/* Process up, ACP heal exhausted — needs KillAgent / restart */
+.status-pill[data-state="acp-hung"] {
+  color: var(--danger);
+  border-color: rgba(240, 113, 120, 0.4);
+}
+
+.status-pill[data-state="acp-hung"] .status-dot {
+  background: var(--danger);
+}
+
 .status-pill[data-state="local"] {
   color: var(--muted);
 }
