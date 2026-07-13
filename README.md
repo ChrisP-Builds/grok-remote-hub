@@ -64,6 +64,7 @@ The stock Grok CLI TUI is excellent on the desktop, but it is a **single local p
 
 - **Session rail** — Working / Subagent / All, search, pin, rename, delete
 - **Live stream** — multi-browser WebSocket fan-out; mid-turn switch keeps continuity
+- **Agent status** — pill and `/health` distinguish process up vs ACP connected (reconnecting / hung vs true agent down); auto-reconnect ACP when the serve process is still listening
 - **History** — hydrate from `updates.jsonl` when you open a session
 - **Composer** — multi-line input, slash palette, prompt queue while a turn runs
 - **Files** — sandboxed tree for the session cwd (edit, markdown + Mermaid, images)
