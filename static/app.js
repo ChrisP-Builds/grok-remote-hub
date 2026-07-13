@@ -1901,11 +1901,13 @@
         if (v && v.pane) {
           markStalePlanItems(v.pane, true);
           clearActiveUserPrompt(v.pane);
+          finalizeAssistantTables(v.pane);
         }
       }
     }
     if (state.activePane) markStalePlanItems(state.activePane, true);
     clearActiveUserPrompt();
+    finalizeAssistantTables(transcriptRoot());
 
     setComposerEnabled(composerConnected());
     forceComposerUnlocked();
@@ -2143,6 +2145,19 @@
     forceComposerUnlocked();
     updateTurnStrip();
     renderSessions();
+    // Turn ended: re-parse any assistant tables that finished after last stream chunk.
+    if (!running) {
+      const idleSid = sessionId || state.selectedId;
+      let idleRoot = null;
+      if (idleSid && state.sessionViews) {
+        const v = state.sessionViews.get(idleSid);
+        if (v && v.pane) idleRoot = v.pane;
+      }
+      if (!idleRoot && (!idleSid || idleSid === state.selectedId)) {
+        idleRoot = transcriptRoot();
+      }
+      if (idleRoot) finalizeAssistantTables(idleRoot);
+    }
   }
 
   async function applySessionSwitch(fromId, toId, reason, message) {
@@ -2868,6 +2883,8 @@
       if (!state._reconnectScrollFreeze) {
         state._suppressStickyScroll = false;
       }
+      // Cheap: ensure GFM tables in loaded history are rendered (uses _rawText).
+      finalizeAssistantTables(transcriptRoot());
       updateTurnStrip();
       if (jump && state.stickToBottom && !state._reconnectScrollFreeze) jumpToLatest();
       else updateJumpLatestUiOnly();
@@ -2938,6 +2955,8 @@
 
   function setTermBodyContent(bodyEl, text) {
     const raw = text == null ? "" : String(text);
+    // Always keep markdown source; after a table render, textContent has no pipes.
+    bodyEl._rawText = raw;
     const table = parseSimpleMarkdownTable(raw);
     if (!table || table.length < 1) {
       bodyEl.textContent = raw;
@@ -3009,6 +3028,23 @@
       post.textContent = (after.startsWith("\n") ? "" : "\n") + after;
       bodyEl.appendChild(post);
     }
+  }
+
+  /**
+   * Re-parse assistant bodies that still have table markdown in _rawText.
+   * Mid-stream may miss a complete table; never re-parse from textContent (no pipes).
+   */
+  function finalizeAssistantTables(root) {
+    const r = root || transcriptRoot();
+    if (!r) return;
+    r.querySelectorAll(".term-line.assistant .term-body").forEach((body) => {
+      const raw = body._rawText != null ? String(body._rawText) : "";
+      if (!raw.includes("|")) return;
+      // Incomplete mid-stream then complete: re-run even if a partial .term-table exists.
+      if (!body.querySelector(".term-table") || raw.includes("|")) {
+        setTermBodyContent(body, raw);
+      }
+    });
   }
 
   function planHasActiveWork(entries) {
@@ -3429,17 +3465,15 @@
     noteTermLineActivity();
     const body = el.querySelector(".term-body");
     if (!body) return;
-    // Streaming: prefer plain text append for speed; re-parse table only if pipes appear
-    if (body.querySelector(".term-table")) {
-      setTermBodyContent(body, (body._rawText || body.textContent || "") + text);
-      body._rawText = (body._rawText || "") + text;
-      return;
-    }
-    body._rawText = (body._rawText || body.textContent || "") + text;
-    if (body._rawText.includes("|") && body._rawText.includes("\n")) {
-      setTermBodyContent(body, body._rawText);
+    // Always accumulate from _rawText (source of truth). After a table render,
+    // body.textContent is cell text without pipes — never re-parse from it.
+    const prev = body._rawText != null ? String(body._rawText) : String(body.textContent || "");
+    const next = prev + text;
+    body._rawText = next;
+    if (next.includes("|") && next.includes("\n")) {
+      setTermBodyContent(body, next);
     } else {
-      body.textContent = body._rawText;
+      body.textContent = next;
     }
   }
 
@@ -4747,6 +4781,13 @@
           }
           // Selected session went idle: strip must show idle for it.
           updateTurnStrip();
+          // Still finalize tables for the session that just finished.
+          if (!sid || sid === state.selectedId) {
+            finalizeAssistantTables(transcriptRoot());
+          } else if (state.sessionViews) {
+            const v = state.sessionViews.get(sid);
+            if (v && v.pane) finalizeAssistantTables(v.pane);
+          }
         } else {
           setTurnRunning(false, sid, { forceIdleFlags: true });
         }
