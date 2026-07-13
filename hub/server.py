@@ -48,7 +48,11 @@ from hub.session_index import (
     stamp_hub_origin,
 )
 from hub.billing_usage import fetch_credits_usage
-from hub.status_view import map_agent_status
+from hub.status_view import (
+    ACP_HEAL_MAX_ATTEMPTS,
+    map_agent_status,
+    should_attempt_acp_heal,
+)
 from hub.session_signals import read_session_signals, read_signals_file, find_signals_path
 from hub.session_policy import (
     STUCK_TURN_SECONDS,
@@ -157,6 +161,12 @@ class Hub:
         self.tailscale_ip: str | None = None
         self.agent_status = "down"
         self.acp_connected = False
+        # ACP self-heal: reconnect when process is up but WebSocket is down.
+        self._acp_heal_attempts = 0
+        self._acp_heal_max = ACP_HEAL_MAX_ATTEMPTS
+        self._acp_disconnected_at: float | None = None  # monotonic
+        self._acp_heal_last_error: str | None = None
+        self._acp_heal_in_progress = False
         self.clients: set[web.WebSocketResponse] = set()
         self.subscriptions: dict[web.WebSocketResponse, set[str]] = {}
         # Background WS work (prompt/cancel) so the receive loop can process pings.
@@ -286,6 +296,11 @@ class Hub:
         ]
         pending_q = sorted(self.acp.sessions_with_pending_questions())
         session_flags = self._session_flags_map()
+        heal_exhausted = (
+            self._acp_heal_attempts >= self._acp_heal_max
+            and not bool(mapped["acpConnected"])
+            and mapped["agentProcess"] == "up"
+        )
         return {
             "type": "status",
             "agent": mapped["agent"],
@@ -294,6 +309,8 @@ class Hub:
             "bind": self.bind_mode,
             "tailscaleIp": self.tailscale_ip,
             "acpConnected": mapped["acpConnected"],
+            "acpHealAttempts": self._acp_heal_attempts,
+            "acpHealError": self._acp_heal_last_error if heal_exhausted else None,
             "loadedSessionId": self.acp.loaded_session_id,
             "turnRunning": self.acp.turn_running,
             "turnSessionId": self.acp.turn_session_id,
@@ -354,11 +371,26 @@ class Hub:
 
     async def _on_agent_status(self, status: str) -> None:
         self.agent_status = status
+        if status != "up":
+            # Process down: do not auto-heal; reset budget for next process-up.
+            self._acp_heal_attempts = 0
+            self._acp_heal_last_error = None
         await self.broadcast(self.status_payload())
 
     async def _on_acp_connection(self, connected: bool) -> None:
         self.acp_connected = connected
-        if not connected:
+        if connected:
+            if self._acp_heal_attempts or self._acp_heal_last_error:
+                log.info(
+                    "ACP heal: connected; reset heal attempts (was n=%s)",
+                    self._acp_heal_attempts,
+                )
+            self._acp_heal_attempts = 0
+            self._acp_disconnected_at = None
+            self._acp_heal_last_error = None
+        else:
+            if self._acp_disconnected_at is None:
+                self._acp_disconnected_at = time.monotonic()
             # Prior process-local session/new ids are dead after ACP drop.
             # Keep remote_agent_session for UI badges; next ensure will session/new.
             if self.acp_created_sessions:
@@ -852,6 +884,7 @@ class Hub:
         app.router.add_post("/api/sessions/{id}/load", self.handle_load_session)
         app.router.add_post("/api/sessions/{id}/attach", self.handle_attach_session)
         app.router.add_post("/api/admin/reset-turn", self.handle_reset_turn)
+        app.router.add_post("/api/admin/reconnect-acp", self.handle_reconnect_acp)
         app.router.add_get("/api/projects", self.handle_projects)
         app.router.add_post("/api/projects", self.handle_create_project)
         app.router.add_get("/api/skills", self.handle_skills)
@@ -939,12 +972,17 @@ class Hub:
 
         Near-streaming cadence (1s) while any turn is active; slower when idle.
         Also surfaces watchdog force-clears that may not have gone through WS prompt.
+        Triggers ACP self-heal when agent process is up but ACP is disconnected.
         """
         try:
             while True:
                 active = bool(self.acp.turn_running) or bool(self.acp.turn_session_ids)
                 # 1.0s while turns run so rail pills stay fresh; 5–10s when idle.
                 await asyncio.sleep(1.0 if active else 8.0)
+                try:
+                    await self._maybe_heal_acp()
+                except Exception:
+                    log.debug("ACP heal tick failed", exc_info=True)
                 reason = self.acp.last_force_clear_reason
                 if reason and reason != self._last_broadcast_force_clear:
                     sid = self.acp.last_force_clear_session
@@ -968,6 +1006,64 @@ class Hub:
         except asyncio.CancelledError:
             return
 
+    async def _maybe_heal_acp(self) -> None:
+        """Reconnect ACP when agent process is up but the WebSocket is down.
+
+        Capped attempts with backoff; never spawns extra agent processes.
+        """
+        if self._acp_disconnected_at is None and (
+            self.agent_status == "up" and not self.acp_connected
+        ):
+            self._acp_disconnected_at = time.monotonic()
+        disconnected_for: float | None = None
+        if self._acp_disconnected_at is not None:
+            disconnected_for = time.monotonic() - self._acp_disconnected_at
+        if not should_attempt_acp_heal(
+            agent_process_up=self.agent_status == "up",
+            acp_connected=self.acp_connected,
+            heal_in_progress=self._acp_heal_in_progress,
+            attempts=self._acp_heal_attempts,
+            disconnected_for_s=disconnected_for,
+            max_attempts=self._acp_heal_max,
+        ):
+            return
+        self._acp_heal_in_progress = True
+        n = self._acp_heal_attempts + 1
+        self._acp_heal_attempts = n
+        log.info(
+            "ACP heal: reconnect attempt n=%s/%s (agent up, acp down for %.1fs)",
+            n,
+            self._acp_heal_max,
+            disconnected_for if disconnected_for is not None else -1.0,
+        )
+        try:
+            await self.acp.reconnect(timeout=10.0)
+            if self.acp.connected or self.acp_connected:
+                log.info("ACP heal: reconnect ok n=%s", n)
+                self._acp_heal_last_error = None
+            else:
+                self._acp_heal_last_error = "reconnect returned without connection"
+                log.warning("ACP heal: failed n=%s: %s", n, self._acp_heal_last_error)
+        except Exception as exc:
+            self._acp_heal_last_error = str(exc)
+            log.warning("ACP heal: failed n=%s: %s", n, exc)
+        finally:
+            self._acp_heal_in_progress = False
+            if (
+                self._acp_heal_attempts >= self._acp_heal_max
+                and not self.acp_connected
+            ):
+                log.warning(
+                    "ACP heal: exhausted attempts n=%s; last error=%s "
+                    "(restart with KillAgent if agent hung)",
+                    self._acp_heal_attempts,
+                    self._acp_heal_last_error,
+                )
+                try:
+                    await self.broadcast(self.status_payload())
+                except Exception:
+                    log.debug("ACP heal exhausted status broadcast failed", exc_info=True)
+
     async def handle_index(self, request: web.Request) -> web.FileResponse:
         return web.FileResponse(Path(self.config.static_dir) / "index.html")
 
@@ -982,6 +1078,16 @@ class Hub:
             "agentProcess": mapped["agentProcess"],
             "agentDetail": mapped["agentDetail"],
             "acpConnected": mapped["acpConnected"],
+            "acpHealAttempts": self._acp_heal_attempts,
+            "acpHealError": (
+                self._acp_heal_last_error
+                if (
+                    self._acp_heal_attempts >= self._acp_heal_max
+                    and not bool(mapped["acpConnected"])
+                    and mapped["agentProcess"] == "up"
+                )
+                else None
+            ),
             "bind": self.bind_mode,
             "host": self.bind_host,
             "hosts": list(self.bind_hosts),
@@ -1062,6 +1168,54 @@ class Hub:
                 "sessionIds": sids,
             }
         )
+
+    async def handle_reconnect_acp(self, request: web.Request) -> web.Response:
+        """Manual ACP WebSocket reconnect (no KillAgent, no new agent process).
+
+        Resets the auto-heal attempt budget so operators can retry after exhaustion.
+        """
+        if self.agent_status != "up":
+            return web.json_response(
+                {"ok": False, "error": "agent process down", "acpConnected": False},
+                status=503,
+            )
+        if self._acp_heal_in_progress:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "ACP heal already in progress",
+                    "acpConnected": self.acp_connected,
+                },
+                status=409,
+            )
+        self._acp_heal_attempts = 0
+        self._acp_heal_last_error = None
+        if self._acp_disconnected_at is None and not self.acp_connected:
+            self._acp_disconnected_at = time.monotonic()
+        log.info("ACP heal: manual reconnect via POST /api/admin/reconnect-acp")
+        self._acp_heal_in_progress = True
+        err: str | None = None
+        try:
+            await self.acp.reconnect(timeout=10.0)
+            if not (self.acp.connected or self.acp_connected):
+                err = "reconnect returned without connection"
+                self._acp_heal_last_error = err
+        except Exception as exc:
+            err = str(exc)
+            self._acp_heal_last_error = err
+            log.warning("ACP heal: manual reconnect failed: %s", exc)
+        finally:
+            self._acp_heal_in_progress = False
+        await self.broadcast(self.status_payload())
+        ok = bool(self.acp_connected)
+        body: dict[str, Any] = {
+            "ok": ok,
+            "acpConnected": ok,
+            "agentProcess": self.agent_status,
+        }
+        if err and not ok:
+            body["error"] = err
+        return web.json_response(body, status=200 if ok else 502)
 
     async def handle_sessions(self, request: web.Request) -> web.Response:
         return web.json_response({"items": self._sessions_items_with_status()})
