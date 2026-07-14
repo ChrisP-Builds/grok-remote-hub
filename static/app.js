@@ -395,12 +395,15 @@
     filePreview: $("#file-preview"),
     fileImageWrap: $("#file-image-wrap"),
     fileImage: $("#file-image"),
+    fileVideoWrap: $("#file-video-wrap"),
+    fileVideo: $("#file-video"),
     fileMdModes: $("#file-md-modes"),
     fileStatus: $("#file-status"),
     btnFileBack: $("#btn-file-back"),
     btnFileEdit: $("#btn-file-edit"),
     btnFilePreview: $("#btn-file-preview"),
     btnFileInsert: $("#btn-file-insert"),
+    btnFileShare: $("#btn-file-share"),
     btnFileSave: $("#btn-file-save"),
     imageLightbox: $("#image-lightbox"),
     lightboxImg: $("#lightbox-img"),
@@ -5298,6 +5301,14 @@
     return /\.(png|jpe?g|gif|webp|bmp|svg|ico)$/i.test(String(path || ""));
   }
 
+  function isVideoPath(path) {
+    return /\.(mp4|mov|webm|m4v)$/i.test(String(path || ""));
+  }
+
+  function isMediaPath(path) {
+    return isImagePath(path) || isVideoPath(path);
+  }
+
   function isHtmlPath(path) {
     return /\.html?$/i.test(String(path || ""));
   }
@@ -5440,10 +5451,13 @@
     btn.title = "Open site preview: " + rel;
   }
 
-  function rawFsUrl(root, rel) {
-    const q =
+  function rawFsUrl(root, rel, opts) {
+    let q =
       `/api/fs/raw?root=${encodeURIComponent(root)}` +
       `&path=${encodeURIComponent(rel)}`;
+    if (opts && (opts.download === true || opts.download === 1 || opts.download === "1")) {
+      q += "&download=1";
+    }
     return apiUrl(q);
   }
 
@@ -5662,6 +5676,69 @@
     closeLightbox();
   }
 
+  function hideVideoPreview() {
+    if (els.fileVideo) {
+      try {
+        els.fileVideo.pause();
+      } catch (_) {}
+      els.fileVideo.removeAttribute("src");
+      els.fileVideo.src = "";
+      try {
+        els.fileVideo.load();
+      } catch (_) {}
+    }
+    if (els.fileVideoWrap) els.fileVideoWrap.classList.add("hidden");
+  }
+
+  function hideMediaPreviews() {
+    hideImagePreview();
+    hideVideoPreview();
+  }
+
+  function basenameFromPath(path) {
+    const s = String(path || "").replace(/\\/g, "/");
+    const parts = s.split("/");
+    return parts[parts.length - 1] || s || "download";
+  }
+
+  async function shareFsFile(root, rel) {
+    if (!root || !rel) {
+      toast("No file to share", "danger");
+      return;
+    }
+    const name = basenameFromPath(rel);
+    const url = rawFsUrl(root, rel);
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        toast(`Could not load file (HTTP ${res.status})`, "danger");
+        return;
+      }
+      const blob = await res.blob();
+      const type = blob.type || "";
+      const file = new File([blob], name, { type: type || "application/octet-stream" });
+      if (
+        typeof navigator !== "undefined" &&
+        typeof navigator.canShare === "function" &&
+        typeof navigator.share === "function" &&
+        navigator.canShare({ files: [file] })
+      ) {
+        await navigator.share({ files: [file], title: name });
+        return;
+      }
+      toast("Open full size, then long-press to save");
+      window.open(rawFsUrl(root, rel, { download: 1 }), "_blank", "noopener");
+    } catch (err) {
+      if (err && (err.name === "AbortError" || err.name === "NotAllowedError")) {
+        return;
+      }
+      toast("Share failed: " + (err && err.message ? err.message : err), "danger");
+      try {
+        window.open(rawFsUrl(root, rel, { download: 1 }), "_blank", "noopener");
+      } catch (_) {}
+    }
+  }
+
   function openLightbox(src) {
     if (!els.imageLightbox || !els.lightboxImg || !src) return;
     els.lightboxImg.src = src;
@@ -5769,13 +5846,14 @@
   }
 
   function setFileViewMode(mode) {
-    if (isImagePath(state.fs.openPath)) return;
+    if (isMediaPath(state.fs.openPath)) return;
     const next = mode === "preview" ? "preview" : "edit";
     state.fileViewMode = next;
     const showPreview = next === "preview";
     if (els.fileEditor) els.fileEditor.classList.toggle("hidden", showPreview);
     if (els.filePreview) els.filePreview.classList.toggle("hidden", !showPreview);
     if (els.fileImageWrap) els.fileImageWrap.classList.add("hidden");
+    if (els.fileVideoWrap) els.fileVideoWrap.classList.add("hidden");
     if (els.btnFileEdit) els.btnFileEdit.setAttribute("aria-selected", showPreview ? "false" : "true");
     if (els.btnFilePreview) els.btnFilePreview.setAttribute("aria-selected", showPreview ? "true" : "false");
     if (showPreview) {
@@ -5787,11 +5865,11 @@
   }
 
   function updateMdModeUi(path) {
-    const isMd = isMarkdownPath(path) && !isImagePath(path);
+    const isMd = isMarkdownPath(path) && !isMediaPath(path);
     if (els.fileMdModes) els.fileMdModes.classList.toggle("hidden", !isMd);
     if (!isMd) {
       state.fileViewMode = "edit";
-      if (!isImagePath(path)) {
+      if (!isMediaPath(path)) {
         if (els.fileEditor) els.fileEditor.classList.remove("hidden");
         if (els.filePreview) els.filePreview.classList.add("hidden");
         if (els.btnFileEdit) els.btnFileEdit.setAttribute("aria-selected", "true");
@@ -5802,7 +5880,7 @@
 
   function clearFilePreview() {
     if (els.filePreview) els.filePreview.innerHTML = "";
-    hideImagePreview();
+    hideMediaPreviews();
   }
 
   function resetFs(opts) {
@@ -5829,8 +5907,10 @@
       clearFilePreview();
       if (els.filePreview) els.filePreview.classList.add("hidden");
       if (els.fileImageWrap) els.fileImageWrap.classList.add("hidden");
+      if (els.fileVideoWrap) els.fileVideoWrap.classList.add("hidden");
       if (els.fileMdModes) els.fileMdModes.classList.add("hidden");
       if (els.btnFileSave) els.btnFileSave.classList.remove("hidden");
+      if (els.btnFileShare) els.btnFileShare.classList.add("hidden");
       updateFileDirtyUi();
       if (state.mainMode === "file") {
         setMainMode("chat");
@@ -5841,12 +5921,15 @@
 
   function updateFileDirtyUi() {
     const dirty = !!state.fs.dirty;
-    const isImage = isImagePath(state.fs.openPath);
-    if (els.fileDirty) els.fileDirty.classList.toggle("hidden", !dirty || isImage);
+    const isMedia = isMediaPath(state.fs.openPath);
+    if (els.fileDirty) els.fileDirty.classList.toggle("hidden", !dirty || isMedia);
     if (els.btnFileSave) {
-      els.btnFileSave.classList.toggle("hidden", isImage);
+      els.btnFileSave.classList.toggle("hidden", isMedia);
       els.btnFileSave.disabled =
-        isImage || !dirty || state.fs.saving || !state.fs.openPath;
+        isMedia || !dirty || state.fs.saving || !state.fs.openPath;
+    }
+    if (els.btnFileShare) {
+      els.btnFileShare.classList.toggle("hidden", !isMedia);
     }
   }
 
@@ -5876,8 +5959,10 @@
     clearFilePreview();
     if (els.filePreview) els.filePreview.classList.add("hidden");
     if (els.fileImageWrap) els.fileImageWrap.classList.add("hidden");
+    if (els.fileVideoWrap) els.fileVideoWrap.classList.add("hidden");
     if (els.fileMdModes) els.fileMdModes.classList.add("hidden");
     if (els.btnFileSave) els.btnFileSave.classList.remove("hidden");
+    if (els.btnFileShare) els.btnFileShare.classList.add("hidden");
     if (els.filePathLabel) els.filePathLabel.textContent = "";
     if (els.fileStatus) els.fileStatus.textContent = "";
     updateFileDirtyUi();
@@ -6128,6 +6213,7 @@
       state.fs.dirty = false;
       state.fs.error = null;
       state.fileViewMode = "edit";
+      hideVideoPreview();
       if (els.fileEditor) {
         els.fileEditor.value = "";
         els.fileEditor.disabled = true;
@@ -6150,7 +6236,38 @@
       return;
     }
 
-    hideImagePreview();
+    if (isVideoPath(rel)) {
+      state.fs.root = root;
+      state.fs.openPath = rel;
+      state.fs.content = "";
+      state.fs.baseline = "";
+      state.fs.dirty = false;
+      state.fs.error = null;
+      state.fileViewMode = "edit";
+      hideImagePreview();
+      if (els.fileEditor) {
+        els.fileEditor.value = "";
+        els.fileEditor.disabled = true;
+        els.fileEditor.classList.add("hidden");
+      }
+      if (els.filePreview) {
+        els.filePreview.innerHTML = "";
+        els.filePreview.classList.add("hidden");
+      }
+      if (els.fileMdModes) els.fileMdModes.classList.add("hidden");
+      if (els.filePathLabel) els.filePathLabel.textContent = rel;
+      const src = rawFsUrl(root, rel) + "&t=" + Date.now();
+      if (els.fileVideo) els.fileVideo.src = src;
+      if (els.fileVideoWrap) els.fileVideoWrap.classList.remove("hidden");
+      if (els.fileStatus) els.fileStatus.textContent = "Video preview";
+      updateFileDirtyUi();
+      setMainMode("file");
+      renderFileTree();
+      if (isMobile()) closeRail();
+      return;
+    }
+
+    hideMediaPreviews();
     state.fs.loading = true;
     if (els.fileStatus) els.fileStatus.textContent = "Loading…";
     try {
@@ -7113,6 +7230,17 @@
     if (els.btnFileInsert) {
       els.btnFileInsert.addEventListener("click", () => {
         insertOpenPath();
+      });
+    }
+    if (els.btnFileShare) {
+      els.btnFileShare.addEventListener("click", () => {
+        const root = state.fs.root || (state.selectedMeta && state.selectedMeta.cwd) || "";
+        const rel = state.fs.openPath;
+        if (!root || !rel || !isMediaPath(rel)) {
+          toast("No media file open", "danger");
+          return;
+        }
+        void shareFsFile(root, rel);
       });
     }
     if (els.btnFileEdit) {

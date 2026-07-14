@@ -1141,3 +1141,40 @@ def test_cli_reload_and_new_vs_resume_entry_contract() -> None:
     assert "def sessions_matching_cwd" in policy
     assert "def entry_requires_resume_choice" in policy
     assert "def recovery_keeps_session_id" in policy
+
+
+def test_files_media_share_and_video_contract() -> None:
+    """Files panel: video preview, Share/Save media, raw download=1."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    server = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    fs_browser = (ROOT / "hub" / "fs_browser.py").read_text(encoding="utf-8")
+
+    assert "function isVideoPath" in js
+    assert "function isMediaPath" in js
+    assert "function shareFsFile" in js
+    assert "function hideVideoPreview" in js
+    assert "function rawFsUrl" in js
+    assert "download=1" in js
+    assert "navigator.canShare" in js or "canShare" in js
+    assert "navigator.share" in js
+    assert "Open full size, then long-press to save" in js
+
+    assert 'id="btn-file-share"' in html
+    assert 'id="file-video-wrap"' in html
+    assert 'id="file-video"' in html
+    assert "playsinline" in html
+    assert "controls" in html
+
+    assert ".file-video-wrap" in css
+    assert ".file-video" in css
+
+    assert "RAW_MAX_BYTES" in fs_browser
+    assert "VIDEO_EXTS" in fs_browser
+    assert "def is_video_path" in fs_browser
+    assert "def content_disposition_attachment" in fs_browser
+    assert "RAW_MAX_BYTES" in server
+    assert "download" in server
+    assert "content_disposition_attachment" in server
+    assert "handle_fs_raw" in server

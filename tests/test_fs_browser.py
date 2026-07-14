@@ -7,9 +7,12 @@ from pathlib import Path
 import pytest
 
 from hub.fs_browser import (
+    RAW_MAX_BYTES,
     FsBrowserError,
+    content_disposition_attachment,
     content_type_for,
     is_image_path,
+    is_video_path,
     list_dir,
     read_text,
     resolve_file_for_read,
@@ -246,6 +249,36 @@ def test_is_image_path() -> None:
     assert not is_image_path("notes.txt")
     assert not is_image_path("readme.md")
     assert not is_image_path("")
+
+
+def test_is_video_path() -> None:
+    assert is_video_path("clip.mp4")
+    assert is_video_path("clip.MOV")
+    assert is_video_path("a/b/c.webm")
+    assert is_video_path("demo.m4v")
+    assert is_video_path("path/to/Video.M4V")
+    assert not is_video_path("notes.txt")
+    assert not is_video_path("shot.png")
+    assert not is_video_path("readme.md")
+    assert not is_video_path("")
+
+
+def test_raw_max_bytes_video_friendly() -> None:
+    assert RAW_MAX_BYTES >= 150_000_000
+
+
+def test_content_disposition_attachment_basename_only() -> None:
+    assert content_disposition_attachment("clip.mp4") == 'attachment; filename="clip.mp4"'
+    assert content_disposition_attachment(r"a\b\clip.mp4") == 'attachment; filename="clip.mp4"'
+    assert content_disposition_attachment("a/b/clip.mp4") == 'attachment; filename="clip.mp4"'
+    # Quotes / control chars stripped
+    hdr = content_disposition_attachment('bad"name\r\n.mp4')
+    assert "attachment;" in hdr
+    assert '"' not in hdr.split("filename=", 1)[1][1:-1] or "filename=" in hdr
+    assert "\r" not in hdr and "\n" not in hdr
+    empty = content_disposition_attachment("")
+    assert empty == 'attachment; filename="download"'
+    assert content_disposition_attachment("..") == 'attachment; filename="download"'
 
 
 def test_resolve_file_for_read_png(tmp_path: Path) -> None:

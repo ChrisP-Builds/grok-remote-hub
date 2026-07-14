@@ -872,6 +872,36 @@ a {
   font-size: 12px;
 }
 
+.file-video-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  background: var(--bg);
+}
+
+.file-video-wrap.hidden {
+  display: none !important;
+}
+
+.file-video {
+  max-width: 100%;
+  max-height: 100%;
+  width: 100%;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: #000;
+}
+
+.file-video-hint {
+  margin: 10px 0 0;
+  font-size: 12px;
+}
+
 .image-lightbox {
   position: fixed;
   inset: 0;
