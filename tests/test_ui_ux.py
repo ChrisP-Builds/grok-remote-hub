@@ -179,6 +179,16 @@ def test_js_no_wait_for_turn_session_switch() -> None:
     assert "countResidualInPane" in js
     assert "markStalePlanItems" in js
     assert "livePromptSessionId" in js
+    # Residual strip must ignore history: only count plan/tool rows after last user line
+    residual_idx = js.find("function countResidualInPane")
+    assert residual_idx >= 0
+    residual_end = js.find("\n  function markStalePlanItems", residual_idx)
+    assert residual_end > residual_idx
+    residual_chunk = js[residual_idx:residual_end]
+    assert ".term-line.user" in residual_chunk
+    assert "DOCUMENT_POSITION_FOLLOWING" in residual_chunk
+    assert "afterLastUser" in residual_chunk
+    assert "lastUser" in residual_chunk
     # autoGrow must re-stick after height change (same turn as resize)
     auto_idx = js.find("function autoGrow")
     assert auto_idx >= 0
@@ -583,6 +593,55 @@ def test_js_turn_idle_clears_selected_strip() -> None:
     assert idle_flag < row_status
 
 
+def test_js_stream_visibility_contract() -> None:
+    """ACP stream chunks must paint transcript; optimistic user on submit; e2e hooks."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    # Live stream path: agent message + thought chunks
+    msg_idx = js.find('if (kind === "agent_message_chunk")')
+    assert msg_idx >= 0
+    msg_chunk = js[msg_idx : msg_idx + 500]
+    assert "appendMessage" in msg_chunk
+    assert 'role: "assistant"' in msg_chunk or "role: 'assistant'" in msg_chunk
+
+    thought_idx = js.find('if (kind === "agent_thought_chunk")')
+    assert thought_idx >= 0
+    thought_chunk = js[thought_idx : thought_idx + 700]
+    assert "appendMessage" in thought_chunk
+    assert 'role: "thought"' in thought_chunk or "role: 'thought'" in thought_chunk
+    assert "open: true" in thought_chunk
+
+    # handleAcpMessage marks working on stream kinds and dispatches paint
+    handle_idx = js.find("function handleAcpMessage")
+    assert handle_idx >= 0
+    handle_chunk = js[handle_idx : handle_idx + 3500]
+    assert "markSessionActivity" in handle_chunk
+    assert "agent_message_chunk" in handle_chunk
+    assert "agent_thought_chunk" in handle_chunk
+    assert '"working"' in handle_chunk
+    assert "processAcpSessionUpdate" in handle_chunk
+
+    # Optimistic user bubble on submit (instant feedback, not wait for ACP echo)
+    submit_idx = js.find("function submitPrompt")
+    assert submit_idx >= 0
+    submit_chunk = js[submit_idx : submit_idx + 1800]
+    assert "appendMessage" in submit_chunk
+    assert 'role: "user"' in submit_chunk or "role: 'user'" in submit_chunk
+
+    # E2E inject hooks: same live path, no auth bypass
+    assert "window.__hubTestHooks" in js
+    hooks_idx = js.find("window.__hubTestHooks")
+    assert hooks_idx >= 0
+    hooks_chunk = js[hooks_idx : hooks_idx + 1600]
+    assert "injectAcpSessionUpdate" in hooks_chunk
+    assert "handleAcpMessage" in hooks_chunk
+    assert "transcriptTextIncludes" in hooks_chunk
+    assert "transcriptHasRole" in hooks_chunk
+    assert "turnStripText" in hooks_chunk
+    assert "setSelectedForTest" in hooks_chunk
+    assert "showSessionPane" in hooks_chunk
+
+
 def test_server_emit_error_logs_client_errors() -> None:
     """Every client error path should log via _emit_error (hub daily log)."""
     src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
@@ -934,7 +993,9 @@ def test_new_session_folder_browser_contract() -> None:
     assert "function openProjectBrowser" in js
     assert "function closeProjectBrowser" in js
     assert "function setProjectModalMode" in js
-    assert "createSession(abs)" in js or "createSession(absolute)" in js
+    # New-vs-Resume entry: browse/list pick path via onProjectChosen, not bare createSession
+    assert "onProjectChosen(abs)" in js or "function onProjectChosen" in js
+    assert "function createSession" in js
 
     assert 'add_get("/api/projects/browse"' in server or 'add_get("/api/projects/browse"' in server
     assert "handle_projects_browse" in server
@@ -943,3 +1004,79 @@ def test_new_session_folder_browser_contract() -> None:
 
     assert ".project-browser" in css
     assert ".project-browser-list" in css or ".project-browser" in css
+
+
+def test_cli_reload_and_new_vs_resume_entry_contract() -> None:
+    """Reload recovery + Resume vs Start new entry (CLI interrupt-then-continue)."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    policy = (ROOT / "hub" / "session_policy.py").read_text(encoding="utf-8")
+
+    assert 'id="btn-reload"' in html
+    assert "Reload" in html
+    assert "Stop turn and re-attach this session (resume)" in html
+    assert 'id="project-entry-choice"' in html
+    assert 'id="btn-entry-start-new"' in html
+    assert 'id="btn-entry-back"' in html
+    assert 'id="project-entry-priors"' in html
+    assert "Start new session" in html
+
+    assert "function reloadResumeSession" in js
+    assert "function onProjectChosen" in js
+    assert "function sessionsMatchingCwd" in js
+    assert "function stopTurnForSession" in js
+    assert "function showEntryChoice" in js
+    assert "/api/admin/reset-turn" in js
+    assert "openSession" in js
+    # Reload re-attaches same id; must not POST create on recovery path
+    reload_idx = js.find("async function reloadResumeSession")
+    assert reload_idx >= 0
+    reload_end = js.find("\n  async function ", reload_idx + 10)
+    if reload_end < 0:
+        reload_end = js.find("\n  function ", reload_idx + 10)
+    reload_chunk = js[reload_idx : reload_end if reload_end > 0 else reload_idx + 4000]
+    assert "openSession" in reload_chunk
+    assert "stopTurnForSession" in reload_chunk
+    assert "const clearOk = await stopTurnForSession" in reload_chunk
+    assert "clear_failed" in reload_chunk
+    assert "Could not clear turn" in reload_chunk
+    assert "opened.ok" in reload_chunk or "!opened.ok" in reload_chunk or "opened && opened.ok" in reload_chunk or "!opened || !opened.ok" in reload_chunk
+    assert "Session resumed" in reload_chunk
+    assert "/api/sessions" not in reload_chunk
+    # openSession returns consistent result objects
+    open_idx = js.find("async function openSession")
+    assert open_idx >= 0
+    open_end = js.find("\n  async function ", open_idx + 10)
+    if open_end < 0:
+        open_end = js.find("\n  function ", open_idx + 10)
+    open_chunk = js[open_idx : open_end if open_end > 0 else open_idx + 8000]
+    assert 'reason: "cancelled"' in open_chunk or 'reason:"cancelled"' in open_chunk
+    assert "attach_failed" in open_chunk
+    assert "historyOnly" in open_chunk
+    assert "ok: true" in open_chunk or "ok:true" in open_chunk
+    stop_idx = js.find("async function stopTurnForSession")
+    assert stop_idx >= 0
+    stop_chunk = js[stop_idx : stop_idx + 900]
+    assert "reset-turn" in stop_chunk
+    assert "sessionId" in stop_chunk
+    assert "return res.ok" in stop_chunk
+    # New flow offers Resume when priors
+    assert "showEntryChoice" in js
+    assert "Resume" in js
+    assert "entryRequiresResumeChoice" in js
+    assert "reloadResumeSession," in js or "reloadResumeSession" in js
+    assert "sessionsMatchingCwd" in js
+    assert "stopTurnForSession" in js
+    assert "setSessionsForTest" in js
+    assert "getSessionIdsForTest" in js
+    assert "openSession," in js or "openSession" in js
+    assert "onProjectChosen," in js or "onProjectChosen" in js
+
+    assert ".project-entry-choice" in css
+    assert ".project-entry-row" in css or ".project-entry-priors" in css
+    assert "#btn-reload" in css or "btn-reload" in css
+
+    assert "def sessions_matching_cwd" in policy
+    assert "def entry_requires_resume_choice" in policy
+    assert "def recovery_keeps_session_id" in policy

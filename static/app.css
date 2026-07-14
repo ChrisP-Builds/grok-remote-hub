@@ -2908,6 +2908,75 @@ a {
   margin-top: 10px;
 }
 
+.project-entry-choice {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  margin-top: 4px;
+}
+
+.project-entry-choice.hidden {
+  display: none !important;
+}
+
+.project-entry-cwd {
+  font-size: 11.5px;
+  font-family: var(--font);
+  margin: 0 0 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.project-entry-priors {
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.project-entry-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+.project-entry-row .entry-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-entry-row .entry-title {
+  font-weight: 500;
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.project-entry-row .entry-id {
+  font-size: 11px;
+  font-family: var(--font);
+  color: var(--muted);
+}
+
+#btn-reload:not(.hidden) {
+  flex: 0 0 auto;
+}
+
 .project-row {
   display: flex;
   flex-direction: column;

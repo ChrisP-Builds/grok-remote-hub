@@ -344,8 +344,10 @@
     _skillsLoaded: false,
     _skillsFetching: false,
     projects: [],
-    /** New-session modal: "list" | "browse" */
+    /** New-session modal: "list" | "browse" | "entry" */
     projectModalMode: "list",
+    entryChoiceCwd: null,
+    reloadingSession: false,
     /** Current folder browser payload from /api/projects/browse */
     projectBrowse: null,
     pendingUserQuestion: null, // { requestId, sessionId, questions, toolCallId }
@@ -421,6 +423,7 @@
     input: $("#composer-input"),
     btnSend: $("#btn-send"),
     btnStop: $("#btn-stop"),
+    btnReload: $("#btn-reload"),
     composerHint: $("#composer-hint"),
     slash: $("#slash-palette"),
     btnMenu: $("#btn-menu"),
@@ -454,6 +457,14 @@
     btnBrowseUp: $("#btn-browse-up"),
     btnBrowseStart: $("#btn-browse-start"),
     btnBrowseBack: $("#btn-browse-back"),
+    projectEntryChoice: $("#project-entry-choice"),
+    projectEntryPriors: $("#project-entry-priors"),
+    projectEntryCwd: $("#project-entry-cwd"),
+    projectEntryChoiceHelp: $("#project-entry-choice-help"),
+    btnEntryStartNew: $("#btn-entry-start-new"),
+    btnEntryBack: $("#btn-entry-back"),
+    modalNewTitle: $("#modal-new-title"),
+    modalNewHelp: $("#modal-new-help"),
     toastHost: $("#toast-host"),
     errorStrip: $("#error-strip"),
     errorStripTime: $("#error-strip-time"),
@@ -1669,8 +1680,16 @@
       tool_failed: 0,
     };
     if (!pane) return counts;
+    // Only last-turn leftovers: history often leaves tools/plans open or failed.
+    const users = pane.querySelectorAll(".term-line.user");
+    const lastUser = users.length ? users[users.length - 1] : null;
+    if (!lastUser) return counts;
+    function afterLastUser(el) {
+      return !!(lastUser.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING);
+    }
     const planItems = pane.querySelectorAll(".plan-item");
     for (const li of planItems) {
+      if (!afterLastUser(li)) continue;
       const st = normalizeStatus(li.dataset.status || "");
       if (st === "pending" || st === "in_progress") counts.plan_pending += 1;
       else if (st === "running") counts.plan_running += 1;
@@ -1678,6 +1697,7 @@
     }
     const tools = pane.querySelectorAll("details.term-line.tool, .term-line.tool");
     for (const row of tools) {
+      if (!afterLastUser(row)) continue;
       const st = normalizeStatus(row.dataset.status || "");
       if (st === "pending" || st === "in_progress") counts.tool_pending += 1;
       else if (st === "running") counts.tool_running += 1;
@@ -1820,6 +1840,12 @@
     }
     if (els.btnStop) {
       els.btnStop.classList.toggle("hidden", !turnRunningOnSelected());
+    }
+    // Reload: Stop + re-attach same id. Visible whenever a session is open (not empty main).
+    if (els.btnReload) {
+      const showReload = !!state.selectedId && !state.reloadingSession;
+      els.btnReload.classList.toggle("hidden", !showReload);
+      els.btnReload.disabled = !!state.reloadingSession;
     }
     if (!state.selectedId) {
       els.composerHint.textContent =
@@ -3852,6 +3878,10 @@
     }
   }
 
+  /**
+   * Open a session for viewing and attach a live hub session when possible.
+   * @returns {Promise<{ok:boolean, reason?:string, viewId?:string, liveId?:string, switched?:boolean, historyOnly?:boolean}>}
+   */
   async function openSession(session) {
     // Mid-turn switch is allowed; live turn keeps streaming into its session pane.
     if (
@@ -3859,7 +3889,9 @@
       state.selectedId &&
       state.selectedId !== session.sessionId
     ) {
-      if (!window.confirm("Discard unsaved changes?")) return;
+      if (!window.confirm("Discard unsaved changes?")) {
+        return { ok: false, reason: "cancelled" };
+      }
       state.fs.dirty = false;
     }
 
@@ -3934,12 +3966,16 @@
       try {
         const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(viewId)}/history`));
         const data = await res.json();
-        if (state.selectedId !== viewId) return;
+        if (state.selectedId !== viewId) {
+          return { ok: false, reason: "cancelled", viewId };
+        }
         applyHistoryMessages(data.messages || [], {
           jump: !!state.stickToBottom,
         });
       } catch (err) {
-        if (state.selectedId !== viewId) return;
+        if (state.selectedId !== viewId) {
+          return { ok: false, reason: "cancelled", viewId };
+        }
         clearTranscript();
         showEmptyMain(false);
         showSessionPane(viewId);
@@ -3965,7 +4001,7 @@
       if (state.stickToBottom) scrollIfSticky();
       // Do not focus-steal from long turn; still unlock composer for queue/view.
       forceComposerUnlocked();
-      return;
+      return { ok: true, viewId, liveId: viewId, switched: false, historyOnly: true };
     }
     if (!(isLiveTurnHere && reusePane)) {
       try {
@@ -3975,13 +4011,13 @@
         });
         if (!attached) {
           subscribeSessionIds(viewId, liveKeep);
-          return;
+          return { ok: false, reason: "attach_failed", viewId };
         }
         if (
           state.selectedId !== viewId &&
           state.selectedId !== attached.liveId
         ) {
-          return;
+          return { ok: false, reason: "cancelled", viewId };
         }
         liveId = attached.liveId;
         switched = !!attached.switched && liveId !== viewId;
@@ -4015,7 +4051,7 @@
         toast("Attach failed: " + err, "danger");
         subscribeSessionIds(viewId, liveKeep);
         els.input.focus();
-        return;
+        return { ok: false, reason: "attach_failed", viewId };
       }
     }
 
@@ -4034,6 +4070,7 @@
     els.input.focus({ preventScroll: true });
     // Focus can still nudge layout on some mobile browsers
     requestAnimationFrame(() => clampHorizontalScroll());
+    return { ok: true, viewId, liveId, switched };
   }
 
   function sendWs(obj) {
@@ -6576,6 +6613,7 @@
     els.modalNew.classList.remove("hidden");
     els.projectSearch.value = "";
     if (els.projectNewName) els.projectNewName.value = "";
+    state.entryChoiceCwd = null;
     setProjectModalMode("list");
     await refreshProjects();
     if (els.projectNewName) els.projectNewName.focus();
@@ -6584,14 +6622,218 @@
 
   function closeNewModal() {
     els.modalNew.classList.add("hidden");
+    state.entryChoiceCwd = null;
     setProjectModalMode("list");
   }
 
   function setProjectModalMode(mode) {
-    state.projectModalMode = mode === "browse" ? "browse" : "list";
-    const browse = state.projectModalMode === "browse";
-    if (els.projectListView) els.projectListView.classList.toggle("hidden", browse);
-    if (els.projectBrowser) els.projectBrowser.classList.toggle("hidden", !browse);
+    const m = mode === "browse" || mode === "entry" ? mode : "list";
+    state.projectModalMode = m;
+    if (els.projectListView) els.projectListView.classList.toggle("hidden", m !== "list");
+    if (els.projectBrowser) els.projectBrowser.classList.toggle("hidden", m !== "browse");
+    if (els.projectEntryChoice) els.projectEntryChoice.classList.toggle("hidden", m !== "entry");
+    if (els.modalNewTitle) {
+      els.modalNewTitle.textContent =
+        m === "entry" ? "Resume or start new" : "New session";
+    }
+    if (els.modalNewHelp) {
+      els.modalNewHelp.classList.toggle("hidden", m === "entry");
+      if (m !== "entry") {
+        els.modalNewHelp.textContent = "Pick a project working directory.";
+      }
+    }
+  }
+
+  /** Normalize path like hub.session_policy.cwd_key (backslash, strip, casefold). */
+  function cwdKeyClient(cwd) {
+    return String(cwd || "")
+      .replace(/\//g, "\\")
+      .replace(/\\+$/, "")
+      .toLowerCase();
+  }
+
+  /** Client mirror of hub.session_policy.sessions_matching_cwd. */
+  function sessionsMatchingCwd(cwd, excludeSubagents) {
+    const key = cwdKeyClient(cwd);
+    if (!key) return [];
+    const exclude = excludeSubagents !== false;
+    const items = (state.sessions || []).filter((s) => {
+      if (!s) return false;
+      if (exclude && s.isSubagent) return false;
+      return cwdKeyClient(s.cwd) === key;
+    });
+    items.sort((a, b) => {
+      const ta = String((a && a.updatedAt) || "");
+      const tb = String((b && b.updatedAt) || "");
+      if (ta === tb) return 0;
+      return ta < tb ? 1 : -1;
+    });
+    return items;
+  }
+
+  function entryRequiresResumeChoice(priorCount) {
+    return Number(priorCount) > 0;
+  }
+
+  async function onProjectChosen(cwd) {
+    const path = String(cwd || "").trim();
+    if (!path) {
+      toast("No folder selected", "danger");
+      return;
+    }
+    const priors = sessionsMatchingCwd(path);
+    if (!entryRequiresResumeChoice(priors.length)) {
+      await createSession(path);
+      return;
+    }
+    showEntryChoice(path, priors);
+  }
+
+  function showEntryChoice(cwd, priors) {
+    state.entryChoiceCwd = String(cwd || "");
+    setProjectModalMode("entry");
+    if (els.projectEntryCwd) {
+      els.projectEntryCwd.textContent = state.entryChoiceCwd;
+      els.projectEntryCwd.title = state.entryChoiceCwd;
+    }
+    if (!els.projectEntryPriors) return;
+    els.projectEntryPriors.innerHTML = "";
+    const list = Array.isArray(priors) ? priors : [];
+    for (const row of list) {
+      const wrap = document.createElement("div");
+      wrap.className = "project-entry-row";
+      wrap.setAttribute("role", "listitem");
+      const meta = document.createElement("div");
+      meta.className = "entry-meta";
+      const title = document.createElement("span");
+      title.className = "entry-title";
+      title.textContent = row.title || "Untitled session";
+      const idEl = document.createElement("span");
+      idEl.className = "entry-id";
+      const sid = String(row.sessionId || "");
+      idEl.textContent = sid.length > 12 ? sid.slice(0, 8) + "…" : sid;
+      idEl.title = sid;
+      meta.append(title, idEl);
+      const resumeBtn = document.createElement("button");
+      resumeBtn.type = "button";
+      resumeBtn.className = "btn btn-sm btn-accent";
+      resumeBtn.textContent = "Resume";
+      resumeBtn.addEventListener("click", async () => {
+        closeNewModal();
+        await openSession(row);
+      });
+      wrap.append(meta, resumeBtn);
+      els.projectEntryPriors.appendChild(wrap);
+    }
+  }
+
+  async function stopTurnForSession(sessionId) {
+    const sid = String(sessionId || "").trim();
+    if (!sid) return false;
+    sendWs({ type: "cancel", sessionId: sid });
+    try {
+      const res = await fetch(apiUrl("/api/admin/reset-turn"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: sid }),
+      });
+      return res.ok;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * Stop turn + re-attach the same selected session (CLI interrupt-then-continue).
+   * @returns {Promise<{ok:boolean, reason?:string, expectedView?:string, liveId?:string, switched?:boolean}>}
+   */
+  async function reloadResumeSession() {
+    const viewId = String(state.selectedId || "").trim();
+    const sid = String(state.livePromptSessionId || state.selectedId || "").trim();
+    if (!viewId && !sid) {
+      toast("No session selected", "danger");
+      return { ok: false, reason: "no_session" };
+    }
+    const expectedView = viewId || sid;
+    const cancelId = sid || viewId;
+    if (state.reloadingSession) {
+      return { ok: false, reason: "busy", expectedView };
+    }
+    state.reloadingSession = true;
+    if (els.btnReload) {
+      els.btnReload.disabled = true;
+      els.btnReload.classList.add("hidden");
+    }
+    try {
+      const clearOk = await stopTurnForSession(cancelId);
+      if (!clearOk) {
+        toast("Could not clear turn — Reload aborted", "danger");
+        return { ok: false, reason: "clear_failed", expectedView };
+      }
+      // Brief poll for turn clear (force-clear is immediate; allow status to catch up).
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        if (!state.turnRunning || !turnRunningOnSelected()) break;
+        await new Promise((r) => setTimeout(r, 150));
+      }
+      // Prefer original selected view id for re-attach (resume, not session/new).
+      let session =
+        (state.sessions || []).find((s) => s && s.sessionId === expectedView) ||
+        null;
+      if (!session && state.selectedMeta && state.selectedMeta.sessionId === expectedView) {
+        session = state.selectedMeta;
+      }
+      if (!session) {
+        session = {
+          sessionId: expectedView,
+          title: (state.selectedMeta && state.selectedMeta.title) || "Session",
+          cwd: (state.selectedMeta && state.selectedMeta.cwd) || "",
+          updatedAt: new Date().toISOString(),
+          modelId: (state.selectedMeta && state.selectedMeta.modelId) || "",
+          path: "",
+        };
+      }
+      const opened = await openSession(session);
+      if (!opened || !opened.ok) {
+        toast("Resume failed — could not re-attach this session", "danger");
+        return {
+          ok: false,
+          reason: (opened && opened.reason) || "open_failed",
+          expectedView,
+        };
+      }
+      const selectedAfter = String(state.selectedId || "").trim();
+      if (selectedAfter !== expectedView) {
+        toast("Session attach moved selection; check the open session.", "danger");
+        return { ok: false, reason: "selection_mismatch", expectedView };
+      }
+      if (opened.switched && opened.liveId && opened.liveId !== expectedView) {
+        toast(
+          "Attach switched live target; still showing this session. Sends use the live hub session.",
+          "danger"
+        );
+        return {
+          ok: true,
+          switched: true,
+          expectedView,
+          liveId: opened.liveId,
+        };
+      }
+      toast("Session resumed — send to continue", "");
+      if (els.input) els.input.focus({ preventScroll: true });
+      return {
+        ok: true,
+        expectedView,
+        liveId: opened.liveId || expectedView,
+        switched: false,
+      };
+    } catch (err) {
+      toast("Reload failed: " + err, "danger");
+      return { ok: false, reason: "error", expectedView, error: String(err) };
+    } finally {
+      state.reloadingSession = false;
+      setComposerEnabled(composerConnected());
+    }
   }
 
   async function refreshProjects() {
@@ -6624,7 +6866,7 @@
       path.className = "path";
       path.textContent = p.path;
       btn.append(name, path);
-      btn.addEventListener("click", () => createSession(p.path));
+      btn.addEventListener("click", () => onProjectChosen(p.path));
       els.projectList.appendChild(btn);
     }
   }
@@ -6721,7 +6963,7 @@
       els.projectNewName.value = "";
       await refreshProjects();
       if (data.path) {
-        await createSession(data.path);
+        await onProjectChosen(data.path);
       }
     } catch (err) {
       toast("Failed to create folder: " + err, "danger");
@@ -7002,7 +7244,28 @@
           toast("No folder selected", "danger");
           return;
         }
-        createSession(abs);
+        onProjectChosen(abs);
+      });
+    }
+    if (els.btnEntryStartNew) {
+      els.btnEntryStartNew.addEventListener("click", () => {
+        const cwd = state.entryChoiceCwd;
+        if (!cwd) {
+          toast("No project selected", "danger");
+          return;
+        }
+        createSession(cwd);
+      });
+    }
+    if (els.btnEntryBack) {
+      els.btnEntryBack.addEventListener("click", () => {
+        state.entryChoiceCwd = null;
+        setProjectModalMode("list");
+      });
+    }
+    if (els.btnReload) {
+      els.btnReload.addEventListener("click", () => {
+        reloadResumeSession();
       });
     }
 
@@ -7135,19 +7398,23 @@
 
     els.btnStop.addEventListener("click", () => {
       if (!state.selectedId) return;
-      const sid = state.selectedId;
+      const sid = state.livePromptSessionId || state.selectedId;
       sendWs({ type: "cancel", sessionId: sid });
       // Fallback if hub/agent cancel leaves turn stuck (older hubs without force-clear).
       setTimeout(async () => {
         if (!state.turnRunning) return;
-        if (state.selectedId !== sid) return;
+        if (state.selectedId !== sid && state.livePromptSessionId !== sid) return;
         try {
-          const res = await fetch("/api/admin/reset-turn", { method: "POST" });
+          const res = await fetch(apiUrl("/api/admin/reset-turn"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId: sid }),
+          });
           if (res.ok) {
             toast("Turn force-cleared (Stop fallback)", "");
           } else {
             toast(
-              "Stop did not clear the turn. Try Stop again or reload.",
+              "Stop did not clear the turn. Try Stop again or Reload.",
               "danger"
             );
           }
@@ -7696,6 +7963,69 @@
     await refreshSkills();
     connectWs();
   }
+
+  // Read-only/debug inject for e2e stream visibility (no auth bypass).
+  // Uses the same handleAcpMessage path as live ACP session/update.
+  window.__hubTestHooks = {
+    injectAcpSessionUpdate(kind, contentText, sessionId) {
+      const sid =
+        String(sessionId || state.selectedId || "test-session").trim() || "test-session";
+      if (!state.selectedId) {
+        state.selectedId = sid;
+      }
+      showEmptyMain(false);
+      const paintId = state.selectedId;
+      showSessionPane(paintId);
+      getSessionPane(paintId);
+      if (!state.streamBuffers) {
+        state.streamBuffers = emptyStreamBuffers();
+      }
+      handleAcpMessage(paintId, {
+        method: "session/update",
+        params: {
+          update: {
+            sessionUpdate: kind,
+            content: { type: "text", text: String(contentText || "") },
+          },
+        },
+      });
+    },
+    turnStripText() {
+      return (els.turnStripText && els.turnStripText.textContent) || "";
+    },
+    transcriptHasRole(role) {
+      const root = transcriptRoot();
+      return !!(root && root.querySelector(`.term-line.${role}`));
+    },
+    transcriptTextIncludes(substr) {
+      const root = transcriptRoot();
+      return ((root && root.textContent) || "").includes(substr);
+    },
+    setSelectedForTest(sessionId) {
+      const sid = String(sessionId || "").trim();
+      if (!sid) return;
+      state.selectedId = sid;
+      showEmptyMain(false);
+      showSessionPane(sid);
+    },
+    setSessionsForTest(items) {
+      state.sessions = Array.isArray(items) ? items : [];
+    },
+    getSessionIdsForTest() {
+      return {
+        selectedId: state.selectedId,
+        livePromptSessionId: state.livePromptSessionId,
+        turnRunning: state.turnRunning,
+      };
+    },
+    reloadResumeSession,
+    openSession,
+    onProjectChosen,
+    showEntryChoice,
+    sessionsMatchingCwd,
+    entryRequiresResumeChoice,
+    stopTurnForSession,
+  };
 
   bootstrap();
 })();

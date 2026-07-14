@@ -12,15 +12,18 @@ from hub.session_policy import (
     NO_OUTPUT_SECONDS,
     STUCK_TURN_SECONDS,
     cwd_key,
+    entry_requires_resume_choice,
     is_hub_resume_candidate,
     is_no_output_error_message,
     is_turn_stuck_for_new_prompt,
     load_hub_session_ids,
     load_remote_sessions,
     needs_fresh_agent_session,
+    recovery_keeps_session_id,
     resolve_ensure_action,
     resolve_live_session_id,
     save_remote_sessions,
+    sessions_matching_cwd,
     should_auto_retry_no_output,
     should_force_clear_turn,
 )
@@ -482,6 +485,60 @@ def test_cwd_key_normalizes() -> None:
     assert cwd_key("") == ""
 
 
+def test_sessions_matching_cwd_filters_sorts_and_excludes_subagents() -> None:
+    items = [
+        {
+            "sessionId": "old",
+            "cwd": r"D:\Projects\Demo",
+            "updatedAt": "2026-01-01T00:00:00Z",
+            "isSubagent": False,
+        },
+        {
+            "sessionId": "new",
+            "cwd": r"d:/Projects/Demo/",
+            "updatedAt": "2026-07-01T12:00:00Z",
+            "isSubagent": False,
+        },
+        {
+            "sessionId": "sub",
+            "cwd": r"D:\Projects\Demo",
+            "updatedAt": "2026-07-02T00:00:00Z",
+            "isSubagent": True,
+        },
+        {
+            "sessionId": "other",
+            "cwd": r"D:\Projects\Other",
+            "updatedAt": "2026-07-03T00:00:00Z",
+            "isSubagent": False,
+        },
+    ]
+    matched = sessions_matching_cwd(items, r"D:\Projects\Demo")
+    assert [m["sessionId"] for m in matched] == ["new", "old"]
+
+    with_sub = sessions_matching_cwd(
+        items, r"D:\Projects\Demo", exclude_subagents=False
+    )
+    assert [m["sessionId"] for m in with_sub] == ["sub", "new", "old"]
+
+    assert sessions_matching_cwd(None, r"D:\Projects\Demo") == []
+    assert sessions_matching_cwd(items, None) == []
+    assert sessions_matching_cwd(items, "") == []
+
+
+def test_entry_requires_resume_choice() -> None:
+    assert entry_requires_resume_choice(0) is False
+    assert entry_requires_resume_choice(1) is True
+    assert entry_requires_resume_choice(3) is True
+
+
+def test_recovery_keeps_session_id() -> None:
+    assert recovery_keeps_session_id("a", "a", False) is True
+    assert recovery_keeps_session_id("a", "b", False) is False
+    assert recovery_keeps_session_id("a", "a", True) is False
+    assert recovery_keeps_session_id("", "a", False) is False
+    assert recovery_keeps_session_id("a", "", False) is False
+
+
 def test_should_force_clear_none_while_active() -> None:
     # Recent activity, saw updates, under max duration
     assert (
@@ -651,3 +708,42 @@ def test_is_turn_stuck_for_new_prompt_matches_force_clear() -> None:
         )
         is True
     )
+
+
+def test_zero_updates_past_no_output_threshold_clears() -> None:
+    """Product: live turn with zero stream past NO_OUTPUT_SECONDS must force-clear.
+
+    123s empty working is past bound (regression for multi-minute silent wait).
+    """
+    for age in (NO_OUTPUT_SECONDS, NO_OUTPUT_SECONDS + 1, 123.0, 300.0):
+        reason = should_force_clear_turn(False, age, age)
+        assert reason is not None
+        assert "no ACP session/update" in reason
+
+
+def test_under_no_output_threshold_keeps_running_without_updates() -> None:
+    reason = should_force_clear_turn(
+        False,
+        NO_OUTPUT_SECONDS - 1,
+        NO_OUTPUT_SECONDS - 1,
+    )
+    assert reason is None
+
+
+def test_auto_retry_only_once_same_session_no_fork_signal() -> None:
+    """One same-session auto-retry for force-clear no-output; never a second."""
+    reason = should_force_clear_turn(
+        False,
+        NO_OUTPUT_SECONDS + 0.1,
+        NO_OUTPUT_SECONDS + 0.1,
+    )
+    assert reason is not None
+    msg = f"Turn force-cleared: {reason}"
+    assert should_auto_retry_no_output(msg, already_retried=False) is True
+    assert should_auto_retry_no_output(msg, already_retried=True) is False
+
+
+def test_client_stall_never_auto_unlocks() -> None:
+    """Client soft-warn only; server owns unlock (CLIENT_STALL_UNLOCK_SECONDS=0)."""
+    assert CLIENT_STALL_WARN_SECONDS == 120
+    assert CLIENT_STALL_UNLOCK_SECONDS == 0
