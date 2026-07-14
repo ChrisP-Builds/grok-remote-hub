@@ -10,10 +10,14 @@ This file is the **public narrative**. Session chat context is not required to u
 ## [Unreleased]
 
 ### Added
+- **Files media Share/Save** — video preview (mp4/mov/webm/m4v), Web Share API from Files, higher raw serve limit (150 MB), optional `?download=1` Content-Disposition (file-first; ADR 006/010).
+- **Binary upload + attach** — `POST /api/fs/upload` into session `uploads/`; composer paperclip and Files Upload; path prefill; image 40 MB / video 150 MB caps + MIME allowlist.
+- **Hub plan viewer** — `GET /api/sessions/{id}/plan` reads `plan.md` + `plan_mode.json`; View plan modal with soft Approve / Request changes as composer inject only (not TUI `a`-key handshake; Hub-only, no `exit_plan_mode`).
 - **Tool-row site Preview** — when a tool summary/path ends in `.html`/`.htm`, a compact **Preview** control opens the existing in-hub site preview (file-first; ADR 010).
 - **Sticky active user prompt** — current **You:** line pins to the top of the transcript while the turn runs.
 
 ### Fixed
+- **Live stream text doubling** — `mergeStreamText` matches history cumulative-vs-delta merge so mid-turn assistant/thought text no longer looks duplicated.
 - Tools stay **collapsed** by default; empty expand no longer shows “No detail.”
 - Thinking summary no longer doubles the word “Thinking.”
 - Composer placeholder adapts to width (short vs slash-hint) with CSS ellipsis.
