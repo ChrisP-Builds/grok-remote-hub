@@ -26,6 +26,7 @@ from hub.fs_browser import (
     read_text as fs_read_text,
     resolve_file_for_read,
     write_text as fs_write_text,
+    write_upload_bytes as fs_write_upload_bytes,
 )
 from hub.site_preview import (
     SitePreviewError,
@@ -895,6 +896,7 @@ class Hub:
         app.router.add_get("/api/fs/read", self.handle_fs_read)
         app.router.add_get("/api/fs/raw", self.handle_fs_raw)
         app.router.add_put("/api/fs/write", self.handle_fs_write)
+        app.router.add_post("/api/fs/upload", self.handle_fs_upload)
         app.router.add_post("/api/preview/start", self.handle_preview_start)
         app.router.add_post("/api/preview/stop", self.handle_preview_stop)
         app.router.add_get("/api/preview/status", self.handle_preview_status)
@@ -1475,6 +1477,72 @@ class Hub:
             return web.json_response({"error": exc.message}, status=exc.status)
         except Exception:
             log.exception("fs write failed")
+            return web.json_response({"error": "internal error"}, status=500)
+        return web.json_response(result)
+
+    async def handle_fs_upload(self, request: web.Request) -> web.Response:
+        """Binary media upload into session cwd (default uploads/). Multipart preferred."""
+        root = ""
+        rel_dir = "uploads"
+        filename = ""
+        data = b""
+        content_type: str | None = None
+
+        ctype = (request.content_type or "").lower()
+        try:
+            if "multipart/" in ctype:
+                reader = await request.multipart()
+                while True:
+                    part = await reader.next()
+                    if part is None:
+                        break
+                    name = part.name or ""
+                    if name == "root":
+                        root = (await part.text()).strip()
+                    elif name == "path":
+                        text = (await part.text()).strip()
+                        if text:
+                            rel_dir = text
+                    elif name == "filename":
+                        filename = (await part.text()).strip()
+                    elif name == "file":
+                        if part.filename and not filename:
+                            filename = part.filename
+                        # Do not log body; read once into memory under size caps downstream.
+                        data = await part.read(decode=False)
+                        part_ct = part.headers.get("Content-Type")
+                        if part_ct:
+                            content_type = part_ct
+            else:
+                root = (request.query.get("root") or "").strip()
+                path_q = (request.query.get("path") or "").strip()
+                if path_q:
+                    rel_dir = path_q
+                filename = (request.query.get("filename") or "").strip()
+                data = await request.read()
+                if request.content_type:
+                    content_type = request.content_type
+        except Exception:
+            log.exception("fs upload parse failed")
+            return web.json_response({"error": "invalid upload"}, status=400)
+
+        if not root or not str(root).strip():
+            return web.json_response({"error": "root required"}, status=400)
+        if not filename:
+            filename = "upload.bin"
+        try:
+            result = fs_write_upload_bytes(
+                self.config.projects_root,
+                str(root).strip(),
+                rel_dir,
+                filename,
+                data,
+                content_type=content_type,
+            )
+        except FsBrowserError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        except Exception:
+            log.exception("fs upload failed")
             return web.json_response({"error": "internal error"}, status=500)
         return web.json_response(result)
 

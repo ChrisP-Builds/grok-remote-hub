@@ -17,6 +17,7 @@ If someone can open your hub URL without a token, they can drive that agent.
 3. Keep the agent on **`127.0.0.1`** (default). The agent secret file `data/agent.secret` is gitignored.
 4. Run the hub only on a machine you trust; treat Tailscale membership like physical access.
 5. Never commit `config.toml`, `data/`, `logs/`, or `~/.grok/auth.json`.
+6. Binary uploads (`POST /api/fs/upload`) are sandboxed to the session cwd, extension-allowlisted (image/video), and size-capped; treat the hub token as write access to that project tree.
 
 ## Reporting a vulnerability
 

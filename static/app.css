@@ -276,6 +276,21 @@ a {
   padding: 0 10px 8px;
 }
 
+.fs-toolbar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.fs-toolbar .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.fs-toolbar #btn-fs-upload {
+  flex-shrink: 0;
+}
+
 .input {
   width: 100%;
   background: var(--bg);

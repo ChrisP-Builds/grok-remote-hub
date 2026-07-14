@@ -8,6 +8,8 @@ import pytest
 
 from hub.fs_browser import (
     RAW_MAX_BYTES,
+    UPLOAD_MAX_IMAGE_BYTES,
+    UPLOAD_MAX_VIDEO_BYTES,
     FsBrowserError,
     content_disposition_attachment,
     content_type_for,
@@ -17,7 +19,9 @@ from hub.fs_browser import (
     read_text,
     resolve_file_for_read,
     resolve_sandbox,
+    sanitize_upload_filename,
     write_text,
+    write_upload_bytes,
 )
 
 
@@ -312,3 +316,119 @@ def test_resolve_file_for_read_dir_400(tmp_path: Path) -> None:
         resolve_file_for_read(projects, root, "imgs")
     assert exc.value.status == 400
     assert "file" in exc.value.message.lower()
+
+
+# --- Upload helpers ---
+
+
+def test_sanitize_upload_filename() -> None:
+    assert sanitize_upload_filename("photo.jpg") == "photo.jpg"
+    assert sanitize_upload_filename(r"a\b\clip.mp4") == "clip.mp4"
+    assert sanitize_upload_filename("a/b/shot.PNG") == "shot.PNG"
+    assert sanitize_upload_filename("..") == "upload.bin"
+    assert sanitize_upload_filename(".") == "upload.bin"
+    assert sanitize_upload_filename("") == "upload.bin"
+    # Dangerous / path-ish chars stripped; extension kept when present
+    safe = sanitize_upload_filename("my file (1).jpg")
+    assert safe.endswith(".jpg")
+    assert "/" not in safe and "\\" not in safe
+    assert " " not in safe
+    assert "(" not in safe
+    # Path traversal segments become basename only
+    assert ".." not in Path(sanitize_upload_filename("../evil.jpg")).parts
+
+
+def test_write_upload_happy_png(tmp_path: Path) -> None:
+    projects, root = _projects_and_root(tmp_path)
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+    result = write_upload_bytes(projects, root, "uploads", "shot.png", png)
+    assert result["path"] == "uploads/shot.png"
+    assert result["size"] == len(png)
+    assert Path(result["root"]) == root.resolve()
+    written = root / "uploads" / "shot.png"
+    assert written.is_file()
+    assert written.read_bytes() == png
+    # uploads/ auto-created
+    assert (root / "uploads").is_dir()
+
+
+def test_write_upload_unique_suffix(tmp_path: Path) -> None:
+    projects, root = _projects_and_root(tmp_path)
+    first = write_upload_bytes(projects, root, "uploads", "a.jpg", b"one")
+    second = write_upload_bytes(projects, root, "uploads", "a.jpg", b"two")
+    assert first["path"] == "uploads/a.jpg"
+    assert second["path"] == "uploads/a-1.jpg"
+    assert (root / "uploads" / "a.jpg").read_bytes() == b"one"
+    assert (root / "uploads" / "a-1.jpg").read_bytes() == b"two"
+
+
+def test_write_upload_escape_path_rejected(tmp_path: Path) -> None:
+    projects, root = _projects_and_root(tmp_path)
+    with pytest.raises(FsBrowserError) as exc:
+        write_upload_bytes(projects, root, "../outside", "x.png", b"x")
+    assert exc.value.status == 400
+    assert "escape" in exc.value.message.lower() or ".." in exc.value.message
+
+
+def test_write_upload_escape_filename_sanitized(tmp_path: Path) -> None:
+    """Filename path segments are stripped; file lands under uploads/ only."""
+    projects, root = _projects_and_root(tmp_path)
+    result = write_upload_bytes(
+        projects, root, "uploads", "../../etc/passwd.jpg", b"img"
+    )
+    assert result["path"] == "uploads/passwd.jpg"
+    assert (root / "uploads" / "passwd.jpg").is_file()
+    assert not (tmp_path / "passwd.jpg").exists()
+
+
+def test_write_upload_size_reject_image(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import hub.fs_browser as fb
+
+    projects, root = _projects_and_root(tmp_path)
+    monkeypatch.setattr(fb, "UPLOAD_MAX_IMAGE_BYTES", 50)
+    big = b"y" * 51
+    with pytest.raises(FsBrowserError) as exc:
+        fb.write_upload_bytes(projects, root, "uploads", "huge.png", big)
+    assert exc.value.status == 413
+    assert "large" in exc.value.message.lower()
+    assert not (root / "uploads" / "huge.png").exists()
+
+
+def test_write_upload_size_reject_video(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import hub.fs_browser as fb
+
+    projects, root = _projects_and_root(tmp_path)
+    monkeypatch.setattr(fb, "UPLOAD_MAX_VIDEO_BYTES", 50)
+    big = b"z" * 51
+    with pytest.raises(FsBrowserError) as exc:
+        fb.write_upload_bytes(projects, root, "uploads", "clip.mp4", big)
+    assert exc.value.status == 413
+    assert "large" in exc.value.message.lower()
+    assert not (root / "uploads" / "clip.mp4").exists()
+
+
+def test_write_upload_allowlist_reject_exe(tmp_path: Path) -> None:
+    projects, root = _projects_and_root(tmp_path)
+    with pytest.raises(FsBrowserError) as exc:
+        write_upload_bytes(projects, root, "uploads", "malware.exe", b"MZ")
+    assert exc.value.status == 415
+    assert not (root / "uploads" / "malware.exe").exists()
+
+
+def test_write_upload_allowlist_reject_sh(tmp_path: Path) -> None:
+    projects, root = _projects_and_root(tmp_path)
+    with pytest.raises(FsBrowserError) as exc:
+        write_upload_bytes(projects, root, "uploads", "run.sh", b"#!/bin/sh\n")
+    assert exc.value.status == 415
+
+
+def test_write_upload_heic_allowed(tmp_path: Path) -> None:
+    projects, root = _projects_and_root(tmp_path)
+    result = write_upload_bytes(projects, root, "uploads", "IMG_001.HEIC", b"heic")
+    assert result["path"] == "uploads/IMG_001.HEIC"
+    assert (root / "uploads" / "IMG_001.HEIC").read_bytes() == b"heic"
+
+
+def test_upload_max_constants() -> None:
+    assert UPLOAD_MAX_IMAGE_BYTES == 40_000_000
+    assert UPLOAD_MAX_VIDEO_BYTES == 150_000_000

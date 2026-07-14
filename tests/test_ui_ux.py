@@ -1178,3 +1178,28 @@ def test_files_media_share_and_video_contract() -> None:
     assert "download" in server
     assert "content_disposition_attachment" in server
     assert "handle_fs_raw" in server
+
+
+def test_fs_upload_and_attach_contract() -> None:
+    """PR2: binary upload route + composer attach + Files Upload controls."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    server = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    fs_browser = (ROOT / "hub" / "fs_browser.py").read_text(encoding="utf-8")
+
+    assert 'add_post("/api/fs/upload"' in server or "/api/fs/upload" in server
+    assert "handle_fs_upload" in server
+    assert "def write_upload_bytes" in fs_browser
+    assert "def sanitize_upload_filename" in fs_browser
+    assert "UPLOAD_MAX_IMAGE_BYTES" in fs_browser
+    assert "UPLOAD_MAX_VIDEO_BYTES" in fs_browser
+
+    assert 'id="btn-attach"' in html
+    assert 'id="composer-file-input"' in html
+    assert 'id="btn-fs-upload"' in html
+    assert "accept=" in html and "image/*" in html
+
+    assert "uploadFsFiles" in js
+    assert "/api/fs/upload" in js
+    assert "btnAttach" in js or "btn-attach" in js
+    assert "Attached file(s):" in js
