@@ -593,6 +593,67 @@ def test_js_turn_idle_clears_selected_strip() -> None:
     assert idle_flag < row_status
 
 
+def _merge_stream_text(prev: str | None, chunk: str | None) -> str:
+    """Pure Python mirror of static/app.js mergeStreamText (history _merge_messages rules)."""
+    p = "" if prev is None else str(prev)
+    c = "" if chunk is None else str(chunk)
+    if not c:
+        return p
+    if not p:
+        return c
+    if p == c or p.startswith(c):
+        return p
+    if c.startswith(p):
+        return c
+    return p + c
+
+
+def test_merge_stream_text_algorithm() -> None:
+    """Cumulative snapshots replace; pure deltas append; shorter/equal ignored."""
+    # Cumulative: "a" then "ab" then "abc" → "abc" not "aababc"
+    body = ""
+    for snap in ("a", "ab", "abc"):
+        body = _merge_stream_text(body, snap)
+    assert body == "abc"
+
+    # Pure deltas: "a"+"b" → "ab"
+    assert _merge_stream_text("a", "b") == "ab"
+    assert _merge_stream_text(_merge_stream_text("", "a"), "b") == "ab"
+
+    # Ignore redundant shorter or equal snapshot
+    assert _merge_stream_text("abc", "ab") == "abc"
+    assert _merge_stream_text("abc", "abc") == "abc"
+    assert _merge_stream_text("hello", "") == "hello"
+    assert _merge_stream_text("", "x") == "x"
+    assert _merge_stream_text(None, "hi") == "hi"
+    assert _merge_stream_text("hi", None) == "hi"
+    assert _merge_stream_text(None, None) == ""
+
+
+def test_js_merge_stream_text_contract() -> None:
+    """mergeStreamText exists and is used by appendToBody + thought stream path."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    fn_idx = js.find("function mergeStreamText")
+    assert fn_idx >= 0
+    fn = js[fn_idx : fn_idx + 450]
+    assert "prev" in fn and "chunk" in fn
+    assert "startsWith" in fn
+    assert "return p + c" in fn or "return p+c" in fn
+
+    app_idx = js.find("function appendToBody")
+    assert app_idx >= 0
+    app_fn = js[app_idx : app_idx + 700]
+    assert "mergeStreamText(prev, text)" in app_fn
+    assert "const next = prev + text" not in app_fn
+
+    thought_idx = js.find('if (kind === "agent_thought_chunk")')
+    assert thought_idx >= 0
+    thought_chunk = js[thought_idx : thought_idx + 1200]
+    assert "mergeStreamText(prev, text)" in thought_chunk
+    assert '(body._rawText || body.textContent || "") + text' not in thought_chunk
+
+
 def test_js_stream_visibility_contract() -> None:
     """ACP stream chunks must paint transcript; optimistic user on submit; e2e hooks."""
     js = (STATIC / "app.js").read_text(encoding="utf-8")

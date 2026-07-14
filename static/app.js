@@ -3525,6 +3525,18 @@
     updateTurnStrip();
   }
 
+  // Merge live stream chunks: cumulative snapshots replace, pure deltas append.
+  // Mirrors hub/history.py _merge_messages text rules.
+  function mergeStreamText(prev, chunk) {
+    const p = prev == null ? "" : String(prev);
+    const c = chunk == null ? "" : String(chunk);
+    if (!c) return p;
+    if (!p) return c;
+    if (p === c || p.startsWith(c)) return p;
+    if (c.startsWith(p)) return c;
+    return p + c;
+  }
+
   function appendToBody(el, text) {
     if (!el) return;
     noteTermLineActivity();
@@ -3533,7 +3545,7 @@
     // Always accumulate from _rawText (source of truth). After a table render,
     // body.textContent is cell text without pipes — never re-parse from it.
     const prev = body._rawText != null ? String(body._rawText) : String(body.textContent || "");
-    const next = prev + text;
+    const next = mergeStreamText(prev, text);
     body._rawText = next;
     if (next.includes("|") && next.includes("\n")) {
       setTermBodyContent(body, next);
@@ -3590,7 +3602,8 @@
       }
       const body = el.querySelector(".term-body");
       if (body) {
-        body._rawText = (body._rawText || body.textContent || "") + text;
+        const prev = body._rawText || body.textContent || "";
+        body._rawText = mergeStreamText(prev, text);
         body.textContent = body._rawText;
       }
       const label = el.querySelector(".thought-summary-label");
