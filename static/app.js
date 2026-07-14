@@ -424,6 +424,9 @@
     turnStripCursor: $("#turn-strip-cursor"),
     form: $("#composer-form"),
     input: $("#composer-input"),
+    composerFileInput: $("#composer-file-input"),
+    btnAttach: $("#btn-attach"),
+    btnFsUpload: $("#btn-fs-upload"),
     btnSend: $("#btn-send"),
     btnStop: $("#btn-stop"),
     btnReload: $("#btn-reload"),
@@ -6383,6 +6386,124 @@
     toast("Inserted path");
   }
 
+  function sessionFsRoot() {
+    return state.fs.root || (state.selectedMeta && state.selectedMeta.cwd) || "";
+  }
+
+  function prefillAttachedPaths(paths) {
+    if (!els.input || !paths || !paths.length) return;
+    const lines = paths.map((p) => `- ${String(p).replace(/\\/g, "/")}`);
+    const block = "Attached file(s):\n" + lines.join("\n") + "\n\n";
+    const cur = els.input.value || "";
+    if (cur.trim()) {
+      els.input.value = cur.replace(/\s*$/, "") + "\n\n" + block;
+    } else {
+      els.input.value = block;
+    }
+    autoGrow();
+  }
+
+  function setUploadBusy(busy) {
+    if (els.btnAttach) els.btnAttach.disabled = !!busy;
+    if (els.btnFsUpload) els.btnFsUpload.disabled = !!busy;
+    if (els.composerFileInput) els.composerFileInput.disabled = !!busy;
+  }
+
+  async function refreshFsAfterUpload() {
+    const root = sessionFsRoot();
+    if (!root) return;
+    if (!state.fs.root) state.fs.root = root;
+    state.fs.cache.delete("");
+    state.fs.cache.delete("uploads");
+    try {
+      await fetchFsList("");
+      if (state.fs.expanded && state.fs.expanded.has("uploads")) {
+        await fetchFsList("uploads");
+      }
+    } catch (_) {
+      /* toast already from fetchFsList */
+    }
+  }
+
+  async function uploadFsFiles(fileList, opts) {
+    opts = opts || {};
+    const prefill = !!opts.prefillComposer;
+    const root = sessionFsRoot();
+    if (!root) {
+      toast("Open a session to upload", "danger");
+      return;
+    }
+    const files = Array.from(fileList || []).filter(Boolean);
+    if (!files.length) return;
+
+    setUploadBusy(true);
+    const uploaded = [];
+    let lastError = "";
+    try {
+      for (const file of files) {
+        const fd = new FormData();
+        fd.append("root", root);
+        fd.append("path", "uploads");
+        fd.append("file", file, file.name || "upload.bin");
+        try {
+          const res = await fetch(apiUrl("/api/fs/upload"), {
+            method: "POST",
+            body: fd,
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            lastError =
+              data.error ||
+              (res.status === 413
+                ? "File too large"
+                : res.status === 415
+                  ? "Unsupported file type"
+                  : `Upload failed (HTTP ${res.status})`);
+            continue;
+          }
+          if (data.path) uploaded.push(data.path);
+        } catch (err) {
+          lastError = String(err);
+        }
+      }
+      if (uploaded.length) {
+        await refreshFsAfterUpload();
+        if (prefill) {
+          prefillAttachedPaths(uploaded);
+          if (els.input && !els.input.disabled) els.input.focus();
+        }
+        const label =
+          uploaded.length === 1
+            ? "Uploaded " + uploaded[0]
+            : "Uploaded " + uploaded.length + " files";
+        toast(label);
+      }
+      if (lastError) {
+        toast(
+          uploaded.length
+            ? "Some uploads failed: " + lastError
+            : lastError,
+          "danger"
+        );
+      }
+    } finally {
+      setUploadBusy(false);
+      if (els.composerFileInput) els.composerFileInput.value = "";
+    }
+  }
+
+  function openUploadPicker() {
+    if (!sessionFsRoot()) {
+      toast("Open a session to upload", "danger");
+      return;
+    }
+    if (!els.composerFileInput) {
+      toast("Upload control missing", "danger");
+      return;
+    }
+    els.composerFileInput.click();
+  }
+
   function onFileEditorInput() {
     if (!els.fileEditor || !state.fs.openPath) return;
     state.fs.content = els.fileEditor.value;
@@ -7212,6 +7333,24 @@
       els.fileFilter.addEventListener("input", () => {
         state.fs.filter = els.fileFilter.value;
         renderFileTree();
+      });
+    }
+    if (els.btnFsUpload) {
+      els.btnFsUpload.addEventListener("click", () => {
+        openUploadPicker();
+      });
+    }
+    if (els.btnAttach) {
+      els.btnAttach.addEventListener("click", () => {
+        openUploadPicker();
+      });
+    }
+    if (els.composerFileInput) {
+      els.composerFileInput.addEventListener("change", () => {
+        const list = els.composerFileInput.files;
+        if (!list || !list.length) return;
+        // Composer attach prefills paths; Files Upload uses the same input.
+        void uploadFsFiles(list, { prefillComposer: true });
       });
     }
     if (els.btnFileBack) {

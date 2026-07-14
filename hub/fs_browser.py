@@ -12,6 +12,14 @@ VIDEO_EXTS = {".mp4", ".mov", ".webm", ".m4v"}
 # Raw media serve cap (images + video); keep high enough for phone-friendly clips.
 RAW_MAX_BYTES = 150_000_000
 
+# Binary upload caps (composer / Files panel).
+UPLOAD_MAX_IMAGE_BYTES = 40_000_000
+UPLOAD_MAX_VIDEO_BYTES = 150_000_000
+# HEIC/HEIF for iPhone camera rolls; not required for in-browser preview.
+UPLOAD_IMAGE_EXTS = IMAGE_EXTS | {".heic", ".heif"}
+UPLOAD_VIDEO_EXTS = set(VIDEO_EXTS)
+UPLOAD_ALLOWED_EXTS = UPLOAD_IMAGE_EXTS | UPLOAD_VIDEO_EXTS
+
 
 class FsBrowserError(Exception):
     def __init__(self, message: str, status: int = 400):
@@ -26,6 +34,10 @@ def is_image_path(rel_or_name: str) -> bool:
 
 def is_video_path(rel_or_name: str) -> bool:
     return Path(str(rel_or_name)).suffix.lower() in VIDEO_EXTS
+
+
+def is_upload_allowed_ext(rel_or_name: str) -> bool:
+    return Path(str(rel_or_name)).suffix.lower() in UPLOAD_ALLOWED_EXTS
 
 
 def resolve_file_for_read(
@@ -235,5 +247,129 @@ def write_text(
     return {
         "root": str(root_resolved),
         "path": _normalize_rel(rel),
+        "size": len(raw),
+    }
+
+
+def sanitize_upload_filename(name: str) -> str:
+    """Basename-only safe filename for uploads; keep alnum, dash, underscore, dot."""
+    base = Path(str(name or "")).name
+    if not base or base in {".", ".."}:
+        return "upload.bin"
+
+    # Drop path-ish separators if any remain after Path.name (e.g. mixed).
+    base = base.replace("\\", "/").split("/")[-1]
+    if not base or base in {".", ".."}:
+        return "upload.bin"
+
+    orig_ext = Path(base).suffix.lower()
+    safe_chars: list[str] = []
+    for ch in base:
+        if ch.isalnum() or ch in "-_.":
+            safe_chars.append(ch)
+    safe = "".join(safe_chars).lstrip(".")
+    # Collapse empty / dot-only results
+    if not safe or safe in {".", ".."} or all(c == "." for c in safe):
+        if orig_ext and orig_ext in UPLOAD_ALLOWED_EXTS:
+            return f"upload{orig_ext}"
+        return "upload.bin"
+
+    # Preserve allowed extension; if sanitize ate it, re-attach when known.
+    safe_ext = Path(safe).suffix.lower()
+    if not safe_ext and orig_ext and orig_ext in UPLOAD_ALLOWED_EXTS:
+        safe = f"{safe}{orig_ext}"
+    return safe
+
+
+def _unique_upload_path(dir_path: Path, filename: str) -> Path:
+    """Pick dir_path/filename or filename-1.ext, filename-2.ext, … if taken."""
+    candidate = dir_path / filename
+    if not candidate.exists():
+        return candidate
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    n = 1
+    while True:
+        alt = dir_path / f"{stem}-{n}{suffix}"
+        if not alt.exists():
+            return alt
+        n += 1
+        if n > 10_000:
+            raise FsBrowserError("cannot allocate unique filename", 400)
+
+
+def write_upload_bytes(
+    projects_root: Path,
+    root: str | Path,
+    rel_dir: str,
+    filename: str,
+    data: bytes,
+    content_type: str | None = None,
+) -> dict[str, Any]:
+    """Write binary media under session root (default dir: uploads/).
+
+    Does not log or return the body. Prefer unique filenames over overwrite.
+    """
+    del content_type  # reserved for future MIME sniffing; extension is authoritative
+
+    if data is None:
+        data = b""
+    if not isinstance(data, (bytes, bytearray)):
+        raise FsBrowserError("invalid body", 400)
+    raw = bytes(data)
+
+    rel_dir_norm = _normalize_rel(rel_dir if rel_dir is not None else "uploads")
+    if not rel_dir_norm:
+        rel_dir_norm = "uploads"
+
+    safe_name = sanitize_upload_filename(filename)
+    ext = Path(safe_name).suffix.lower()
+    if ext not in UPLOAD_ALLOWED_EXTS:
+        raise FsBrowserError("unsupported media type", 415)
+
+    if ext in UPLOAD_IMAGE_EXTS:
+        max_bytes = UPLOAD_MAX_IMAGE_BYTES
+    else:
+        max_bytes = UPLOAD_MAX_VIDEO_BYTES
+    if len(raw) > max_bytes:
+        raise FsBrowserError("file too large", 413)
+
+    # Resolve directory under sandbox; auto-create uploads/ (and nested) if missing.
+    dir_path = resolve_sandbox(projects_root, root, rel_dir_norm)
+    root_resolved = _resolved_root(projects_root, root)
+    try:
+        dir_path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise FsBrowserError(f"cannot create directory: {exc}", 400) from exc
+    if not dir_path.is_dir():
+        raise FsBrowserError("not a directory", 400)
+
+    # Unique target; re-check sandbox for the final file path.
+    target = _unique_upload_path(dir_path, safe_name)
+    try:
+        rel_out = target.relative_to(root_resolved).as_posix()
+    except ValueError as exc:
+        raise FsBrowserError("path escapes root", 400) from exc
+    # Final resolve rejects escape / absolute
+    path = resolve_sandbox(projects_root, root, rel_out)
+
+    tmp = path.with_suffix(path.suffix + ".hubtmp")
+    try:
+        tmp.write_bytes(raw)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        try:
+            path.write_bytes(raw)
+        except OSError as exc:
+            raise FsBrowserError(f"cannot write file: {exc}", 400) from exc
+
+    return {
+        "root": str(root_resolved),
+        "path": _normalize_rel(rel_out),
         "size": len(raw),
     }

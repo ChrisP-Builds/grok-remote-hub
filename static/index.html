@@ -46,8 +46,9 @@
         </div>
       </div>
       <div id="panel-files" role="tabpanel" aria-labelledby="tab-files" class="rail-panel hidden">
-        <div class="search-wrap">
+        <div class="search-wrap fs-toolbar">
           <input type="search" id="file-filter" class="input" placeholder="Filter files" autocomplete="off" />
+          <button type="button" id="btn-fs-upload" class="btn btn-ghost btn-sm" title="Upload image or video">Upload</button>
         </div>
         <div id="file-tree" class="file-tree" role="tree"></div>
         <div id="file-empty" class="empty-rail">
@@ -159,7 +160,15 @@
               autocapitalize="sentences"
               autocomplete="on"
             ></textarea>
+            <input
+              type="file"
+              id="composer-file-input"
+              accept="image/*,video/*"
+              multiple
+              hidden
+            />
             <div class="composer-actions">
+              <button type="button" id="btn-attach" class="btn btn-ghost btn-sm" title="Attach image or video" aria-label="Attach file">📎</button>
               <button type="button" id="btn-stop" class="btn btn-danger btn-sm hidden">Stop</button>
               <button
                 type="button"
