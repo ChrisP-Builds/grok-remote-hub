@@ -162,6 +162,64 @@ def cwd_key(cwd: str | None) -> str:
     return str(cwd or "").replace("/", "\\").rstrip("\\").casefold()
 
 
+def sessions_matching_cwd(
+    items: list[dict[str, Any]] | None,
+    cwd: str | None,
+    *,
+    exclude_subagents: bool = True,
+) -> list[dict[str, Any]]:
+    """Filter session dicts (with cwd, sessionId, isSubagent?, updatedAt?) to same cwd_key.
+
+    Sort by updatedAt descending when present. Prefer non-subagents when
+    exclude_subagents is True (subagents dropped entirely).
+    """
+    key = cwd_key(cwd)
+    if not key or not items:
+        return []
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if exclude_subagents and item.get("isSubagent"):
+            continue
+        item_key = cwd_key(item.get("cwd"))
+        if item_key and item_key == key:
+            out.append(item)
+
+    def _sort_key(row: dict[str, Any]) -> tuple[int, str]:
+        # Prefer rows with updatedAt; empty sorts last via (0, "")
+        ts = str(row.get("updatedAt") or "").strip()
+        return (1 if ts else 0, ts)
+
+    out.sort(key=_sort_key, reverse=True)
+    return out
+
+
+def entry_requires_resume_choice(prior_count: int) -> bool:
+    """True when New flow must offer Resume vs Start new (prior_count > 0)."""
+    try:
+        n = int(prior_count)
+    except (TypeError, ValueError):
+        n = 0
+    return n > 0
+
+
+def recovery_keeps_session_id(
+    before_id: str, after_id: str, switched_to_new: bool
+) -> bool:
+    """True when recovery succeeded on same id without treating silent new as ok.
+
+    Same non-empty ids and not switched_to_new.
+    """
+    before = str(before_id or "").strip()
+    after = str(after_id or "").strip()
+    if not before or not after:
+        return False
+    if switched_to_new:
+        return False
+    return before == after
+
+
 def resolve_ensure_action(
     view_session_id: str | None,
     cwd: str | None,
