@@ -108,13 +108,13 @@ def test_js_mobile_table_raw_text_contracts() -> None:
     set_fn = js[set_idx : set_idx + 400]
     assert "bodyEl._rawText = raw" in set_fn
 
-    # appendToBody accumulates from _rawText, not table textContent alone
+    # appendToBody accumulates from _rawText via mergeStreamText (cumulative-safe)
     app_idx = js.find("function appendToBody")
     assert app_idx >= 0
     app_fn = js[app_idx : app_idx + 700]
     assert "body._rawText" in app_fn
     assert "const prev = body._rawText != null" in app_fn
-    assert "const next = prev + text" in app_fn
+    assert "mergeStreamText(prev, text)" in app_fn
     # Must not rebuild next solely from textContent when table present
     assert "querySelector(\".term-table\")" not in app_fn or "textContent" in app_fn
 
