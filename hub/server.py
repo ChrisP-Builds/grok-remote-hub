@@ -34,6 +34,7 @@ from hub.site_preview import (
     build_preview_plan,
 )
 from hub.history import load_session_history
+from hub.plan_view import PlanViewError, read_session_plan
 from hub.projects import ProjectError, create_project, list_project_browse
 from hub.multi_turn import (
     STATUS_IDLE,
@@ -879,6 +880,7 @@ class Hub:
         app.router.add_post("/api/compat/refresh", self.handle_compat_refresh)
         app.router.add_get("/api/sessions", self.handle_sessions)
         app.router.add_get("/api/sessions/{id}/history", self.handle_history)
+        app.router.add_get("/api/sessions/{id}/plan", self.handle_session_plan)
         app.router.add_get("/api/sessions/{id}/usage", self.handle_session_usage)
         app.router.add_get("/api/usage/plan", self.handle_usage_plan)
         app.router.add_post("/api/sessions", self.handle_new_session)
@@ -1288,6 +1290,22 @@ class Hub:
             max_messages=self.config.max_history_messages,
         )
         return web.json_response({"sessionId": session_id, "messages": messages})
+
+    async def handle_session_plan(self, request: web.Request) -> web.Response:
+        """Read-only plan.md + plan_mode.json for Hub plan viewer (no TUI handshake)."""
+        session_id = request.match_info["id"]
+        session = find_session(self.config.sessions_root, session_id)
+        path = session.path if session else None
+        try:
+            payload = await asyncio.to_thread(
+                read_session_plan,
+                self.config.sessions_root,
+                session_id,
+                path,
+            )
+        except PlanViewError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        return web.json_response(payload)
 
     async def handle_session_usage(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]
