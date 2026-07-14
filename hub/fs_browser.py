@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"}
+VIDEO_EXTS = {".mp4", ".mov", ".webm", ".m4v"}
+# Raw media serve cap (images + video); keep high enough for phone-friendly clips.
+RAW_MAX_BYTES = 150_000_000
 
 
 class FsBrowserError(Exception):
@@ -19,6 +22,10 @@ class FsBrowserError(Exception):
 
 def is_image_path(rel_or_name: str) -> bool:
     return Path(str(rel_or_name)).suffix.lower() in IMAGE_EXTS
+
+
+def is_video_path(rel_or_name: str) -> bool:
+    return Path(str(rel_or_name)).suffix.lower() in VIDEO_EXTS
 
 
 def resolve_file_for_read(
@@ -38,6 +45,21 @@ def content_type_for(path: Path) -> str:
     if ctype:
         return ctype
     return "application/octet-stream"
+
+
+def content_disposition_attachment(filename: str) -> str:
+    """Build Content-Disposition attachment header; basename only, no path segments."""
+    base = Path(str(filename or "")).name
+    safe = (
+        base.replace('"', "")
+        .replace("\r", "")
+        .replace("\n", "")
+        .replace("\\", "")
+        .strip()
+    )
+    if not safe or safe in {".", ".."}:
+        safe = "download"
+    return f'attachment; filename="{safe}"'
 
 
 def _under(path: Path, root: Path) -> bool:

@@ -185,6 +185,7 @@
               <button type="button" role="tab" id="btn-file-preview" class="btn btn-ghost btn-sm" aria-selected="false">Preview</button>
             </div>
             <button type="button" id="btn-file-insert" class="btn btn-ghost btn-sm">Insert path</button>
+            <button type="button" id="btn-file-share" class="btn btn-ghost btn-sm hidden">Share</button>
             <button type="button" id="btn-file-save" class="btn btn-accent btn-sm" disabled>Save</button>
           </div>
         </div>
@@ -193,6 +194,10 @@
         <div id="file-image-wrap" class="file-image-wrap hidden">
           <img id="file-image" class="file-image" alt="Image preview" />
           <p class="file-image-hint muted">Tap image to enlarge</p>
+        </div>
+        <div id="file-video-wrap" class="file-video-wrap hidden">
+          <video id="file-video" class="file-video" controls playsinline></video>
+          <p class="file-video-hint muted">Use controls to play; Share to save on phone</p>
         </div>
         <p id="file-status" class="file-status muted"></p>
       </div>

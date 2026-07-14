@@ -18,7 +18,9 @@ from hub.acp_client import AcpClient
 from hub.agent_supervisor import AgentSupervisor
 from hub.config import Config, PROJECT_ROOT, TAILSCALE_EXE
 from hub.fs_browser import (
+    RAW_MAX_BYTES,
     FsBrowserError,
+    content_disposition_attachment,
     content_type_for,
     list_dir as fs_list_dir,
     read_text as fs_read_text,
@@ -1426,16 +1428,22 @@ class Hub:
                 self.config.projects_root, root, path
             )
             size = file_path.stat().st_size
-            if size > 15_000_000:
+            if size > RAW_MAX_BYTES:
                 return web.json_response({"error": "file too large"}, status=413)
             ctype = content_type_for(file_path)
+            headers = {
+                "Content-Type": ctype,
+                "Cache-Control": "private, max-age=60",
+                "X-Content-Type-Options": "nosniff",
+            }
+            download = (request.query.get("download") or "").strip().lower()
+            if download in ("1", "true", "yes"):
+                headers["Content-Disposition"] = content_disposition_attachment(
+                    file_path.name
+                )
             return web.FileResponse(
                 path=file_path,
-                headers={
-                    "Content-Type": ctype,
-                    "Cache-Control": "private, max-age=60",
-                    "X-Content-Type-Options": "nosniff",
-                },
+                headers=headers,
             )
         except FsBrowserError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
