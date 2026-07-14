@@ -1203,3 +1203,52 @@ def test_fs_upload_and_attach_contract() -> None:
     assert "/api/fs/upload" in js
     assert "btnAttach" in js or "btn-attach" in js
     assert "Attached file(s):" in js
+
+
+def test_session_plan_viewer_contract() -> None:
+    """PR3: Hub plan viewer route, modal, soft approve inject (not TUI handshake)."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    server = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    plan_view = (ROOT / "hub" / "plan_view.py").read_text(encoding="utf-8")
+
+    assert "/api/sessions/{id}/plan" in server
+    assert "handle_session_plan" in server
+    assert "read_session_plan" in server
+    assert "PlanViewError" in server
+
+    assert "def read_session_plan" in plan_view
+    assert "plan.md" in plan_view
+    assert "plan_mode.json" in plan_view
+    assert "awaiting_plan_approval" in plan_view
+    # Read-only: open for read, no writes to plan files
+    assert '.open("w"' not in plan_view
+    assert "path.write_text" not in plan_view
+    assert "atomic_write" not in plan_view
+
+    assert 'id="btn-view-plan"' in html
+    assert 'id="modal-plan"' in html
+    assert 'id="plan-body"' in html
+    assert 'id="btn-plan-approve"' in html
+    assert 'id="btn-plan-request-changes"' in html
+    assert "Hub soft action: sends as chat text only; does not clear TUI plan-mode gate." in html
+
+    assert "btnViewPlan" in js
+    assert "modalPlan" in js or "modal-plan" in js
+    assert "openPlanModal" in js
+    assert "softApprovePlan" in js
+    assert "softRequestPlanChanges" in js
+    assert "refreshSessionPlan" in js
+    assert "/api/sessions/" in js and "/plan" in js
+    assert "approved — implement the plan in plan.md" in js
+    assert "Request changes to the plan:" in js
+    # Soft inject only — no exit_plan_mode RPC call (comments may mention the name)
+    assert "exit_plan_mode(" not in js
+    assert '"exit_plan_mode"' not in js
+    assert "'exit_plan_mode'" not in js
+    assert "PLAN_APPROVE_INJECT" in js
+    assert "injectPlanComposerText" in js
+
+    assert ".modal-card-plan" in css
+    assert ".plan-body" in css

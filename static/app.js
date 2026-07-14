@@ -296,6 +296,8 @@
     pinnedSessions: [],
     selectedId: null,
     selectedMeta: null,
+    /** Last plan API payload for selected session (or null). */
+    sessionPlan: null,
     commands: [],
     turnRunning: false,
     promptQueueLength: 0,
@@ -413,6 +415,13 @@
     emptyMain: $("#empty-main"),
     chatTitle: $("#chat-title"),
     btnRenameSession: $("#btn-rename-session"),
+    btnViewPlan: $("#btn-view-plan"),
+    modalPlan: $("#modal-plan"),
+    planBody: $("#plan-body"),
+    planStatusChip: $("#plan-status-chip"),
+    btnPlanApprove: $("#btn-plan-approve"),
+    btnPlanRequestChanges: $("#btn-plan-request-changes"),
+    btnPlanClose: $("#btn-plan-close"),
     chatProject: $("#chat-project"),
     chatModel: $("#chat-model"),
     chatCwd: $("#chat-cwd"),
@@ -713,6 +722,7 @@
       if (state.selectedId) els.btnRenameSession.classList.remove("hidden");
       else els.btnRenameSession.classList.add("hidden");
     }
+    // View plan visibility is driven by refreshSessionPlan (plan.md exists)
 
     const cwd = meta.cwd || "";
     const project = basename(cwd);
@@ -758,6 +768,8 @@
   function clearTopbarSessionMeta() {
     if (els.chatTitle) els.chatTitle.textContent = "Select a session";
     if (els.btnRenameSession) els.btnRenameSession.classList.add("hidden");
+    setViewPlanVisible(false);
+    state.sessionPlan = null;
     if (els.chatProject) {
       els.chatProject.textContent = "";
       els.chatProject.classList.add("hidden");
@@ -3965,6 +3977,9 @@
       modelId: session.modelId || "",
       sessionId: session.sessionId || viewId,
     });
+    state.sessionPlan = null;
+    setViewPlanVisible(false);
+    refreshSessionPlan(viewId);
     renderSessions();
     syncFsForSession();
     if (isMobile()) closeRail();
@@ -5671,6 +5686,146 @@
     } catch (_) {
       /* ignore network errors on close */
     }
+  }
+
+  // Soft composer inject only — NOT the Grok TUI a-key / exit_plan_mode handshake.
+  const PLAN_APPROVE_INJECT = "approved — implement the plan in plan.md";
+  const PLAN_REQUEST_CHANGES_INJECT = "Request changes to the plan:\n\n";
+
+  function setViewPlanVisible(show) {
+    if (!els.btnViewPlan) return;
+    els.btnViewPlan.classList.toggle("hidden", !show);
+  }
+
+  function closePlanModal() {
+    if (els.modalPlan) els.modalPlan.classList.add("hidden");
+  }
+
+  function renderPlanMarkdown(source) {
+    if (!els.planBody) return;
+    const text = source || "";
+    if (typeof window.marked === "undefined" || typeof window.DOMPurify === "undefined") {
+      els.planBody.textContent = text || "(empty plan)";
+      return;
+    }
+    try {
+      if (window.marked && typeof window.marked.setOptions === "function") {
+        window.marked.setOptions({ gfm: true, breaks: false });
+      }
+      const rawHtml =
+        typeof window.marked.parse === "function"
+          ? window.marked.parse(text || "")
+          : window.marked(text || "");
+      els.planBody.innerHTML = window.DOMPurify.sanitize(rawHtml || "");
+      if (!text.trim()) {
+        els.planBody.innerHTML = '<p class="muted">(empty plan.md)</p>';
+      }
+    } catch (err) {
+      els.planBody.textContent = "Preview failed: " + err + "\n\n" + text;
+    }
+  }
+
+  function updatePlanStatusChip(plan) {
+    if (!els.planStatusChip) return;
+    const awaiting = !!(plan && plan.awaitingApproval);
+    const stateLabel = plan && plan.state ? String(plan.state) : "";
+    if (awaiting) {
+      els.planStatusChip.textContent = "Awaiting approval (runtime)";
+      els.planStatusChip.classList.remove("hidden");
+    } else if (stateLabel) {
+      els.planStatusChip.textContent = "State: " + stateLabel;
+      els.planStatusChip.classList.remove("hidden");
+    } else {
+      els.planStatusChip.textContent = "";
+      els.planStatusChip.classList.add("hidden");
+    }
+  }
+
+  async function refreshSessionPlan(sessionId) {
+    const sid = String(sessionId || state.selectedId || "").trim();
+    if (!sid) {
+      state.sessionPlan = null;
+      setViewPlanVisible(false);
+      return null;
+    }
+    try {
+      const res = await fetch(
+        apiUrl(`/api/sessions/${encodeURIComponent(sid)}/plan`)
+      );
+      if (state.selectedId !== sid) return null;
+      if (res.status === 404) {
+        state.sessionPlan = null;
+        setViewPlanVisible(false);
+        return null;
+      }
+      const data = await res.json().catch(() => ({}));
+      if (state.selectedId !== sid) return null;
+      if (!res.ok) {
+        state.sessionPlan = null;
+        setViewPlanVisible(false);
+        return null;
+      }
+      state.sessionPlan = data;
+      setViewPlanVisible(!!data.exists);
+      return data;
+    } catch (_) {
+      if (state.selectedId === sid) {
+        state.sessionPlan = null;
+        setViewPlanVisible(false);
+      }
+      return null;
+    }
+  }
+
+  async function openPlanModal() {
+    const sid = state.selectedId;
+    if (!sid) {
+      toast("Select a session first", "danger");
+      return;
+    }
+    let plan = state.sessionPlan;
+    if (!plan || plan.sessionId !== sid) {
+      plan = await refreshSessionPlan(sid);
+    }
+    if (!plan || !plan.exists) {
+      toast("No plan.md for this session", "danger");
+      setViewPlanVisible(false);
+      return;
+    }
+    renderPlanMarkdown(plan.markdown || "");
+    updatePlanStatusChip(plan);
+    if (els.modalPlan) els.modalPlan.classList.remove("hidden");
+  }
+
+  function injectPlanComposerText(text) {
+    closePlanModal();
+    if (!els.input) return;
+    els.input.value = text;
+    try {
+      if (typeof autoGrow === "function") autoGrow();
+    } catch (_) {}
+    try {
+      els.input.focus({ preventScroll: true });
+    } catch (_) {
+      try {
+        els.input.focus();
+      } catch (_) {}
+    }
+    // Place caret at end for request-changes prompt
+    try {
+      const len = els.input.value.length;
+      els.input.setSelectionRange(len, len);
+    } catch (_) {}
+    setComposerEnabled(composerConnected());
+  }
+
+  function softApprovePlan() {
+    // Inject only — does not call exit_plan_mode or write plan_mode.json.
+    injectPlanComposerText(PLAN_APPROVE_INJECT);
+  }
+
+  function softRequestPlanChanges() {
+    injectPlanComposerText(PLAN_REQUEST_CHANGES_INJECT);
   }
 
   function hideImagePreview() {
@@ -7427,6 +7582,11 @@
           stopSitePreview();
           return;
         }
+        if (els.modalPlan && !els.modalPlan.classList.contains("hidden")) {
+          e.preventDefault();
+          closePlanModal();
+          return;
+        }
         if (els.modalAskUser && !els.modalAskUser.classList.contains("hidden")) {
           e.preventDefault();
           cancelAskUserQuestion();
@@ -7455,6 +7615,25 @@
         startRenameSession(state.selectedId, title, els.chatTitle);
       });
     }
+    if (els.btnViewPlan) {
+      els.btnViewPlan.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openPlanModal();
+      });
+    }
+    if (els.btnPlanApprove) {
+      els.btnPlanApprove.addEventListener("click", (e) => {
+        e.preventDefault();
+        softApprovePlan();
+      });
+    }
+    if (els.btnPlanRequestChanges) {
+      els.btnPlanRequestChanges.addEventListener("click", (e) => {
+        e.preventDefault();
+        softRequestPlanChanges();
+      });
+    }
 
     $$("[data-close]").forEach((el) => {
       el.addEventListener("click", () => {
@@ -7462,6 +7641,7 @@
         if (id === "modal-new") closeNewModal();
         if (id === "modal-ask-user") cancelAskUserQuestion();
         if (id === "modal-site-preview") stopSitePreview();
+        if (id === "modal-plan") closePlanModal();
       });
     });
     $$(".site-preview-preset").forEach((btn) => {

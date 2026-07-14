@@ -70,6 +70,7 @@
           <div class="topbar-title-row">
             <h1 id="chat-title" class="chat-title">Select a session</h1>
             <button type="button" id="btn-rename-session" class="session-rename-btn topbar-rename hidden" aria-label="Rename session" title="Rename session">✎</button>
+            <button type="button" id="btn-view-plan" class="btn btn-ghost btn-sm topbar-plan hidden" aria-label="View session plan" title="View session plan">View plan</button>
           </div>
           <div class="chat-sub" id="chat-sub">
             <span id="chat-project" class="chip chip-project meta-chip hidden" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Project details"></span>
@@ -302,6 +303,26 @@
             ></iframe>
           </div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal-plan" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-plan-title">
+    <div class="modal-backdrop" data-close="modal-plan"></div>
+    <div class="modal-card modal-card-plan">
+      <header class="modal-header">
+        <div class="plan-title-wrap">
+          <h2 id="modal-plan-title">Session plan</h2>
+          <span id="plan-status-chip" class="plan-status-chip muted hidden" aria-live="polite"></span>
+        </div>
+        <button type="button" class="btn btn-ghost btn-icon" data-close="modal-plan" aria-label="Close">×</button>
+      </header>
+      <div id="plan-body" class="plan-body markdown-body" tabindex="0" aria-label="Session plan markdown"></div>
+      <p class="muted modal-help plan-soft-note">Hub soft action: sends as chat text only; does not clear TUI plan-mode gate.</p>
+      <div class="modal-actions plan-actions">
+        <button type="button" id="btn-plan-close" class="btn btn-ghost" data-close="modal-plan">Close</button>
+        <button type="button" id="btn-plan-request-changes" class="btn btn-ghost">Request changes</button>
+        <button type="button" id="btn-plan-approve" class="btn btn-accent">Approve</button>
       </div>
     </div>
   </div>
