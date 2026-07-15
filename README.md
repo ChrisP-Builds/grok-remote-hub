@@ -64,7 +64,8 @@ The stock Grok CLI TUI is excellent on the desktop, but it is a **single local p
 
 - **Session rail** — Working / Subagent / All, search, pin, rename, delete
 - **Live stream** — multi-browser WebSocket fan-out; mid-turn switch keeps continuity
-- **Agent status** — pill and `/health` distinguish process up vs ACP connected (reconnecting / hung vs true agent down); auto-reconnect ACP when the serve process is still listening
+- **Agent status** — pill and `/health` distinguish process up vs ACP connected **and** ACP quality (`ok`/`stale`/`zombie`); auto-reconnect when process is up; after heal exhaustion, **click the hung pill** to restart the agent serve (hub stays up)
+- **Plan mode (Hub)** — View plan appears **inline** when awaiting/Active; Approve writes `plan_mode.json` (not stock TUI `exit_plan_mode`)
 - **History** — hydrate from `updates.jsonl` when you open a session
 - **Composer** — multi-line input, slash palette, prompt queue while a turn runs
 - **Files** — sandboxed tree for the session cwd (edit, markdown + Mermaid, images)
@@ -94,7 +95,7 @@ Node 18+ (ES modules), stdlib only. Separate from the Python hub on `:8787`.
 - **Sole-writer prompts** — live turns use hub-owned `session/new`
 - **Dual browser, not dual TUI** — phone + desktop share this process; stock TUI is separate
 
-Design write-ups: **[docs/adr/](docs/adr/)** (ADR 001–008).
+Design write-ups: **[docs/adr/](docs/adr/)** (ADR 001–014).
 
 | Path | Live together? | Notes |
 |---|---|---|

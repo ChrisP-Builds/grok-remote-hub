@@ -8,6 +8,12 @@ from typing import Any
 
 # Dead on arrival: no ACP update after prompt accepted.
 NO_OUTPUT_SECONDS = 60.0
+# Soft / heavy history: first TTFB can exceed 60s while agent digests updates.jsonl.
+NO_OUTPUT_SOFT_SECONDS = 180.0
+NO_OUTPUT_HEAVY_SECONDS = 300.0
+NO_OUTPUT_HEAVY_UPDATES_BYTES = 12_000_000
+# Second attempt after no-output auto-retry (at least this long).
+NO_OUTPUT_RETRY_SECONDS = 300.0
 
 # Silence after activity — only for truly dead agents (tools can be quiet minutes).
 MID_TURN_STALL_SECONDS = 600.0  # 10 min
@@ -30,6 +36,29 @@ CONTEXT_SOFT_MESSAGE = (
     "Heavy session — responses may be slow. Prefer compact/continue same thread; "
     "use New only to fork."
 )
+
+
+def no_output_seconds_for_session(
+    *,
+    updates_bytes: int | None = None,
+    soft_updates_bytes: int = CONTEXT_SOFT_UPDATES_BYTES,
+    base_seconds: float = NO_OUTPUT_SECONDS,
+    soft_seconds: float = NO_OUTPUT_SOFT_SECONDS,
+    heavy_bytes: int = NO_OUTPUT_HEAVY_UPDATES_BYTES,
+    heavy_seconds: float = NO_OUTPUT_HEAVY_SECONDS,
+) -> float:
+    """Return stall no-output threshold scaled by session history size."""
+    if updates_bytes is None:
+        return float(base_seconds)
+    try:
+        size = int(updates_bytes)
+    except (TypeError, ValueError):
+        return float(base_seconds)
+    if size > int(heavy_bytes):
+        return float(heavy_seconds)
+    if size > int(soft_updates_bytes):
+        return float(soft_seconds)
+    return float(base_seconds)
 
 
 def context_budget_level(

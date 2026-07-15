@@ -6,11 +6,15 @@ from pathlib import Path
 
 from hub.status_view import (
     ACP_HEAL_MAX_ATTEMPTS,
+    ACP_PROBE_INTERVAL_S,
+    ACP_PROBE_SILENCE_S,
     ACP_STALE_SECONDS,
     ACP_ZOMBIE_SEND_FAILURES,
     map_acp_quality,
     map_agent_status,
     should_attempt_acp_heal,
+    should_probe_acp_liveness,
+    should_suppress_session_load_fanout,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -147,21 +151,294 @@ def test_should_attempt_acp_heal_backoff() -> None:
     assert should_attempt_acp_heal(**_heal_kwargs(attempts=1, disconnected_for_s=15.0)) is True
 
 
+def test_should_attempt_acp_heal_skips_stale_when_turn_active() -> None:
+    """Pending session/prompt silence is stall-watchdog territory, not reconnect."""
+    assert (
+        should_attempt_acp_heal(
+            **_heal_kwargs(
+                disconnected_for_s=12.0,
+                acp_quality="stale",
+                turn_active=True,
+            )
+        )
+        is False
+    )
+
+
+def test_should_attempt_acp_heal_allows_stale_when_idle() -> None:
+    """Idle stale (no live turn) may still heal after min_down."""
+    assert (
+        should_attempt_acp_heal(
+            **_heal_kwargs(
+                disconnected_for_s=12.0,
+                acp_quality="stale",
+                turn_active=False,
+            )
+        )
+        is True
+    )
+
+
+def test_should_attempt_acp_heal_allows_zombie_when_turn_active() -> None:
+    """Wire truly dead (zombie) still heals mid-turn after min_down."""
+    assert (
+        should_attempt_acp_heal(
+            **_heal_kwargs(
+                disconnected_for_s=12.0,
+                acp_quality="zombie",
+                turn_active=True,
+            )
+        )
+        is True
+    )
+
+
+def test_acp_stale_seconds_above_no_output() -> None:
+    """Stale quality must flip after no-output stall policy owns silent prompts."""
+    from hub.session_policy import NO_OUTPUT_SECONDS
+
+    assert ACP_STALE_SECONDS > NO_OUTPUT_SECONDS
+
+
+def test_should_probe_acp_liveness_gates() -> None:
+    assert (
+        should_probe_acp_liveness(
+            connected=True,
+            has_pending=False,
+            seconds_since_recv=ACP_PROBE_SILENCE_S,
+            seconds_since_probe=None,
+        )
+        is True
+    )
+    # Not connected
+    assert (
+        should_probe_acp_liveness(
+            connected=False,
+            has_pending=False,
+            seconds_since_recv=100.0,
+            seconds_since_probe=None,
+        )
+        is False
+    )
+    # Pending RPC: stale path handles it
+    assert (
+        should_probe_acp_liveness(
+            connected=True,
+            has_pending=True,
+            seconds_since_recv=100.0,
+            seconds_since_probe=None,
+        )
+        is False
+    )
+    # Recent recv
+    assert (
+        should_probe_acp_liveness(
+            connected=True,
+            has_pending=False,
+            seconds_since_recv=ACP_PROBE_SILENCE_S - 1.0,
+            seconds_since_probe=None,
+        )
+        is False
+    )
+    # Probe too recent
+    assert (
+        should_probe_acp_liveness(
+            connected=True,
+            has_pending=False,
+            seconds_since_recv=100.0,
+            seconds_since_probe=ACP_PROBE_INTERVAL_S - 1.0,
+        )
+        is False
+    )
+    # Never received
+    assert (
+        should_probe_acp_liveness(
+            connected=True,
+            has_pending=False,
+            seconds_since_recv=None,
+            seconds_since_probe=None,
+        )
+        is False
+    )
+
+
 def test_server_has_acp_heal_hook() -> None:
     src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
     assert "reconnect" in src
     assert "acp heal" in src.lower() or "heal_acp" in src or "acp_heal" in src
     assert "_maybe_heal_acp" in src
     assert "should_attempt_acp_heal" in src
+    assert "maybe_probe_liveness" in src
     assert 'POST /api/admin/reconnect-acp' in src or "reconnect-acp" in src
     assert 'POST /api/admin/restart-agent' in src or "restart-agent" in src
+    assert 'GET /api/admin/acp-trace' in src or "acp-trace" in src
     assert "handle_restart_agent" in src
+    assert "handle_acp_trace" in src
     assert "_on_acp_connection" in src
     # Successful connect resets heal attempts
     on_conn = src[src.find("async def _on_acp_connection") :]
     on_conn = on_conn[:1200]
     assert "_acp_heal_attempts = 0" in on_conn
     assert "ACP heal" in on_conn or "heal" in on_conn.lower()
+    acp = (ROOT / "hub" / "acp_client.py").read_text(encoding="utf-8")
+    assert "async def maybe_probe_liveness" in acp
+    assert "AcpTrace" in acp
+
+
+def test_suppress_tool_call_during_load() -> None:
+    loading = {"sess-a"}
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id="sess-a",
+            method="session/update",
+            update_kind="tool_call",
+        )
+        is True
+    )
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id="sess-a",
+            method="_x.ai/session/update",
+            update_kind="agent_thought_chunk",
+        )
+        is True
+    )
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id="sess-a",
+            method="_x.ai/session_notification",
+            update_kind="auto_compact_start",
+        )
+        is True
+    )
+
+
+def test_does_not_suppress_when_sid_has_active_turn() -> None:
+    """Live re-prompt must receive note_activity even if load suppress still set."""
+    loading = {"sess-a"}
+    active = frozenset({"sess-a"})
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id="sess-a",
+            method="session/update",
+            update_kind="tool_call",
+            active_turn_session_ids=active,
+        )
+        is False
+    )
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id="sess-a",
+            method="_x.ai/session/update",
+            update_kind="agent_thought_chunk",
+            active_turn_session_ids=active,
+        )
+        is False
+    )
+
+
+def test_missing_sid_not_suppressed_when_active_turn_exists() -> None:
+    loading = {"sess-a"}
+    active = frozenset({"sess-a"})
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id=None,
+            method="session/update",
+            update_kind="tool_call",
+            active_turn_session_ids=active,
+        )
+        is False
+    )
+
+
+def test_allow_available_commands_during_load() -> None:
+    loading = {"sess-a"}
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id="sess-a",
+            method="session/update",
+            update_kind="available_commands_update",
+        )
+        is False
+    )
+    # Still allowed when active turn is set
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id="sess-a",
+            method="session/update",
+            update_kind="available_commands_update",
+            active_turn_session_ids=frozenset({"sess-a"}),
+        )
+        is False
+    )
+
+
+def test_no_suppress_when_loading_empty() -> None:
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=set(),
+            session_id="sess-a",
+            method="session/update",
+            update_kind="tool_call",
+        )
+        is False
+    )
+
+
+def test_suppress_missing_sid_while_any_load_active() -> None:
+    loading = {"sess-a"}
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id=None,
+            method="session/update",
+            update_kind="tool_call",
+        )
+        is True
+    )
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id=None,
+            method="x.ai/session_notification",
+            update_kind=None,
+        )
+        is True
+    )
+
+
+def test_do_not_suppress_other_session_while_loading() -> None:
+    loading = {"sess-a"}
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id="sess-b",
+            method="session/update",
+            update_kind="tool_call",
+        )
+        is False
+    )
+
+
+def test_suppress_ignores_non_update_methods() -> None:
+    loading = {"sess-a"}
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=loading,
+            session_id="sess-a",
+            method="session/prompt",
+            update_kind=None,
+        )
+        is False
+    )
 
 
 def test_server_status_exposes_turn_telemetry_and_capacity() -> None:

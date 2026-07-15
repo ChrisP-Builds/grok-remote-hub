@@ -70,7 +70,6 @@
           <div class="topbar-title-row">
             <h1 id="chat-title" class="chat-title">Select a session</h1>
             <button type="button" id="btn-rename-session" class="session-rename-btn topbar-rename hidden" aria-label="Rename session" title="Rename session">✎</button>
-            <button type="button" id="btn-view-plan" class="btn btn-ghost btn-sm topbar-plan hidden" aria-label="View session plan" title="View session plan">View plan</button>
           </div>
           <div class="chat-sub" id="chat-sub">
             <span id="chat-project" class="chip chip-project meta-chip hidden" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Project details"></span>
@@ -117,11 +116,6 @@
       </div>
 
       <div id="chat-panel" class="chat-panel">
-        <div id="turn-strip" class="turn-strip" data-state="idle" aria-live="polite">
-          <span id="turn-strip-text">idle</span>
-          <span id="turn-strip-cursor" class="term-cursor hidden" aria-hidden="true">▋</span>
-        </div>
-
         <div id="capacity-banner" class="capacity-banner hidden" data-state="idle" aria-live="polite">
           <span id="capacity-banner-text"></span>
         </div>
@@ -135,8 +129,8 @@
         </div>
 
         <div id="plan-await-banner" class="plan-await-banner hidden" aria-live="polite">
-          <span class="plan-await-banner-text">Plan awaiting approval</span>
-          <button type="button" id="btn-plan-await-open" class="btn btn-ghost btn-sm">View plan</button>
+          <span class="plan-await-banner-text" id="plan-await-banner-text">Plan awaiting approval</span>
+          <button type="button" id="btn-view-plan" class="btn btn-accent btn-sm plan-inline-btn" aria-label="View session plan" title="View session plan">View plan</button>
         </div>
 
         <div class="transcript-wrap">
@@ -159,6 +153,10 @@
         </div>
 
         <div class="composer-shell">
+          <div id="turn-strip" class="turn-strip" data-state="idle" aria-live="polite">
+            <span id="turn-strip-text">idle</span>
+            <span id="turn-strip-cursor" class="term-cursor hidden" aria-hidden="true">▋</span>
+          </div>
           <div id="slash-palette" class="slash-palette hidden" role="listbox" aria-label="Slash commands"></div>
           <form id="composer-form" class="composer">
             <span class="composer-prompt" aria-hidden="true">&gt;</span>
@@ -184,12 +182,6 @@
             <div class="composer-actions">
               <button type="button" id="btn-attach" class="btn btn-ghost btn-sm" title="Attach image or video" aria-label="Attach file">📎</button>
               <button type="button" id="btn-stop" class="btn btn-danger btn-sm hidden">Stop</button>
-              <button
-                type="button"
-                id="btn-reload"
-                class="btn btn-ghost btn-sm hidden"
-                title="Stop turn and re-attach this session (resume)"
-              >Reload</button>
               <button type="submit" id="btn-send" class="btn btn-accent" disabled>Send</button>
             </div>
           </form>

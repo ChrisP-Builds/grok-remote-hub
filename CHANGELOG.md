@@ -10,20 +10,36 @@ This file is the **public narrative**. Session chat context is not required to u
 ## [Unreleased]
 
 ### Added
+- **ACP structured trace** — ring buffer + daily `logs/acp-trace-YYYYMMDD.jsonl`; `GET /api/admin/acp-trace?n=100`; last 5 on `/health` as `acpTraceRecent` (connect/send/recv/probe/heal/compact/quality, no secrets or full prompts).
+- **ACP WebSocket ping probe** — after 45s idle silence (no pending RPC), hub pings the agent WS; probe fail forces unhealthy so heal reconnects (no auto-KillAgent).
 - **Files media Share/Save** — video preview (mp4/mov/webm/m4v), Web Share API from Files, higher raw serve limit (150 MB), optional `?download=1` Content-Disposition (file-first; ADR 006/010).
 - **Binary upload + attach** — `POST /api/fs/upload` into session `uploads/`; composer paperclip and Files Upload; path prefill; image 40 MB / video 150 MB caps + MIME allowlist.
 - **Hub plan viewer** — `GET /api/sessions/{id}/plan` reads `plan.md` + `plan_mode.json`; View plan modal.
-- **Hub plan-mode handshake** — `POST /api/sessions/{id}/plan/action` writes `plan_mode.json` (approve / request_changes / quit) so Approve clears `awaiting_plan_approval` without stock TUI `a`-key / `exit_plan_mode` (ADR 012); Approve also auto-sends continue inject text.
+- **Hub plan-mode handshake** — `POST /api/sessions/{id}/plan/action` writes `plan_mode.json` (approve / request_changes / quit) so Approve clears `awaiting_plan_approval` without stock TUI `a`-key / `exit_plan_mode` (ADR 012); Approve also auto-sends continue inject text. Inline plan strip + View plan only when plan is awaiting/Active (not leftover `plan.md`).
+- **ACP quality** — `acpQuality` (`ok`/`stale`/`zombie`/`down`); chat-ready requires quality ok; zombie send-fail disconnect (ADR 013).
+- **Restart agent from pill** — when hung/down, click status pill → confirm → `POST /api/admin/restart-agent` (KillAgent-style serve recycle; hub stays up) (ADR 014).
+- **Turn telemetry / capacity** — `liveTurns` age/silence/ttfb; capacity banner while work runs.
+- **Soft context budget** — advisory when session `updates.jsonl` / tokens exceed soft thresholds (no hard gate).
+- **Open-tool wait cues** — strip prefers running over quiet while tools open; local `waiting · Ns` heartbeat.
+- **Live terminal_out** — hub terminal/* pump streams deltas to UI tool rows.
 - **Tool-row site Preview** — when a tool summary/path ends in `.html`/`.htm`, a compact **Preview** control opens the existing in-hub site preview (file-first; ADR 010).
-- **Sticky active user prompt** — current **You:** line pins to the top of the transcript while the turn runs.
+- **Sticky active user prompt** — scroll-linked You: pin; one-line collapsed by default; click expands; higher contrast sticky bar.
 
 ### Fixed
+- **Orphan agent turn after hub force-clear** — stall watchdog, admin reset-turn, and no-output recovery now call `session/cancel` (via `notify_agent_cancel`) so the agent releases the old prompt; UI unlock no longer leaves the next message blocked forever.
+- **Heavy-session no-output false kill** — scale stall threshold by `updates.jsonl` size (60s base / 180s soft / 300s heavy); never suppress ACP activity mid-turn; skip redundant `session/load` on no-output retry when already loaded; release load-suppress before re-prompt.
+- **Turn elapsed/silence timers seed from server age** — strip `running · Ns` and tool `waiting · Ns` survive hard-refresh/reconnect (no more client-only `Date.now()` reset to 0s).
+- **session/load historical replay no longer streamed live** — drops agent history flood during load (stops UI tool strobe); history still via REST/WS.
+- **Stale ACP heal no longer kills mid-prompt** — heal skips `stale` while a turn is active (stall watchdog owns silent prompts); `ACP_STALE_SECONDS` raised to 90s so quality does not flip before the 60s no-output policy.
+- **Compact token sanity** — reject absurd/non-finite compact token counts (>5M or negative) hub-side and in UI so bogus “375k context” / scroll thrash does not paint.
+- **`/compact` context bar + feedback** — hub intercepts `/compact` via `_x.ai/compact_conversation`, broadcasts `compact`/`usage` from `_x.ai/session_notification` `auto_compact_*`, and the UI updates the context bar with before→after (or no-op) feedback instead of waiting on the 6s poll alone.
 - **Live stream text doubling** — `mergeStreamText` matches history cumulative-vs-delta merge so mid-turn assistant/thought text no longer looks duplicated.
 - Tools stay **collapsed** by default; empty expand no longer shows “No detail.”
 - Thinking summary no longer doubles the word “Thinking.”
 - Composer placeholder adapts to width (short vs slash-hint) with CSS ellipsis.
 - Status pill distinguishes agent process up vs ACP disconnected; auto-reconnect ACP when process is up (capped retries).
 - Mobile transcript GFM tables re-parse from raw stream text and scroll horizontally.
+- Mobile: hide session-banner; sticky You flush to top of chat scroll.
 
 ---
 
