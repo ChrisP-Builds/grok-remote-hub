@@ -65,7 +65,7 @@ pytestmark = [
 
 
 def test_reload_and_entry_choice_structure() -> None:
-    """Structural smoke: Reload + entry-choice DOM exist."""
+    """Structural smoke: Stop/Send present, Reload absent, entry-choice DOM exists."""
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
@@ -75,8 +75,14 @@ def test_reload_and_entry_choice_structure() -> None:
             page.goto(HUB, wait_until="domcontentloaded", timeout=30_000)
             page.wait_for_selector("#empty-main", timeout=15_000)
 
-            assert page.locator("#btn-reload").count() == 1
+            assert page.locator("#btn-reload").count() == 0
             assert page.locator("#btn-stop").count() == 1
+            assert page.locator("#btn-send").count() == 1
+            page.wait_for_function(
+                "() => !!(window.__hubTestHooks && "
+                "window.__hubTestHooks.reloadResumeSession)",
+                timeout=15_000,
+            )
 
             page.locator("#btn-new").click()
             page.wait_for_selector("#modal-new:not(.hidden)", timeout=10_000)
@@ -208,13 +214,6 @@ def test_reload_resume_same_id_via_hook() -> None:
             )
             assert opened.get("ids", {}).get("selectedId") == sid, opened
 
-            # Reload button visible when session selected.
-            page.wait_for_function(
-                "() => { const b = document.getElementById('btn-reload'); "
-                "return b && !b.classList.contains('hidden'); }",
-                timeout=10_000,
-            )
-
             # Optional reset-turn so clear succeeds even if mid-turn.
             page.evaluate(
                 """async (sid) => {
@@ -258,30 +257,6 @@ def test_reload_resume_same_id_via_hook() -> None:
             assert before.get("selectedId") == sid, result
             assert after.get("selectedId") == sid, result
             assert after.get("selectedId") == before.get("selectedId") == sid, result
-
-            # Click path when possible: reload again via button.
-            if page.locator("#btn-reload:not(.hidden)").count() == 1:
-                page.locator("#btn-reload").click()
-                page.wait_for_function(
-                    """(sid) => {
-                      const b = document.getElementById('btn-reload');
-                      const h = window.__hubTestHooks;
-                      if (!h || !h.getSessionIdsForTest) return false;
-                      const ids = h.getSessionIdsForTest();
-                      // Reload finished: button visible again, same selected id.
-                      return (
-                        !!b &&
-                        !b.classList.contains('hidden') &&
-                        ids.selectedId === sid
-                      );
-                    }""",
-                    arg=sid,
-                    timeout=20_000,
-                )
-                after_click = page.evaluate(
-                    "() => window.__hubTestHooks.getSessionIdsForTest()"
-                )
-                assert after_click.get("selectedId") == sid, after_click
         finally:
             browser.close()
 

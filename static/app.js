@@ -106,6 +106,95 @@
     return !o.turn_running && !!o.has_open_or_failed;
   }
 
+  /** Client wall-clock epoch ms for event that is ageSeconds old. null if age invalid. */
+  function wallMsFromAgeSeconds(nowMs, ageSeconds) {
+    if (ageSeconds == null) return null;
+    const age = Number(ageSeconds);
+    if (!Number.isFinite(age) || age < 0) return null;
+    return Number(nowMs) - age * 1000;
+  }
+
+  /** Non-negative whole seconds since startedWallMs; 0 if missing. */
+  function elapsedSecondsFromWall(nowMs, startedWallMs) {
+    if (startedWallMs == null) return 0;
+    const start = Number(startedWallMs);
+    if (!Number.isFinite(start)) return 0;
+    const s = Math.floor((Number(nowMs) - start) / 1000);
+    return s < 0 ? 0 : s;
+  }
+
+  /**
+   * Prefer liveTurns entry matching selected session; else primary age when selected
+   * is primary (or only one live turn). Mirror of hub.ui_ux.pick_turn_age_seconds.
+   */
+  function pickTurnAgeSeconds(opts) {
+    const o = opts || {};
+    const selected = o.selected_session_id || null;
+    const turns = Array.isArray(o.live_turns) ? o.live_turns : [];
+    const primaryAge = o.primary_age;
+    const primarySid = o.primary_session_id || null;
+    const finite = (raw) => {
+      if (raw == null) return null;
+      const a = Number(raw);
+      if (!Number.isFinite(a) || a < 0) return null;
+      return a;
+    };
+    if (selected) {
+      for (let i = 0; i < turns.length; i++) {
+        const t = turns[i];
+        if (!t || t.sessionId !== selected) continue;
+        const matched = finite(t.ageSeconds);
+        if (matched != null) return matched;
+        break;
+      }
+    }
+    const pa = finite(primaryAge);
+    if (pa != null) {
+      if (!selected || selected === primarySid || turns.length <= 1) return pa;
+    }
+    if (turns.length === 1 && turns[0]) {
+      const only = finite(turns[0].ageSeconds);
+      if (only != null) return only;
+    }
+    return null;
+  }
+
+  /**
+   * Prefer liveTurns silence for selected; else primary silence when selected is
+   * primary or only one live turn.
+   */
+  function pickTurnSilenceSeconds(opts) {
+    const o = opts || {};
+    const selected = o.selected_session_id || null;
+    const turns = Array.isArray(o.live_turns) ? o.live_turns : [];
+    const primarySilence = o.primary_silence;
+    const primarySid = o.primary_session_id || null;
+    const finite = (raw) => {
+      if (raw == null) return null;
+      const a = Number(raw);
+      if (!Number.isFinite(a) || a < 0) return null;
+      return a;
+    };
+    if (selected) {
+      for (let i = 0; i < turns.length; i++) {
+        const t = turns[i];
+        if (!t || t.sessionId !== selected) continue;
+        const matched = finite(t.silenceSeconds);
+        if (matched != null) return matched;
+        break;
+      }
+    }
+    const ps = finite(primarySilence);
+    if (ps != null) {
+      if (!selected || selected === primarySid || turns.length <= 1) return ps;
+    }
+    if (turns.length === 1 && turns[0]) {
+      const only = finite(turns[0].silenceSeconds);
+      if (only != null) return only;
+    }
+    return null;
+  }
+
   const BUILTIN_SLASH = [
     { name: "new", description: "Start a new session" },
     { name: "compact", description: "Compact conversation history" },
@@ -348,6 +437,7 @@
       tools: new Map(),
       terminals: new Map(),
       lastToolTitle: "",
+      lastActivityLine: "",
       activeUserEl: null,
     },
     slashOpen: false,
@@ -439,7 +529,7 @@
     btnPlanQuit: $("#btn-plan-quit"),
     btnPlanClose: $("#btn-plan-close"),
     planAwaitBanner: $("#plan-await-banner"),
-    btnPlanAwaitOpen: $("#btn-plan-await-open"),
+    planAwaitBannerText: $("#plan-await-banner-text"),
     chatProject: $("#chat-project"),
     chatModel: $("#chat-model"),
     chatCwd: $("#chat-cwd"),
@@ -460,7 +550,6 @@
     btnFsUpload: $("#btn-fs-upload"),
     btnSend: $("#btn-send"),
     btnStop: $("#btn-stop"),
-    btnReload: $("#btn-reload"),
     composerHint: $("#composer-hint"),
     slash: $("#slash-palette"),
     btnMenu: $("#btn-menu"),
@@ -1801,6 +1890,105 @@
     return "";
   }
 
+  function formatActivityLine(title, summary) {
+    const t = String(title || "").trim();
+    const s = String(summary || "").trim();
+    if (t && s && !t.includes(s) && s !== t) {
+      const line = t + " · " + s;
+      return line.length > 100 ? line.slice(0, 99) + "…" : line;
+    }
+    return t || s || "";
+  }
+
+  function setSessionActivityLine(sessionId, line, opts) {
+    const text = String(line || "").trim();
+    const isSelected = sessionId && sessionId === state.selectedId;
+    if (isSelected && state.streamBuffers) {
+      state.streamBuffers.lastActivityLine = text;
+      if (opts && opts.toolTitle) state.streamBuffers.lastToolTitle = String(opts.toolTitle);
+    }
+    if (sessionId) {
+      const v = state.sessionViews.get(sessionId);
+      if (v) {
+        v.lastActivityLine = text;
+        if (v.streamBuffers) {
+          v.streamBuffers.lastActivityLine = text;
+          if (opts && opts.toolTitle) v.streamBuffers.lastToolTitle = String(opts.toolTitle);
+        } else if (opts && opts.toolTitle) {
+          v.lastToolTitle = String(opts.toolTitle);
+        }
+      }
+    }
+    scheduleTurnStrip();
+  }
+
+  function activityLineForSession(sessionId) {
+    if (!sessionId) return "";
+    if (sessionId === state.selectedId && state.streamBuffers) {
+      return (
+        state.streamBuffers.lastActivityLine ||
+        state.streamBuffers.lastToolTitle ||
+        ""
+      );
+    }
+    const v = state.sessionViews.get(sessionId);
+    if (v && v.streamBuffers) {
+      return v.streamBuffers.lastActivityLine || v.streamBuffers.lastToolTitle || "";
+    }
+    if (v) return v.lastActivityLine || v.lastToolTitle || "";
+    return "";
+  }
+
+  function parentIdForSession(sessionId) {
+    if (!sessionId || !Array.isArray(state.sessions)) return "";
+    for (let i = 0; i < state.sessions.length; i++) {
+      const s = state.sessions[i];
+      if (s && s.sessionId === sessionId) return s.parentSessionId || "";
+    }
+    return "";
+  }
+
+  function feedParentActivityFromChild(childId, kind, update) {
+    const parentId = parentIdForSession(childId);
+    if (!parentId || parentId !== state.selectedId) return;
+    let title = "";
+    let summary = "";
+    // Use kindStr so structural tests still find processAcpSessionUpdate first.
+    const kindStr = String(kind || "");
+    if (kindStr === "tool_call" || kindStr === "tool_call_update") {
+      title = toolLabelFromUpdate(update) || "";
+      summary =
+        extractToolContentSnippet(update, 80) || toolSummaryFromUpdate(update) || "";
+    } else if (kindStr === "agent_thought_chunk") {
+      title = "thinking";
+      const t = extractText(update.content);
+      if (t) summary = t.trim().slice(0, 60);
+    } else if (kindStr === "agent_message_chunk") {
+      title = "replying";
+      const t = extractText(update.content);
+      if (t) summary = t.trim().slice(0, 60);
+    } else {
+      return;
+    }
+    const line = formatActivityLine(title, summary);
+    if (!line) return;
+    setSessionActivityLine(parentId, "subagent · " + line, {
+      toolTitle: title || "subagent",
+    });
+  }
+
+  function subscribeActiveChildrenOfSelected() {
+    const parent = state.selectedId;
+    if (!parent || !Array.isArray(state.sessions)) return;
+    for (const s of state.sessions) {
+      if (!s || !s.isSubagent) continue;
+      if (s.parentSessionId !== parent) continue;
+      if (s.liveStatus === "working" || s.sessionId) {
+        subscribeSessionIds(s.sessionId);
+      }
+    }
+  }
+
   function countResidualInPane(pane) {
     const counts = {
       plan_pending: 0,
@@ -1932,7 +2120,7 @@
       }
       const st = normalizeStatus(row.dataset.status || "");
       if (st !== "pending" && st !== "running" && st !== "in_progress") continue;
-      if (!row.dataset.openedAt) row.dataset.openedAt = String(Date.now());
+      seedToolOpenedAt(row);
       const openedAt = Number(row.dataset.openedAt) || Date.now();
       const waitS = Math.max(0, Math.floor((Date.now() - openedAt) / 1000));
       const oneLiner = row.querySelector(".tool-one-liner");
@@ -1957,14 +2145,14 @@
       (els.chatModel && !els.chatModel.classList.contains("hidden") ? els.chatModel.textContent : "") ||
       "";
     // Always label from the selected session (not a temporary offscreen target).
-    const tool = toolTitleForSession(state.selectedId);
-    const idleMs = running
-      ? Date.now() - (state.lastTermLineAt || state.turnStartedAt || Date.now())
-      : 0;
+    const tool = activityLineForSession(state.selectedId) || toolTitleForSession(state.selectedId);
+    const nowMs = Date.now();
+    const idleBase = state.lastTermLineAt || state.turnStartedAt;
+    const idleMs = running && idleBase ? nowMs - idleBase : 0;
     // Visual quiet cue only — never unlocks or ends the turn.
     const quietVisual = running && idleMs >= CLIENT_STALL_WARN_MS;
     const elapsedS = running
-      ? Math.floor((Date.now() - (state.turnStartedAt || Date.now())) / 1000)
+      ? elapsedSecondsFromWall(nowMs, state.turnStartedAt)
       : 0;
 
     const pane =
@@ -2159,12 +2347,6 @@
     if (els.btnStop) {
       els.btnStop.classList.toggle("hidden", !turnRunningOnSelected());
     }
-    // Reload: Stop + re-attach same id. Visible whenever a session is open (not empty main).
-    if (els.btnReload) {
-      const showReload = !!state.selectedId && !state.reloadingSession;
-      els.btnReload.classList.toggle("hidden", !showReload);
-      els.btnReload.disabled = !!state.reloadingSession;
-    }
     if (!state.selectedId) {
       els.composerHint.textContent =
         "Remote agent stream. Load a session to chat; desktop TUI stays separate.";
@@ -2209,17 +2391,127 @@
     // Activity resets soft-warn baseline; never auto-unlocks.
   }
 
-  function startStallWatch() {
+  /**
+   * Seed turnStartedAt / lastTermLineAt from server age/silence so elapsed
+   * survives refresh/reconnect (server monotonic started_at is source of truth).
+   * @param {object} statusLike status or /health payload fields
+   */
+  function applyServerTurnTimers(statusLike) {
+    const s = statusLike || {};
+    const liveTurns = Array.isArray(s.liveTurns)
+      ? s.liveTurns
+      : state.liveTurns || [];
+    const primaryAge =
+      s.turnAgeSeconds != null ? s.turnAgeSeconds : state.turnAgeSeconds;
+    const primarySilence =
+      s.turnSilenceSeconds != null
+        ? s.turnSilenceSeconds
+        : state.turnSilenceSeconds;
+    const primarySid =
+      s.turnSessionId !== undefined
+        ? s.turnSessionId || null
+        : state.liveTurnSessionId || null;
+    const selected = state.selectedId || null;
+
+    // Is selected session live on server?
+    let selectedLive = false;
+    if (selected) {
+      for (let i = 0; i < liveTurns.length; i++) {
+        if (liveTurns[i] && liveTurns[i].sessionId === selected) {
+          selectedLive = true;
+          break;
+        }
+      }
+      if (!selectedLive && primarySid && selected === primarySid) {
+        const running =
+          s.turnRunning != null ? !!s.turnRunning : !!state.turnRunning;
+        if (running) selectedLive = true;
+      }
+    }
+
+    // Server idle for selected: do not leave huge frozen ages on the strip.
+    if (
+      selected &&
+      !selectedLive &&
+      (Array.isArray(s.liveTurns) || s.turnRunning === false)
+    ) {
+      if (!turnRunningOnSelected()) {
+        state.turnStartedAt = null;
+        state.lastTermLineAt = null;
+      }
+      return;
+    }
+
+    const now = Date.now();
+    const age = pickTurnAgeSeconds({
+      selected_session_id: selected,
+      live_turns: liveTurns,
+      primary_age: primaryAge,
+      primary_session_id: primarySid,
+    });
+    const silence = pickTurnSilenceSeconds({
+      selected_session_id: selected,
+      live_turns: liveTurns,
+      primary_silence: primarySilence,
+      primary_session_id: primarySid,
+    });
+    if (age != null) {
+      const wall = wallMsFromAgeSeconds(now, age);
+      if (wall != null) state.turnStartedAt = wall;
+    }
+    if (silence != null) {
+      const wall = wallMsFromAgeSeconds(now, silence);
+      if (wall != null) state.lastTermLineAt = wall;
+    }
+  }
+
+  /**
+   * Seed tool-row waiting clock from server silence (or turn age) so refresh
+   * does not show waiting · 0s. Only sets when dataset.openedAt is missing.
+   */
+  function seedToolOpenedAt(row) {
+    if (!row || row.dataset.openedAt) return;
+    const now = Date.now();
+    let ageS = null;
+    if (state.turnRunning || turnRunningOnSelected()) {
+      if (
+        state.turnSilenceSeconds != null &&
+        Number.isFinite(Number(state.turnSilenceSeconds))
+      ) {
+        ageS = Number(state.turnSilenceSeconds);
+      } else if (
+        state.turnAgeSeconds != null &&
+        Number.isFinite(Number(state.turnAgeSeconds))
+      ) {
+        ageS = Number(state.turnAgeSeconds);
+      } else if (state.lastTermLineAt) {
+        ageS = (now - Number(state.lastTermLineAt)) / 1000;
+      }
+    }
+    const wall = ageS != null ? wallMsFromAgeSeconds(now, ageS) : null;
+    row.dataset.openedAt = String(wall != null ? wall : now);
+  }
+
+  /**
+   * @param {{ fromServer?: boolean }} [opts]
+   * fromServer: skip overwrite when turnStartedAt already seeded from age.
+   */
+  function startStallWatch(opts) {
+    const o = opts || {};
     clearStallWatch();
-    state.turnStartedAt = Date.now();
-    state.lastTermLineAt = Date.now();
+    // Preserve server-seeded or continuing-turn clocks; only set now when missing.
+    if (!state.turnStartedAt) state.turnStartedAt = Date.now();
+    if (!state.lastTermLineAt) state.lastTermLineAt = Date.now();
+    // fromServer is accepted for call-site clarity; preserve logic is always on.
+    void o.fromServer;
     state.stallWarned = false;
     state.stallTimer = setInterval(() => {
       if (!state.turnRunning) {
         clearStallWatch();
         return;
       }
-      const idleMs = Date.now() - (state.lastTermLineAt || state.turnStartedAt || Date.now());
+      const base = state.lastTermLineAt || state.turnStartedAt;
+      const idleMs = base ? Date.now() - base : 0;
       updateTurnStrip();
       // Soft warn only (TUI-aligned): never reset-turn or unlock the client.
       if (!state.stallWarned && idleMs >= CLIENT_STALL_WARN_MS && turnRunningOnSelected()) {
@@ -2473,14 +2765,17 @@
       const clearId = sessionId || state.liveTurnSessionId;
       if (state.streamBuffers && (!clearId || clearId === state.selectedId)) {
         state.streamBuffers.lastToolTitle = "";
+        state.streamBuffers.lastActivityLine = "";
         markThoughtComplete(state.streamBuffers);
       }
       if (clearId) {
         const v = state.sessionViews.get(clearId);
         if (v) {
           v.lastToolTitle = "";
+          v.lastActivityLine = "";
           if (v.streamBuffers) {
             v.streamBuffers.lastToolTitle = "";
+            v.streamBuffers.lastActivityLine = "";
             markThoughtComplete(v.streamBuffers);
           }
           // Drop sticky active prompt for the session whose turn ended
@@ -2906,7 +3201,7 @@
       }
       const hint = sessionListProgressHint({
         is_live_turn: isLiveTurn,
-        tool: toolTitleForSession(s.sessionId),
+        tool: activityLineForSession(s.sessionId) || toolTitleForSession(s.sessionId),
       });
       if (hint) {
         const turnHint = document.createElement("span");
@@ -3014,6 +3309,7 @@
       /** @type {Map<string, HTMLElement>} terminalId → live terminal tool row */
       terminals: new Map(),
       lastToolTitle: "",
+      lastActivityLine: "",
       activeUserEl: null,
     };
   }
@@ -3060,8 +3356,8 @@
         row.open = true;
         state.streamBuffers.terminals.set(terminalId, row);
         if (toolKey) state.streamBuffers.tools.set(toolKey, row);
-        state.streamBuffers.lastToolTitle = "terminal";
       }
+      state.streamBuffers.lastToolTitle = "terminal";
       const detail =
         row.querySelector(".tool-detail") || row.querySelector(".term-body");
       if (!detail) return;
@@ -3076,6 +3372,8 @@
       row.dataset.hasDetail = "1";
       // Keep open while streaming (CLI-like live output).
       if (!row.open) row.open = true;
+      const tail = raw.trim().slice(-60);
+      state.streamBuffers.lastActivityLine = formatActivityLine("terminal", tail);
       noteTermLineActivity();
       scheduleTurnStrip();
       scrollIfSticky();
@@ -3115,6 +3413,7 @@
         historyLoaded: false,
         streamBuffers: emptyStreamBuffers(),
         lastToolTitle: "",
+        lastActivityLine: "",
       };
       state.sessionViews.set(sessionId, v);
     }
@@ -3153,9 +3452,12 @@
       if (state.streamBuffers) {
         v.streamBuffers = state.streamBuffers;
         v.lastToolTitle = state.streamBuffers.lastToolTitle || "";
+        v.lastActivityLine = state.streamBuffers.lastActivityLine || "";
       }
     } else if (v.streamBuffers) {
       v.lastToolTitle = v.streamBuffers.lastToolTitle || v.lastToolTitle || "";
+      v.lastActivityLine =
+        v.streamBuffers.lastActivityLine || v.lastActivityLine || "";
     }
   }
 
@@ -3202,6 +3504,10 @@
     } finally {
       v.lastToolTitle =
         (v.streamBuffers && v.streamBuffers.lastToolTitle) || v.lastToolTitle || "";
+      v.lastActivityLine =
+        (v.streamBuffers && v.streamBuffers.lastActivityLine) ||
+        v.lastActivityLine ||
+        "";
       state.activePane = prevPane;
       state.streamBuffers = prevBuf;
       state.stickToBottom = prevStick;
@@ -3392,7 +3698,9 @@
     const r = root || transcriptRoot();
     if (!r) return;
     r.querySelectorAll(".term-line.user.active-prompt").forEach((el) => {
-      el.classList.remove("active-prompt");
+      el.classList.remove("active-prompt", "is-collapsed", "is-expanded");
+      el.removeAttribute("aria-expanded");
+      el.removeAttribute("title");
     });
     if (state.streamBuffers) state.streamBuffers.activeUserEl = null;
     if (state.sessionViews) {
@@ -3403,13 +3711,35 @@
   }
 
   /**
+   * Sticky You: collapse to one line by default; click toggles full text.
+   */
+  function setActivePromptCollapsed(el, collapsed) {
+    if (!el) return;
+    el.classList.toggle("is-collapsed", !!collapsed);
+    el.classList.toggle("is-expanded", !collapsed);
+    el.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    el.title = collapsed ? "Tap to expand prompt" : "Tap to collapse prompt";
+  }
+
+  function toggleActivePromptExpand(el) {
+    if (!el || !el.classList.contains("active-prompt")) return;
+    setActivePromptCollapsed(el, !el.classList.contains("is-collapsed"));
+  }
+
+  /**
    * Pin the active user "You:" line (CLI turn focus).
    * CSS sticky freezes it at the top while stickToBottom keeps the stream in view.
+   * Defaults to one-line collapse so long prompts do not cover mobile stream.
    */
-  function activateUserPrompt(el, { scrollToTop = true } = {}) {
+  function activateUserPrompt(el, { scrollToTop = true, keepExpand = false } = {}) {
     if (!el) return;
+    const wasExpanded =
+      keepExpand &&
+      el.classList.contains("active-prompt") &&
+      el.classList.contains("is-expanded");
     clearActiveUserPrompt(transcriptRoot());
     el.classList.add("active-prompt");
+    setActivePromptCollapsed(el, !wasExpanded);
     if (state.streamBuffers) state.streamBuffers.activeUserEl = el;
     if (scrollToTop) scrollActivePromptToTop(el);
   }
@@ -3715,8 +4045,8 @@
     row.dataset.status = st;
     if (st === "running" || st === "pending") row.classList.add("running");
     if (toolCallId) row.dataset.toolCallId = toolCallId;
-    // Heartbeat waiting elapsed: time since row opened (client-only cue).
-    if (!row.dataset.openedAt) row.dataset.openedAt = String(Date.now());
+    // Heartbeat waiting elapsed: seed from server silence/age when mid-turn.
+    seedToolOpenedAt(row);
 
     const sum = document.createElement("summary");
     const prefix = document.createElement("span");
@@ -3767,7 +4097,7 @@
         (st === "running" || st === "pending" || st === "in_progress") &&
         !row.dataset.openedAt
       ) {
-        row.dataset.openedAt = String(Date.now());
+        seedToolOpenedAt(row);
       }
     }
     if (title) {
@@ -3823,6 +4153,7 @@
       if (existing && existing.isConnected) {
         updateToolLine(existing, { title, status: st, summary });
         state.streamBuffers.lastToolTitle = title;
+        state.streamBuffers.lastActivityLine = formatActivityLine(title, summary);
         if (!(state._historyBatchDepth > 0)) {
           scheduleTurnStrip();
           scrollIfSticky();
@@ -3840,6 +4171,7 @@
     transcriptRoot().appendChild(row);
     if (id) state.streamBuffers.tools.set(id, row);
     state.streamBuffers.lastToolTitle = title;
+    state.streamBuffers.lastActivityLine = formatActivityLine(title, summary);
     if (!(state._historyBatchDepth > 0)) {
       scheduleTurnStrip();
       scrollIfSticky();
@@ -3975,6 +4307,7 @@
       state.streamBuffers.tools = new Map();
       state.streamBuffers.terminals = new Map();
       state.streamBuffers.lastToolTitle = "";
+      state.streamBuffers.lastActivityLine = "";
       // Do not force stick-to-bottom during reconnect if user scrolled up.
       if (!state._reconnectScrollFreeze) {
         state.stickToBottom = true;
@@ -4013,6 +4346,7 @@
     state.streamBuffers.tools = new Map();
     state.streamBuffers.terminals = new Map();
     state.streamBuffers.lastToolTitle = "";
+    state.streamBuffers.lastActivityLine = "";
     state.streamBuffers.activeUserEl = null;
     updateTurnStrip();
   }
@@ -4137,6 +4471,7 @@
       if (id && row) state.streamBuffers.tools.set(id, row);
       state.streamBuffers.assistantEl = null;
       state.streamBuffers.lastToolTitle = label;
+      state.streamBuffers.lastActivityLine = formatActivityLine(label, summary);
       scheduleTurnStrip();
       return;
     }
@@ -4170,7 +4505,15 @@
         if (detailText) patch.summary = detailText;
         updateToolLine(row, patch);
       }
-      if (label) state.streamBuffers.lastToolTitle = label;
+      if (label) {
+        state.streamBuffers.lastToolTitle = label;
+        state.streamBuffers.lastActivityLine = formatActivityLine(label, detailText);
+      } else if (detailText) {
+        state.streamBuffers.lastActivityLine = formatActivityLine(
+          state.streamBuffers.lastToolTitle || "",
+          detailText
+        );
+      }
       scheduleTurnStrip();
       scrollIfSticky();
       return;
@@ -4188,6 +4531,23 @@
         role: "system",
         text: sid ? `${label} (${sid})` : label,
       });
+      const parentId = state.selectedId;
+      if (kind === "subagent_spawned") {
+        if (sid) {
+          subscribeSessionIds(sid);
+          if (!state._childSubs) state._childSubs = new Set();
+          state._childSubs.add(sid);
+        }
+        setSessionActivityLine(
+          parentId,
+          sid ? "subagent · started · " + String(sid).slice(0, 8) : "subagent · started",
+          { toolTitle: "subagent" }
+        );
+      } else {
+        setSessionActivityLine(parentId, "subagent · finished", { toolTitle: "subagent" });
+        if (sid && state._childSubs) state._childSubs.delete(sid);
+      }
+      scheduleTurnStrip();
       return;
     }
   }
@@ -4235,13 +4595,226 @@
     scrollIfSticky();
   }
 
-  function handleAcpMessage(sessionId, message) {
-    const method = message.method || "";
-    if (method !== "session/update" && method !== "_x.ai/session/update") {
+  function compactStateFromKind(kind) {
+    const k = String(kind || "");
+    if (k === "auto_compact_started") return "started";
+    if (k === "auto_compact_completed") return "completed";
+    if (k === "auto_compact_failed") return "failed";
+    if (k === "auto_compact_cancelled") return "cancelled";
+    return null;
+  }
+
+  /** Reject absurd compact token counts (same cap as hub sanitize_compact_tokens). */
+  const COMPACT_TOKEN_ABSURD_MAX = 5_000_000;
+
+  function sanitizeCompactToken(n) {
+    if (n == null) return null;
+    const v = Number(n);
+    if (!Number.isFinite(v) || v < 0 || v > COMPACT_TOKEN_ABSURD_MAX) return null;
+    return Math.round(v);
+  }
+
+  function compactTokensFromUpdate(update) {
+    const u = update || {};
+    const before = sanitizeCompactToken(
+      u.tokensBefore != null ? u.tokensBefore : u.tokens_before
+    );
+    const after = sanitizeCompactToken(
+      u.tokensAfter != null ? u.tokensAfter : u.tokens_after
+    );
+    const summary =
+      u.summaryPreview != null ? u.summaryPreview : u.summary_preview;
+    const error = u.error || u.message || u.reason || null;
+    return { before, after, summary, error };
+  }
+
+  function handleCompactNotification(sessionId, update, kind) {
+    // Typed WS `compact` carries user-facing feedback. This path is a fallback
+    // when only the raw session_notification arrives (older hub, disk tail).
+    // Apply usage only; skip system lines if we recently handled the same event.
+    const stateName = compactStateFromKind(kind);
+    if (!stateName) return;
+    const t = compactTokensFromUpdate(update);
+    const key =
+      String(sessionId || "") +
+      ":" +
+      stateName +
+      ":" +
+      String(t.before) +
+      ":" +
+      String(t.after);
+    if (state._lastCompactKey === key) {
+      if (stateName === "completed" && t.after != null && Number.isFinite(Number(t.after))) {
+        applyUsagePatch(sessionId, { contextTokensUsed: Number(t.after) });
+      }
       return;
     }
-    const update = (message.params && message.params.update) || {};
-    const kind = update.sessionUpdate || "";
+    handleCompactEvent({
+      sessionId: sessionId,
+      state: stateName,
+      tokensBefore: t.before,
+      tokensAfter: t.after,
+      summaryPreview: t.summary,
+      error: t.error,
+    });
+  }
+
+  function applyUsagePatch(sessionId, patch) {
+    if (!patch) return;
+    if (sessionId && state.selectedId && sessionId !== state.selectedId) {
+      // Still apply if this is the live prompt session for the selected view.
+      const live = state.livePromptSessionId || state.liveTurnSessionId;
+      if (live && sessionId !== live && sessionId !== state.selectedId) return;
+    }
+    const prev = state.usage || {};
+    const next = Object.assign({}, prev);
+    if (patch.contextTokensUsed != null) {
+      const used = sanitizeCompactToken(patch.contextTokensUsed);
+      if (used != null) next.contextTokensUsed = used;
+    }
+    if (patch.contextWindowTokens != null) {
+      const win = sanitizeCompactToken(patch.contextWindowTokens);
+      if (win != null && win > 0) next.contextWindowTokens = win;
+    }
+    if (patch.contextPercent != null && Number.isFinite(Number(patch.contextPercent))) {
+      next.contextPercent = Number(patch.contextPercent);
+    } else if (
+      next.contextTokensUsed != null &&
+      next.contextWindowTokens != null &&
+      Number(next.contextWindowTokens) > 0
+    ) {
+      next.contextPercent =
+        (Number(next.contextTokensUsed) / Number(next.contextWindowTokens)) * 100;
+    }
+    // Keep plan segment from prior state.usage
+    if (prev.plan && !next.plan) next.plan = prev.plan;
+    state.usage = next;
+    updateUsageBar(next);
+  }
+
+  function handleUsageEvent(msg) {
+    const sid = msg.sessionId || null;
+    applyUsagePatch(sid, {
+      contextTokensUsed: msg.contextTokensUsed,
+      contextWindowTokens: msg.contextWindowTokens,
+      contextPercent: msg.contextPercent,
+    });
+  }
+
+  function handleCompactEvent(msg) {
+    const sid = msg.sessionId || null;
+    const st = String(msg.state || "");
+    const before = sanitizeCompactToken(msg.tokensBefore);
+    const after = sanitizeCompactToken(msg.tokensAfter);
+    const dedupeKey =
+      String(sid || "") + ":" + st + ":" + String(before) + ":" + String(after);
+    // Prefer one "Compacting…" line; ignore duplicate started for same session.
+    if (st === "started" && state._lastCompactKey === dedupeKey) {
+      return;
+    }
+    state._lastCompactKey = dedupeKey;
+
+    const applyToSelected =
+      !sid ||
+      sid === state.selectedId ||
+      sid === state.livePromptSessionId ||
+      sid === state.liveTurnSessionId ||
+      shouldApplyAcpToSession(sid);
+
+    const appendSys = (text) => {
+      if (!text) return;
+      if (!sid || sid === state.selectedId) {
+        appendMessage({ role: "system", text });
+      } else if (applyToSelected) {
+        withSessionTarget(sid, () => appendMessage({ role: "system", text }));
+      }
+    };
+
+    if (st === "started") {
+      if (applyToSelected) {
+        reportInfo("Compacting conversation…", {
+          sessionId: sid,
+          source: "compact",
+        });
+        appendSys("Compacting conversation…");
+      }
+      return;
+    }
+
+    if (st === "completed") {
+      const beforeOk = before != null;
+      const afterOk = after != null;
+      let text;
+      if (beforeOk && afterOk && Number(before) === Number(after)) {
+        text =
+          "Context compact ran (no change: already minimal or nothing to free)";
+      } else if (beforeOk && afterOk) {
+        text =
+          "Context compacted: " +
+          formatTokenCompact(before) +
+          " → " +
+          formatTokenCompact(after) +
+          " tokens";
+      } else if (afterOk) {
+        text = "Context compacted → " + formatTokenCompact(after) + " tokens";
+      } else {
+        // Invalid/absurd tokens: no fake counts in the UI.
+        text = "Context compact finished";
+      }
+      if (applyToSelected) {
+        reportInfo(text, { sessionId: sid, source: "compact" });
+        appendSys(text);
+      }
+      if (afterOk) {
+        applyUsagePatch(sid, { contextTokensUsed: Number(after) });
+      }
+      // Re-read signals (lag possible); one immediate + one delayed retry.
+      if (!sid || sid === state.selectedId || applyToSelected) {
+        refreshUsage();
+        setTimeout(() => {
+          if (!state.selectedId) return;
+          if (sid && sid !== state.selectedId && sid !== state.livePromptSessionId) {
+            return;
+          }
+          refreshUsage();
+        }, 1500);
+      }
+      return;
+    }
+
+    if (st === "failed" || st === "cancelled") {
+      const err =
+        msg.error ||
+        (st === "cancelled" ? "Context compact cancelled" : "Context compact failed");
+      if (applyToSelected) {
+        reportError(String(err), { sessionId: sid, source: "compact" });
+        appendSys(String(err));
+      }
+      return;
+    }
+  }
+
+  function handleAcpMessage(sessionId, message) {
+    const method = message.method || "";
+    const isSessionUpdate =
+      method === "session/update" || method === "_x.ai/session/update";
+    const isSessionNotification =
+      method === "_x.ai/session_notification" ||
+      method === "x.ai/session_notification";
+    if (!isSessionUpdate && !isSessionNotification) {
+      return;
+    }
+    const update = (message.params && message.params.update) || message.params || {};
+    const kind = update.sessionUpdate || update.session_update || "";
+
+    // Compact lifecycle via session_notification (hub also sends type:compact).
+    // Do not treat as generic stream "working" forever.
+    if (isSessionNotification || (kind && String(kind).startsWith("auto_compact_"))) {
+      if (String(kind).startsWith("auto_compact_")) {
+        handleCompactNotification(sessionId, update, kind);
+      }
+      return;
+    }
 
     // Agent command lists are session-global cache; apply even if selectedId lags
     // (view id vs live id during attach) or message is for another session.
@@ -4253,6 +4826,9 @@
 
     const targetId = sessionId || state.selectedId;
     if (!targetId) return;
+
+    // Child subagent activity → parent turn strip when parent is selected.
+    feedParentActivityFromChild(targetId, kind, update);
 
     // Stream activity → Working pill immediately (including offscreen sessions).
     // markSessionActivity never overwrites question with working.
@@ -4291,7 +4867,10 @@
     const after = () => {
       if (kind === "tool_call" || kind === "tool_call_update") {
         const v = state.sessionViews.get(targetId);
-        if (v && v.streamBuffers) v.lastToolTitle = v.streamBuffers.lastToolTitle || "";
+        if (v && v.streamBuffers) {
+          v.lastToolTitle = v.streamBuffers.lastToolTitle || "";
+          v.lastActivityLine = v.streamBuffers.lastActivityLine || "";
+        }
         scheduleSessionPills();
         scheduleTurnStrip();
       }
@@ -4467,6 +5046,7 @@
     updateTurnStrip();
     refreshUsage();
     restoreComposerDraft(viewId);
+    subscribeActiveChildrenOfSelected();
 
     // Restore live/cached pane without wiping the in-flight stream / replaying history.
     const reusePane = hasCachedContent;
@@ -4789,6 +5369,7 @@
         v.streamBuffers.tools = new Map();
         v.streamBuffers.terminals = new Map();
         v.streamBuffers.lastToolTitle = "";
+        v.streamBuffers.lastActivityLine = "";
       } finally {
         endHistoryBatch({ jump: false });
       }
@@ -4854,8 +5435,25 @@
       if (j.turnSilenceSeconds != null) {
         state.turnSilenceSeconds = j.turnSilenceSeconds;
       }
+      if (Array.isArray(j.pendingQuestionSessions)) {
+        state.pendingQuestionSessions = j.pendingQuestionSessions;
+      }
+      if (j.turnSessionId) state.liveTurnSessionId = j.turnSessionId;
+      if (j.turnRunning != null) {
+        state.turnRunning = !!j.turnRunning;
+        if (state.status) state.status.turnRunning = !!j.turnRunning;
+        if (state.status && j.turnSessionId) {
+          state.status.turnSessionId = j.turnSessionId;
+        }
+      }
+      // Seed elapsed/silence clocks from server age (after turnRunning/liveTurns).
+      applyServerTurnTimers(j);
       if (j.turnRunning || (Array.isArray(j.liveTurns) && j.liveTurns.length)) {
         state._capacityStatusAt = Date.now();
+        // Mid-turn after health merge: ensure stall watch without resetting clocks.
+        if (!state.stallTimer && state.turnRunning) {
+          startStallWatch({ fromServer: true });
+        }
       }
       if (j.contextBudget && typeof j.contextBudget === "object") {
         state.contextBudget = {
@@ -4868,17 +5466,6 @@
         };
       } else {
         state.contextBudget = null;
-      }
-      if (Array.isArray(j.pendingQuestionSessions)) {
-        state.pendingQuestionSessions = j.pendingQuestionSessions;
-      }
-      if (j.turnSessionId) state.liveTurnSessionId = j.turnSessionId;
-      if (j.turnRunning != null) {
-        state.turnRunning = !!j.turnRunning;
-        if (state.status) state.status.turnRunning = !!j.turnRunning;
-        if (state.status && j.turnSessionId) {
-          state.status.turnSessionId = j.turnSessionId;
-        }
       }
       state.hubReachable = j.ok === true;
       updateCapacityBanner();
@@ -5206,6 +5793,8 @@
       } else if (!msg.turnRunning && !(state.liveTurns && state.liveTurns.length)) {
         state.liveTurnSessionId = null;
       }
+      // Seed turn elapsed/silence from server ages (before setTurnRunning).
+      applyServerTurnTimers(msg);
       if (msg.hubVersion != null) state.hubVersion = msg.hubVersion;
       if (msg.cliVersion != null) state.cliVersion = msg.cliVersion;
       if (msg.compatOk != null) state.compatOk = !!msg.compatOk;
@@ -5279,6 +5868,7 @@
           subscribeSessionIds(msg.turnSessionId);
         }
         if (serverRunning && !state.turnRunning) {
+          // Timers already seeded by applyServerTurnTimers; preserve them.
           setTurnRunning(true, msg.turnSessionId || null);
           if (turnRunningOnSelected()) {
             toast("Turn still running on server…", "");
@@ -5304,6 +5894,7 @@
           setTurnRunning(serverRunning, msg.turnSessionId || null);
         } else {
           state.turnRunning = serverRunning;
+          // Re-seeded clocks from this status tick; repaint strip.
           updateTurnStrip();
         }
       }
@@ -5346,6 +5937,7 @@
     if (type === "sessions") {
       state.sessions = msg.items || [];
       renderSessions();
+      subscribeActiveChildrenOfSelected();
       return;
     }
     if (type === "history") {
@@ -5360,6 +5952,14 @@
     }
     if (type === "acp") {
       handleAcpMessage(msg.sessionId, msg.message || {});
+      return;
+    }
+    if (type === "compact") {
+      handleCompactEvent(msg);
+      return;
+    }
+    if (type === "usage") {
+      handleUsageEvent(msg);
       return;
     }
     if (type === "system") {
@@ -6262,9 +6862,53 @@
   const PLAN_APPROVE_INJECT = "approved — implement the plan in plan.md";
   const PLAN_REQUEST_CHANGES_INJECT = "Request changes to the plan:\n\n";
 
+  /**
+   * Show View plan only when plan mode is live (awaiting approval or Active).
+   * Leftover plan.md after Inactive must not pin the button forever.
+   */
+  function planChromeShouldShow(plan) {
+    if (!plan || !plan.exists) return false;
+    if (plan.awaitingApproval) return true;
+    const st = String(plan.state || "")
+      .trim()
+      .toLowerCase();
+    return st === "active" || st === "exitpending" || st === "pending";
+  }
+
+  /**
+   * Single inline strip + View plan button (not topbar). Hidden when no plan work.
+   */
   function setViewPlanVisible(show) {
-    if (!els.btnViewPlan) return;
-    els.btnViewPlan.classList.toggle("hidden", !show);
+    // Compatibility: callers still pass a bool; full plan object preferred via applyPlanChrome.
+    if (show && state.sessionPlan) {
+      applyPlanChrome(state.sessionPlan);
+      return;
+    }
+    if (!show) {
+      if (els.planAwaitBanner) els.planAwaitBanner.classList.add("hidden");
+      if (els.btnViewPlan) els.btnViewPlan.classList.add("hidden");
+    }
+  }
+
+  function applyPlanChrome(plan) {
+    const show = planChromeShouldShow(plan);
+    if (els.planAwaitBanner) {
+      els.planAwaitBanner.classList.toggle("hidden", !show);
+      if (show) {
+        const awaiting = !!(plan && plan.awaitingApproval);
+        els.planAwaitBanner.dataset.kind = awaiting ? "awaiting" : "active";
+        if (els.planAwaitBannerText) {
+          els.planAwaitBannerText.textContent = awaiting
+            ? "Plan awaiting approval"
+            : "Plan active";
+        }
+      } else {
+        delete els.planAwaitBanner.dataset.kind;
+      }
+    }
+    if (els.btnViewPlan) {
+      els.btnViewPlan.classList.toggle("hidden", !show);
+    }
   }
 
   function closePlanModal() {
@@ -6272,9 +6916,7 @@
   }
 
   function updatePlanAwaitBanner(plan) {
-    if (!els.planAwaitBanner) return;
-    const awaiting = !!(plan && plan.awaitingApproval && plan.exists);
-    els.planAwaitBanner.classList.toggle("hidden", !awaiting);
+    applyPlanChrome(plan);
   }
 
   function maybeAutoOpenPlanAwait(plan) {
@@ -6331,8 +6973,7 @@
     const sid = String(sessionId || state.selectedId || "").trim();
     if (!sid) {
       state.sessionPlan = null;
-      setViewPlanVisible(false);
-      updatePlanAwaitBanner(null);
+      applyPlanChrome(null);
       return null;
     }
     try {
@@ -6342,28 +6983,24 @@
       if (state.selectedId !== sid) return null;
       if (res.status === 404) {
         state.sessionPlan = null;
-        setViewPlanVisible(false);
-        updatePlanAwaitBanner(null);
+        applyPlanChrome(null);
         return null;
       }
       const data = await res.json().catch(() => ({}));
       if (state.selectedId !== sid) return null;
       if (!res.ok) {
         state.sessionPlan = null;
-        setViewPlanVisible(false);
-        updatePlanAwaitBanner(null);
+        applyPlanChrome(null);
         return null;
       }
       state.sessionPlan = data;
-      setViewPlanVisible(!!data.exists);
-      updatePlanAwaitBanner(data);
+      applyPlanChrome(data);
       maybeAutoOpenPlanAwait(data);
       return data;
     } catch (_) {
       if (state.selectedId === sid) {
         state.sessionPlan = null;
-        setViewPlanVisible(false);
-        updatePlanAwaitBanner(null);
+        applyPlanChrome(null);
       }
       return null;
     }
@@ -6425,8 +7062,7 @@
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || "Plan action failed");
     state.sessionPlan = data;
-    setViewPlanVisible(!!data.exists);
-    updatePlanAwaitBanner(data);
+    applyPlanChrome(data);
     updatePlanStatusChip(data);
     return data;
   }
@@ -7391,7 +8027,7 @@
     updateStatusPill();
   }
 
-  // Slash palette (position: fixed so chat-panel overflow does not clip it)
+  // Slash palette (CSS absolute; bottom:100% of .composer-shell — clamp max-height only)
   function positionSlashPalette() {
     if (!els.slash || els.slash.classList.contains("hidden")) return;
     if (state._slashTouching) return;
@@ -7401,25 +8037,17 @@
     const rect = anchor.getBoundingClientRect();
     const vv = window.visualViewport;
     const vTop = vv ? vv.offsetTop : 0;
-    const vHeight = vv ? vv.height : window.innerHeight;
     const margin = 8;
-    const maxH = Math.min(240, Math.floor(vHeight * 0.4));
-    const availAbove = rect.top - vTop - margin;
-    const height = Math.min(maxH, Math.max(120, availAbove));
-    let top = rect.top - height - 4;
-    if (top < vTop + margin) {
-      // Not enough room above — place below composer if possible, else clamp
-      top = Math.max(vTop + margin, rect.bottom + 4);
-    }
-    const left = Math.max(margin, rect.left);
-    const width = Math.max(120, rect.width);
-    const maxHeight = Math.min(maxH, Math.max(80, vHeight - (top - vTop) - margin));
-    els.slash.style.top = Math.round(top) + "px";
-    els.slash.style.left = Math.round(left) + "px";
-    els.slash.style.width = Math.round(width) + "px";
-    els.slash.style.right = "auto";
-    els.slash.style.bottom = "auto";
-    els.slash.style.maxHeight = Math.round(maxHeight) + "px";
+    const maxCap = Math.min(240, Math.floor((vv ? vv.height : window.innerHeight) * 0.4));
+    const availAbove = Math.max(80, Math.floor(rect.top - vTop - margin));
+    const maxHeight = Math.min(maxCap, availAbove);
+    els.slash.style.maxHeight = maxHeight + "px";
+    // CSS anchors: absolute; bottom:100% of .composer-shell — clear any stale fixed coords
+    els.slash.style.left = "";
+    els.slash.style.right = "";
+    els.slash.style.top = "";
+    els.slash.style.bottom = "";
+    els.slash.style.width = "";
   }
 
   async function refreshSkills() {
@@ -7807,10 +8435,6 @@
       return { ok: false, reason: "busy", expectedView };
     }
     state.reloadingSession = true;
-    if (els.btnReload) {
-      els.btnReload.disabled = true;
-      els.btnReload.classList.add("hidden");
-    }
     try {
       const clearOk = await stopTurnForSession(cancelId);
       if (!clearOk) {
@@ -8299,13 +8923,6 @@
         hardQuitPlan();
       });
     }
-    if (els.btnPlanAwaitOpen) {
-      els.btnPlanAwaitOpen.addEventListener("click", (e) => {
-        e.preventDefault();
-        openPlanModal();
-      });
-    }
-
     $$("[data-close]").forEach((el) => {
       el.addEventListener("click", () => {
         const id = el.getAttribute("data-close");
@@ -8394,12 +9011,6 @@
         setProjectModalMode("list");
       });
     }
-    if (els.btnReload) {
-      els.btnReload.addEventListener("click", () => {
-        reloadResumeSession();
-      });
-    }
-
     els.form.addEventListener("submit", (e) => {
       e.preventDefault();
       const action = resolveSlashOnSubmit();
@@ -8545,7 +9156,7 @@
             toast("Turn force-cleared (Stop fallback)", "");
           } else {
             toast(
-              "Stop did not clear the turn. Try Stop again or Reload.",
+              "Stop did not clear the turn. Try Stop again.",
               "danger"
             );
           }
@@ -8558,6 +9169,22 @@
     els.transcript.addEventListener("scroll", () => {
       updateJumpLatest();
       scheduleStickyUserFromScroll();
+    });
+
+    // Sticky You: one-line collapsed by default; click/tap expands (ignore text selection).
+    els.transcript.addEventListener("click", (e) => {
+      const t = e.target;
+      if (!t || !t.closest) return;
+      const row = t.closest(".term-line.user.active-prompt");
+      if (!row || !els.transcript.contains(row)) return;
+      // Don't collapse when interacting with links inside the prompt body.
+      if (t.closest("a[href]")) return;
+      try {
+        const sel = window.getSelection && window.getSelection();
+        if (sel && String(sel.toString() || "").trim()) return;
+      } catch (_) {}
+      e.preventDefault();
+      toggleActivePromptExpand(row);
     });
 
     if (els.btnJumpLatest) {
@@ -9089,6 +9716,7 @@
         const data = await res.json();
         state.sessions = data.items || [];
         renderSessions();
+        subscribeActiveChildrenOfSelected();
       }
     } catch (_) {}
 

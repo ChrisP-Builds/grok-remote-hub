@@ -12,7 +12,11 @@ from hub.session_policy import (
     CONTEXT_SOFT_UPDATES_BYTES,
     MAX_TURN_SECONDS,
     MID_TURN_STALL_SECONDS,
+    NO_OUTPUT_HEAVY_SECONDS,
+    NO_OUTPUT_HEAVY_UPDATES_BYTES,
+    NO_OUTPUT_RETRY_SECONDS,
     NO_OUTPUT_SECONDS,
+    NO_OUTPUT_SOFT_SECONDS,
     STUCK_TURN_SECONDS,
     context_budget_level,
     cwd_key,
@@ -23,6 +27,7 @@ from hub.session_policy import (
     load_hub_session_ids,
     load_remote_sessions,
     needs_fresh_agent_session,
+    no_output_seconds_for_session,
     recovery_keeps_session_id,
     resolve_ensure_action,
     resolve_live_session_id,
@@ -36,11 +41,54 @@ from hub.session_policy import (
 
 def test_tui_aligned_timeout_constants() -> None:
     assert NO_OUTPUT_SECONDS == 60.0
+    assert NO_OUTPUT_SOFT_SECONDS == 180.0
+    assert NO_OUTPUT_HEAVY_SECONDS == 300.0
+    assert NO_OUTPUT_HEAVY_UPDATES_BYTES == 12_000_000
+    assert NO_OUTPUT_RETRY_SECONDS == 300.0
     assert MID_TURN_STALL_SECONDS == 600.0
     assert MAX_TURN_SECONDS == 1800.0
     assert STUCK_TURN_SECONDS == 1800.0
     assert CLIENT_STALL_WARN_SECONDS == 120.0
     assert CLIENT_STALL_UNLOCK_SECONDS == 0
+
+
+def test_no_output_seconds_for_session_none_is_base() -> None:
+    assert no_output_seconds_for_session() == 60.0
+    assert no_output_seconds_for_session(updates_bytes=None) == 60.0
+
+
+def test_no_output_seconds_for_session_soft() -> None:
+    assert (
+        no_output_seconds_for_session(
+            updates_bytes=CONTEXT_SOFT_UPDATES_BYTES + 1
+        )
+        == 180.0
+    )
+    # At soft boundary (not greater) stays base
+    assert (
+        no_output_seconds_for_session(updates_bytes=CONTEXT_SOFT_UPDATES_BYTES)
+        == 60.0
+    )
+
+
+def test_no_output_seconds_for_session_heavy() -> None:
+    assert (
+        no_output_seconds_for_session(
+            updates_bytes=NO_OUTPUT_HEAVY_UPDATES_BYTES + 1
+        )
+        == 300.0
+    )
+    # Soft but not heavy
+    assert (
+        no_output_seconds_for_session(updates_bytes=7_000_000) == 180.0
+    )
+    # At heavy boundary (not greater) stays soft
+    assert (
+        no_output_seconds_for_session(
+            updates_bytes=NO_OUTPUT_HEAVY_UPDATES_BYTES
+        )
+        == 180.0
+    )
 
 
 def test_turn_telemetry_before_first_update() -> None:

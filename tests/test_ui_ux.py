@@ -6,7 +6,9 @@ import json
 from pathlib import Path
 
 from hub.ui_ux import (
+    elapsed_seconds_from_wall,
     idle_turn_label,
+    pick_turn_age_seconds,
     residual_status_parts,
     session_list_progress_hint,
     should_mark_plan_stale,
@@ -14,6 +16,7 @@ from hub.ui_ux import (
     topbar_bubble_lines,
     topbar_bubble_text,
     turn_progress_label,
+    wall_ms_from_age_seconds,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -104,6 +107,52 @@ def test_turn_progress_label_running_and_tool() -> None:
     assert "quiet" not in open_tools
     assert "read_file" in open_tools
     assert "45s" in open_tools
+
+    # Long activity one-liner still surfaces in the strip (tool= may be full line).
+    long_tool = "read_file · D:/Projects/Grok Remote Hub/static/app.js · lines 100-200"
+    long_line = turn_progress_label(
+        running=True,
+        tool=long_tool,
+        model="grok",
+        elapsed_s=8,
+    )
+    assert "running" in long_line
+    assert "read_file" in long_line
+    assert "8s" in long_line
+    assert "grok" in long_line
+    sub_line = turn_progress_label(
+        running=True,
+        tool="subagent · thinking · planning next step",
+        elapsed_s=3,
+    )
+    assert "subagent" in sub_line
+    assert "thinking" in sub_line
+
+
+def test_turn_strip_inside_composer_shell() -> None:
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    shell_i = html.find('class="composer-shell"')
+    assert shell_i >= 0
+    form_i = html.find('id="composer-form"', shell_i)
+    strip_i = html.find('id="turn-strip"', shell_i)
+    palette_i = html.find('id="slash-palette"', shell_i)
+    assert strip_i >= 0, "turn-strip must live inside composer-shell"
+    assert form_i > strip_i, "turn-strip must appear before composer-form"
+    assert palette_i > strip_i, "slash-palette must follow turn-strip in shell"
+    # No turn-strip before composer-shell (old top-of-chat placement)
+    assert html.find('id="turn-strip"') == strip_i
+    assert "position: absolute" in css
+    # Slash palette anchored to top of composer-shell
+    assert "bottom: 100%" in css or "bottom:100%" in css
+    slash_block = css[css.find(".slash-palette") : css.find(".slash-palette") + 500]
+    assert "position: absolute" in slash_block
+    assert "bottom: 100%" in slash_block or "bottom:100%" in slash_block
+    assert "lastActivityLine" in js
+    assert "feedParentActivityFromChild" in js
+    assert "activityLineForSession" in js
+    assert "formatActivityLine" in js
 
 
 def test_residual_status_and_stale() -> None:
@@ -425,6 +474,21 @@ def test_js_process_restart_clears_stale_live_state() -> None:
     assert "clearQuestions: false" in resume_chunk
 
 
+def test_js_sticky_user_prompt_collapse_toggle() -> None:
+    """Sticky You: one-line collapse by default; expand/collapse on click."""
+    js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    css = (ROOT / "static" / "app.css").read_text(encoding="utf-8")
+    assert "function setActivePromptCollapsed" in js
+    assert "function toggleActivePromptExpand" in js
+    assert "is-collapsed" in js
+    assert "toggleActivePromptExpand" in js
+    assert ".term-line.user.active-prompt.is-collapsed" in css
+    assert "white-space: nowrap" in css
+    assert "tap to expand" not in css
+    assert "tap to collapse" not in css
+    assert "display: flex" in css
+
+
 def test_js_last_prompt_resend_and_optimistic_user() -> None:
     """Persist last prompt, one-tap Resend, optimistic user bubble on submit."""
     js = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -495,11 +559,12 @@ def test_js_active_user_prompt_sticky() -> None:
     assert "active-prompt" in js
     assert "activeUserEl" in js
 
-    # CSS sticky pin for active user line
+    # CSS sticky pin for active user line (collapsed one-line by default)
     assert ".term-line.user.active-prompt" in css
     assert "position: sticky" in css
     assert ".term-line.user.active-prompt .term-body" in css
-    assert "max-height: 30vh" in css
+    assert "is-collapsed" in css
+    assert "white-space: nowrap" in css
 
     # submitPrompt activates only on !alreadyRunning (not queue-only echoes)
     submit_idx = js.find("function submitPrompt")
@@ -1127,6 +1192,94 @@ def test_open_tool_wait_visibility_structural() -> None:
     assert "updateToolLine" in upd_chunk
 
 
+def test_wall_ms_from_age_seconds() -> None:
+    """Server age → client wall epoch ms; invalid age → None."""
+    assert wall_ms_from_age_seconds(100000, 12.4) == 100000 - 12400
+    assert wall_ms_from_age_seconds(100000, 0) == 100000
+    assert wall_ms_from_age_seconds(100000, None) is None
+    assert wall_ms_from_age_seconds(100000, -1) is None
+    assert wall_ms_from_age_seconds(100000, float("nan")) is None
+
+
+def test_elapsed_seconds_from_wall_recovers_age() -> None:
+    """Round-trip: wall from age, then elapsed recovers whole seconds."""
+    now = 1_700_000_000_000.0
+    age = 12.4
+    wall = wall_ms_from_age_seconds(now, age)
+    assert wall is not None
+    assert elapsed_seconds_from_wall(now, wall) == 12
+    assert elapsed_seconds_from_wall(now, None) == 0
+    assert elapsed_seconds_from_wall(now, now + 5000) == 0  # future start clamps
+
+
+def test_pick_turn_age_seconds_prefers_matching_session() -> None:
+    """Selected liveTurns entry wins over primary; primary used when only match."""
+    turns = [
+        {"sessionId": "a", "ageSeconds": 10.0},
+        {"sessionId": "b", "ageSeconds": 42.5},
+    ]
+    assert (
+        pick_turn_age_seconds(
+            selected_session_id="b",
+            live_turns=turns,
+            primary_age=10.0,
+            primary_session_id="a",
+        )
+        == 42.5
+    )
+    # Selected is primary: use primary_age when no matching entry age
+    assert (
+        pick_turn_age_seconds(
+            selected_session_id="primary",
+            live_turns=[],
+            primary_age=7.2,
+            primary_session_id="primary",
+        )
+        == 7.2
+    )
+    # Only one turn: fall back to that entry / primary
+    assert (
+        pick_turn_age_seconds(
+            selected_session_id="other",
+            live_turns=[{"sessionId": "x", "ageSeconds": 3.0}],
+            primary_age=3.0,
+            primary_session_id="x",
+        )
+        == 3.0
+    )
+    # Selected elsewhere with multi turns and no match: no primary apply
+    assert (
+        pick_turn_age_seconds(
+            selected_session_id="z",
+            live_turns=turns,
+            primary_age=10.0,
+            primary_session_id="a",
+        )
+        is None
+    )
+
+
+def test_js_server_turn_timers_structural() -> None:
+    """Client seeds turn clocks from server age (survive refresh)."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "function wallMsFromAgeSeconds" in js
+    assert "function elapsedSecondsFromWall" in js
+    assert "function pickTurnAgeSeconds" in js
+    assert "function applyServerTurnTimers" in js
+    assert "function seedToolOpenedAt" in js
+    assert "applyServerTurnTimers(msg)" in js or "applyServerTurnTimers(j)" in js
+    # Strip uses wall-clock helper, not raw Date.now()-only elapsed
+    strip_idx = js.find("function updateTurnStrip")
+    assert strip_idx >= 0
+    strip_chunk = js[strip_idx : strip_idx + 1200]
+    assert "elapsedSecondsFromWall" in strip_chunk
+    # startStallWatch must not always overwrite seeded clocks
+    stall_idx = js.find("function startStallWatch")
+    assert stall_idx >= 0
+    stall_chunk = js[stall_idx : stall_idx + 900]
+    assert "if (!state.turnStartedAt)" in stall_chunk
+
+
 def test_context_budget_banner_structural() -> None:
     """Soft context budget banner: advisory only, never hard-blocks Send."""
     html = (STATIC / "index.html").read_text(encoding="utf-8")
@@ -1314,15 +1467,16 @@ def test_new_session_folder_browser_contract() -> None:
 
 
 def test_cli_reload_and_new_vs_resume_entry_contract() -> None:
-    """Reload recovery + Resume vs Start new entry (CLI interrupt-then-continue)."""
+    """Reload recovery hook + Resume vs Start new entry (CLI interrupt-then-continue)."""
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     css = (STATIC / "app.css").read_text(encoding="utf-8")
     policy = (ROOT / "hub" / "session_policy.py").read_text(encoding="utf-8")
 
-    assert 'id="btn-reload"' in html
-    assert "Reload" in html
-    assert "Stop turn and re-attach this session (resume)" in html
+    # Composer keeps Stop/Send; Reload button is intentionally not in the UI
+    assert 'id="btn-stop"' in html
+    assert 'id="btn-send"' in html
+    assert 'id="btn-reload"' not in html
     assert 'id="project-entry-choice"' in html
     assert 'id="btn-entry-start-new"' in html
     assert 'id="btn-entry-back"' in html
@@ -1382,7 +1536,7 @@ def test_cli_reload_and_new_vs_resume_entry_contract() -> None:
 
     assert ".project-entry-choice" in css
     assert ".project-entry-row" in css or ".project-entry-priors" in css
-    assert "#btn-reload" in css or "btn-reload" in css
+    assert "#btn-reload" not in css and "btn-reload" not in css
 
     assert "def sessions_matching_cwd" in policy
     assert "def entry_requires_resume_choice" in policy
@@ -1502,6 +1656,14 @@ def test_session_plan_viewer_contract() -> None:
     assert "/api/sessions/" in js and "/plan" in js
     assert "approved — implement the plan in plan.md" in js
     assert "Request changes to the plan:" in js
+    # View plan only when awaiting / Active — not leftover plan.md alone
+    assert "function planChromeShouldShow" in js
+    assert "function applyPlanChrome" in js
+    assert "plan-await-banner" in html
+    assert 'id="btn-view-plan"' in html
+    # Inline strip (not topbar title row)
+    assert "topbar-plan" not in html
+    assert "plan-inline-btn" in html or "plan-inline-btn" in css
     # No exit_plan_mode RPC call (comments may mention the name)
     assert "exit_plan_mode(" not in js
     assert '"exit_plan_mode"' not in js

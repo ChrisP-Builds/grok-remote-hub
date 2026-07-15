@@ -46,6 +46,9 @@ def turn_progress_label(
 ) -> str:
     """Human turn-strip text (idle + residual / running · elapsed · tool · model).
 
+    ``tool`` may be a short tool name or a full activity one-liner (e.g.
+    ``read_file · path/to/file`` or ``subagent · thinking · …``).
+
     When tools/plan are still open mid-turn, prefer ``running`` over ``quiet``
     even if silence crossed the visual-quiet threshold (honest mid-tool wait).
     """
@@ -147,3 +150,78 @@ def idle_turn_label(
 def should_mark_plan_stale(*, turn_running: bool, has_open_or_failed: bool) -> bool:
     """True when pending/open plan rows should show as stale (turn ended)."""
     return (not turn_running) and bool(has_open_or_failed)
+
+
+def wall_ms_from_age_seconds(now_ms: float, age_seconds: float | None) -> float | None:
+    """Client wall-clock epoch ms for event that is age_seconds old. None if age invalid."""
+    if age_seconds is None:
+        return None
+    try:
+        age = float(age_seconds)
+    except (TypeError, ValueError):
+        return None
+    if age != age or age < 0 or age == float("inf"):  # NaN / negative / inf
+        return None
+    return float(now_ms) - age * 1000.0
+
+
+def elapsed_seconds_from_wall(now_ms: float, started_wall_ms: float | None) -> int:
+    """Non-negative whole seconds since started_wall_ms; 0 if missing."""
+    if started_wall_ms is None:
+        return 0
+    try:
+        start = float(started_wall_ms)
+    except (TypeError, ValueError):
+        return 0
+    if start != start:  # NaN
+        return 0
+    s = int((float(now_ms) - start) // 1000)
+    return 0 if s < 0 else s
+
+
+def pick_turn_age_seconds(
+    *,
+    selected_session_id: str | None,
+    live_turns: list[dict],
+    primary_age: float | None,
+    primary_session_id: str | None,
+) -> float | None:
+    """Prefer live_turns entry matching selected_session_id; else primary_age if selected is primary or only one turn."""
+    turns = list(live_turns or [])
+
+    def _finite_age(raw: object) -> float | None:
+        if raw is None:
+            return None
+        try:
+            a = float(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        if a != a or a < 0 or a == float("inf"):
+            return None
+        return a
+
+    if selected_session_id:
+        for t in turns:
+            if not isinstance(t, dict):
+                continue
+            if t.get("sessionId") != selected_session_id:
+                continue
+            matched = _finite_age(t.get("ageSeconds"))
+            if matched is not None:
+                return matched
+            break
+
+    pa = _finite_age(primary_age)
+    if pa is not None:
+        if (
+            not selected_session_id
+            or selected_session_id == primary_session_id
+            or len(turns) <= 1
+        ):
+            return pa
+
+    if len(turns) == 1 and isinstance(turns[0], dict):
+        only = _finite_age(turns[0].get("ageSeconds"))
+        if only is not None:
+            return only
+    return None

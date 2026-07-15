@@ -17,6 +17,7 @@ from hub.acp_ask_user import (
 from hub.acp_fs import read_text_file, write_text_file
 from hub.acp_permissions import pick_permission_option
 from hub.acp_terminal import TerminalManager
+from hub.acp_trace import AcpTrace, session_id_slice
 from hub.config import Config
 from hub.session_policy import (
     MAX_TURN_SECONDS,
@@ -25,6 +26,13 @@ from hub.session_policy import (
     STUCK_TURN_SECONDS,
     is_turn_stuck_for_new_prompt,
     should_force_clear_turn,
+)
+from hub.status_view import (
+    ACP_PROBE_INTERVAL_S,
+    ACP_PROBE_SILENCE_S,
+    ACP_PROBE_TIMEOUT_S,
+    should_probe_acp_liveness,
+    should_suppress_session_load_fanout,
 )
 
 log = logging.getLogger("hub.acp")
@@ -61,6 +69,9 @@ class AcpClient:
         secret: str,
         on_message: MessageCallback | None = None,
         on_connection: Callable[[bool], Awaitable[None] | None] | None = None,
+        *,
+        log_dir: Any = None,
+        trace: AcpTrace | None = None,
     ):
         self.config = config
         self.secret = secret
@@ -77,6 +88,12 @@ class AcpClient:
         self._stop = asyncio.Event()
         self.connected = False
         self.loaded_session_id: str | None = None
+        # session/load: suppress historical session/update fanout (UI strobe).
+        self._loading_sessions: set[str] = set()
+        # Optional once-per-load suppress counts for trace (sid -> count).
+        self._load_suppress_counts: dict[str, int] = {}
+        # Delayed release handles for load suppress (sid -> Handle).
+        self._load_release_handles: dict[str, asyncio.TimerHandle] = {}
         self.available_commands: list[dict[str, Any]] = []
         # session_id -> {started_at, last_activity, saw_update, first_update_at,
         #                cwd_key, prompt_req_id?}
@@ -107,6 +124,27 @@ class AcpClient:
         self.last_send_error_at: float | None = None
         self.consecutive_send_failures: int = 0
         self._force_unhealthy_scheduled: bool = False
+        # Proactive WS ping probe timestamps (monotonic).
+        self.last_probe_at: float | None = None
+        self.last_probe_ok_at: float | None = None
+        self._probe_in_progress: bool = False
+        # Structured lifecycle trace (memory + optional JSONL).
+        if trace is not None:
+            self.trace = trace
+        else:
+            resolved_log = log_dir
+            if resolved_log is None:
+                resolved_log = getattr(config, "log_dir", None)
+            self.trace = AcpTrace(log_dir=resolved_log)
+
+    def _trace(self, event: str, **fields: Any) -> None:
+        tr = getattr(self, "trace", None)
+        if tr is None:
+            return
+        try:
+            tr.emit(event, **fields)
+        except Exception:
+            log.debug("ACP trace emit failed", exc_info=True)
 
     def acp_liveness_snapshot(self) -> dict[str, Any]:
         """Ages (seconds or None) and pending-RPC flag for status quality mapping."""
@@ -125,11 +163,23 @@ class AcpClient:
             "has_pending": bool(self._pending),
         }
 
-    def _schedule_force_unhealthy(self) -> None:
+    def _schedule_force_unhealthy(self, reason: str = "send_failures") -> None:
         """Close half-dead WS so maintain reconnects; never await under send lock."""
         if self._force_unhealthy_scheduled:
             return
         self._force_unhealthy_scheduled = True
+        self._trace(
+            "force_unhealthy",
+            reason=reason,
+            consecutive_send_failures=self.consecutive_send_failures,
+            **{k: v for k, v in self.acp_liveness_snapshot().items()},
+        )
+        if reason == "send_failures" or "zombie" in reason.lower():
+            self._trace(
+                "zombie",
+                reason=reason,
+                consecutive_send_failures=self.consecutive_send_failures,
+            )
         # Immediate false so status is not chat-ready while close is scheduled.
         # Notify hub now: _close_ws only calls on_connection when connected was True.
         was_connected = self.connected
@@ -148,12 +198,13 @@ class AcpClient:
         except RuntimeError:
             self._force_unhealthy_scheduled = False
             return
-        loop.create_task(self._force_unhealthy(), name="acp-force-unhealthy")
+        loop.create_task(self._force_unhealthy(reason), name="acp-force-unhealthy")
 
-    async def _force_unhealthy(self) -> None:
+    async def _force_unhealthy(self, reason: str = "send_failures") -> None:
         try:
             log.warning(
-                "ACP unhealthy after %s consecutive send failures; closing WS",
+                "ACP unhealthy (%s) after %s consecutive send failures; closing WS",
+                reason,
                 self.consecutive_send_failures,
             )
             await self._close_ws()
@@ -161,6 +212,72 @@ class AcpClient:
             log.debug("ACP force unhealthy close failed", exc_info=True)
         finally:
             self._force_unhealthy_scheduled = False
+
+    async def maybe_probe_liveness(self) -> bool | None:
+        """Ping ACP WebSocket when idle silence suggests a half-open wire.
+
+        Returns True on probe ok, False on fail, None if skipped.
+        On fail: force unhealthy so heal can reconnect (no KillAgent).
+        """
+        if self._probe_in_progress:
+            return None
+        if not self.connected or self._ws is None:
+            return None
+        live = self.acp_liveness_snapshot()
+        now = time.monotonic()
+        since_probe: float | None = None
+        if self.last_probe_at is not None:
+            since_probe = now - float(self.last_probe_at)
+        if not should_probe_acp_liveness(
+            connected=bool(self.connected and self._ws is not None),
+            has_pending=bool(live.get("has_pending")),
+            seconds_since_recv=live.get("seconds_since_recv"),
+            seconds_since_probe=since_probe,
+            silence_s=ACP_PROBE_SILENCE_S,
+            interval_s=ACP_PROBE_INTERVAL_S,
+        ):
+            return None
+        ws = self._ws
+        if ws is None:
+            return None
+        self._probe_in_progress = True
+        self.last_probe_at = now
+        self._trace(
+            "probe_start",
+            seconds_since_recv=live.get("seconds_since_recv"),
+            consecutive_send_failures=live.get("consecutive_send_failures"),
+        )
+        try:
+            # websockets: ping() returns a future that resolves on pong.
+            pong_waiter = await ws.ping()
+            await asyncio.wait_for(pong_waiter, timeout=ACP_PROBE_TIMEOUT_S)
+            self.last_recv_at = time.monotonic()
+            self.last_probe_ok_at = self.last_recv_at
+            self._trace(
+                "probe_ok",
+                seconds_since_recv=0.0,
+            )
+            return True
+        except Exception as exc:
+            log.warning(
+                "ACP liveness probe failed (recv_age=%s): %s",
+                live.get("seconds_since_recv"),
+                exc,
+            )
+            self._trace(
+                "probe_fail",
+                error=str(exc)[:200],
+                seconds_since_recv=live.get("seconds_since_recv"),
+                consecutive_send_failures=self.consecutive_send_failures,
+            )
+            self.consecutive_send_failures = max(
+                int(self.consecutive_send_failures) + 1, 2
+            )
+            self.last_send_error_at = time.monotonic()
+            self._schedule_force_unhealthy(reason="probe_fail")
+            return False
+        finally:
+            self._probe_in_progress = False
 
     # --- back-compat properties over multi-session active_turns ---
 
@@ -337,6 +454,13 @@ class AcpClient:
             len(self.active_turns),
             reason,
         )
+        self._trace(
+            "turn_force_clear",
+            reason=reason,
+            sessionId=session_id_slice(cleared_sid),
+            active=len(self.active_turns),
+            pending=len(self._pending),
+        )
         self.last_force_clear_reason = reason
         self.last_force_clear_session = cleared_sid
         for req_id, fut in list(self._pending.items()):
@@ -368,6 +492,12 @@ class AcpClient:
             sid,
             f"{age:.1f}s" if age is not None else "unknown",
             reason,
+        )
+        self._trace(
+            "turn_force_clear",
+            reason=reason,
+            sessionId=session_id_slice(sid),
+            ageSeconds=age,
         )
         self.last_force_clear_reason = reason
         self.last_force_clear_session = sid
@@ -451,6 +581,7 @@ class AcpClient:
         """
         was_connected = self.connected
         log.info("ACP reconnect requested (was_connected=%s)", was_connected)
+        self._trace("disconnect", reason="reconnect_requested", was_connected=was_connected)
         try:
             await self._close_ws()
         except Exception as exc:
@@ -534,6 +665,11 @@ class AcpClient:
             try:
                 url = self._url()
                 log.info("Connecting ACP to %s:%s", self.config.agent_bind, self.config.agent_port)
+                self._trace(
+                    "connect",
+                    host=self.config.agent_bind,
+                    port=self.config.agent_port,
+                )
                 async with ws_connect(url, open_timeout=10, max_size=16 * 1024 * 1024) as ws:
                     self._ws = ws
                     # Reader must run before initialize/request awaits responses
@@ -561,6 +697,7 @@ class AcpClient:
                 log.info("ACP recv cancelled (reconnect); maintain continues")
             except Exception as exc:
                 log.warning("ACP connection error: %s", exc)
+                self._trace("disconnect", reason="connection_error", error=str(exc)[:200])
             finally:
                 self._ws = None
                 self.loaded_session_id = None
@@ -587,6 +724,7 @@ class AcpClient:
                 self._pending_session.clear()
                 self._cancel_all_pending_user_questions()
                 if self.connected:
+                    self._trace("disconnect", reason="ws_closed")
                     await self._set_connected(False)
             if self._stop.is_set():
                 break
@@ -594,18 +732,23 @@ class AcpClient:
             backoff = min(backoff * 2, 15.0)
 
     async def _initialize(self) -> None:
-        await self.request(
-            "initialize",
-            {
-                "protocolVersion": 1,
-                "clientCapabilities": {
-                    "fs": {"readTextFile": True, "writeTextFile": True},
-                    "terminal": True,
+        try:
+            await self.request(
+                "initialize",
+                {
+                    "protocolVersion": 1,
+                    "clientCapabilities": {
+                        "fs": {"readTextFile": True, "writeTextFile": True},
+                        "terminal": True,
+                    },
+                    "clientInfo": {"name": "grok-remote-hub", "version": "0.3.2"},
                 },
-                "clientInfo": {"name": "grok-remote-hub", "version": "0.3.2"},
-            },
-            timeout=30.0,
-        )
+                timeout=30.0,
+            )
+            self._trace("initialize_ok")
+        except Exception as exc:
+            self._trace("initialize_fail", error=str(exc)[:200])
+            raise
 
     async def _handle_raw(self, raw: str | bytes) -> None:
         if isinstance(raw, bytes):
@@ -627,6 +770,8 @@ class AcpClient:
 
         # JSON-RPC response to a hub-originated request
         if msg_id is not None and ("result" in msg or "error" in msg) and not method:
+            kind = "error" if "error" in msg else "result"
+            self._trace("recv", kind=kind, id=msg_id)
             fut = self._pending.pop(msg_id, None)
             self._pending_session.pop(msg_id, None)
             if fut and not fut.done():
@@ -644,11 +789,71 @@ class AcpClient:
             and "result" not in msg
             and "error" not in msg
         ):
+            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+            sid = params.get("sessionId") or params.get("session_id")
+            self._trace(
+                "recv",
+                method=str(method)[:80],
+                kind="client_request",
+                sessionId=session_id_slice(str(sid) if sid else None),
+            )
             await self._handle_client_request(msg)
             await self._fanout(msg)
             return
 
-        # Notifications / other
+        # Notifications / other — trace interesting methods only
+        sid = None
+        update_kind = None
+        if method:
+            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+            if isinstance(params, dict):
+                sid = params.get("sessionId") or params.get("session_id")
+                upd = params.get("update") if isinstance(params.get("update"), dict) else {}
+                update_kind = (
+                    upd.get("sessionUpdate")
+                    or upd.get("session_update")
+                    or params.get("sessionUpdate")
+                )
+                if not sid and isinstance(upd, dict):
+                    sid = upd.get("sessionId") or upd.get("session_id")
+            method_s = str(method)
+            interesting = (
+                method_s in (
+                    "session/update",
+                    "_x.ai/session/update",
+                    "_x.ai/session_notification",
+                    "x.ai/session_notification",
+                )
+                or "compact" in method_s.lower()
+            )
+            if interesting:
+                self._trace(
+                    "recv",
+                    method=method_s[:80],
+                    kind=str(update_kind)[:80] if update_kind else "notification",
+                    sessionId=session_id_slice(str(sid) if sid else None),
+                )
+
+        sid_str = str(sid) if sid else None
+        method_str = str(method) if method else None
+        kind_str = str(update_kind) if update_kind else None
+        suppress = should_suppress_session_load_fanout(
+            loading_session_ids=self._loading_sessions,
+            session_id=sid_str,
+            method=method_str,
+            update_kind=kind_str,
+            active_turn_session_ids=frozenset(self.active_turns.keys()),
+        )
+        if suppress:
+            # Count for a single end-of-load trace (avoid per-message flood).
+            key = sid_str or next(iter(self._loading_sessions), "")
+            if key:
+                self._load_suppress_counts[key] = (
+                    self._load_suppress_counts.get(key, 0) + 1
+                )
+            await self._track_update(msg)
+            return
+
         await self._fanout(msg)
         await self._track_update(msg)
 
@@ -877,23 +1082,61 @@ class AcpClient:
 
     async def _track_update(self, msg: dict[str, Any]) -> None:
         method = msg.get("method") or ""
-        if method not in ("session/update", "_x.ai/session/update"):
-            return
         params = msg.get("params") or {}
         sid = None
+        update_pre: dict[str, Any] = {}
         if isinstance(params, dict):
             sid = params.get("sessionId") or params.get("session_id")
-            update_pre = params.get("update") or {}
-            if not sid and isinstance(update_pre, dict):
+            raw_update = params.get("update") or {}
+            if isinstance(raw_update, dict):
+                update_pre = raw_update
+            if not sid and update_pre:
                 sid = update_pre.get("sessionId") or update_pre.get("session_id")
         sid_str = str(sid) if sid else None
-        self.note_activity(sid_str)
-        update = params.get("update") or {}
+        method_str = str(method) if method else None
+
+        # Compact / session notifications count as activity so stall watchdog
+        # does not mis-fire while compaction runs mid-session.
+        if method in (
+            "_x.ai/session_notification",
+            "x.ai/session_notification",
+        ):
+            kind_n = str(
+                update_pre.get("sessionUpdate")
+                or update_pre.get("session_update")
+                or params.get("sessionUpdate")
+                or ""
+            )
+            suppress_n = should_suppress_session_load_fanout(
+                loading_session_ids=self._loading_sessions,
+                session_id=sid_str,
+                method=method_str,
+                update_kind=kind_n or None,
+                active_turn_session_ids=frozenset(self.active_turns.keys()),
+            )
+            if kind_n.startswith("auto_compact_") and not suppress_n:
+                self.note_activity(sid_str)
+            return
+
+        if method not in ("session/update", "_x.ai/session/update"):
+            return
+        update = update_pre if update_pre else (params.get("update") or {})
         kind = update.get("sessionUpdate") or ""
+        # available_commands still applied during load (helper allows this kind).
         if kind == "available_commands_update":
             cmds = update.get("availableCommands") or update.get("available_commands") or []
             if isinstance(cmds, list):
                 self.available_commands = cmds
+        suppress = should_suppress_session_load_fanout(
+            loading_session_ids=self._loading_sessions,
+            session_id=sid_str,
+            method=method_str,
+            update_kind=str(kind) if kind else None,
+            active_turn_session_ids=frozenset(self.active_turns.keys()),
+        )
+        if suppress:
+            return
+        self.note_activity(sid_str)
         if kind in ("turn_completed", "task_completed", "prompt_complete"):
             if sid_str and sid_str in self.active_turns:
                 self.active_turns.pop(sid_str, None)
@@ -941,16 +1184,29 @@ class AcpClient:
         ws = self._ws
         if ws is None:
             raise ConnectionError("ACP not connected")
+        method = payload.get("method")
         try:
             await ws.send(json.dumps(payload))
-        except Exception:
+        except Exception as exc:
             self.consecutive_send_failures += 1
             self.last_send_error_at = time.monotonic()
+            self._trace(
+                "send_fail",
+                method=str(method)[:80] if method else None,
+                consecutive_failures=self.consecutive_send_failures,
+                error=str(exc)[:200],
+            )
             if self.consecutive_send_failures >= 2:
-                self._schedule_force_unhealthy()
+                self._schedule_force_unhealthy(reason="send_failures")
             raise
         self.last_send_ok_at = time.monotonic()
         self.consecutive_send_failures = 0
+        if method:
+            self._trace(
+                "send_ok",
+                method=str(method)[:80],
+                consecutive_failures=0,
+            )
 
     async def request(
         self,
@@ -1012,14 +1268,65 @@ class AcpClient:
                 )
             else:
                 raise RuntimeError("Turn in progress; cannot load this session")
-        result = await self.request(
-            "session/load",
-            {"sessionId": session_id, "cwd": cwd, "mcpServers": []},
-            timeout=60.0,
-            session_id=session_id,
-        )
-        self.loaded_session_id = session_id
-        return result
+        sid = str(session_id)
+        # Cancel any prior delayed release for this sid before re-arming.
+        self.release_load_suppress(sid)
+        self._loading_sessions.add(sid)
+        self._load_suppress_counts.setdefault(sid, 0)
+        try:
+            result = await self.request(
+                "session/load",
+                {"sessionId": session_id, "cwd": cwd, "mcpServers": []},
+                timeout=60.0,
+                session_id=session_id,
+            )
+            self.loaded_session_id = session_id
+            return result
+        finally:
+            # Delayed release: agent may flush trailing historical frames after
+            # the RPC result. Always schedule release (success or failure).
+            loop = asyncio.get_running_loop()
+
+            def _delayed_release(s: str = sid) -> None:
+                self._load_release_handles.pop(s, None)
+                self.release_load_suppress(s)
+
+            # Replace any prior handle (should be none after release above).
+            prev = self._load_release_handles.pop(sid, None)
+            if prev is not None:
+                prev.cancel()
+            self._load_release_handles[sid] = loop.call_later(0.3, _delayed_release)
+
+    def release_load_suppress(self, session_id: str | None = None) -> None:
+        """Immediately stop load-replay suppress so live prompts get activity.
+
+        Discards sid from ``_loading_sessions``, emits count trace if any, and
+        cancels a pending delayed release. Safe if already released.
+        When session_id is None, release all loading sessions.
+        """
+        if session_id is None:
+            sids = list(self._loading_sessions) or list(self._load_release_handles)
+            for s in sids:
+                self.release_load_suppress(s)
+            return
+        sid = str(session_id).strip()
+        if not sid:
+            return
+        handle = self._load_release_handles.pop(sid, None)
+        if handle is not None:
+            handle.cancel()
+        count = self._load_suppress_counts.pop(sid, 0)
+        was_loading = sid in self._loading_sessions
+        self._loading_sessions.discard(sid)
+        if count:
+            self._trace(
+                "load_replay_suppressed",
+                sessionId=session_id_slice(sid),
+                count=count,
+            )
+        elif was_loading:
+            # No frames counted; still clear quietly.
+            pass
 
     async def _stall_watchdog_loop(
         self, session_id: str, no_output_seconds: float
@@ -1053,6 +1360,16 @@ class AcpClient:
                 )
                 if reason:
                     self.force_clear_turn(reason, session_id=session_id)
+                    # Best-effort: free agent so next prompt is not blocked
+                    # behind an orphan turn the hub already unlocked locally.
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(
+                            self.notify_agent_cancel(session_id),
+                            name=f"acp-cancel-after-clear-{session_id[:8]}",
+                        )
+                    except RuntimeError:
+                        pass
                     return
         except asyncio.CancelledError:
             return
@@ -1070,6 +1387,27 @@ class AcpClient:
     def _clear_active_turn(self, session_id: str) -> None:
         self.active_turns.pop(session_id, None)
         self._cancel_stall_watchdog(session_id)
+
+    async def session_compact(
+        self,
+        session_id: str,
+        context: str | None = None,
+    ) -> Any:
+        """Request conversation compaction via verified agent RPC.
+
+        Method must be ``_x.ai/compact_conversation`` (``x.ai/…`` is not found).
+        Unknown extra fields are ignored by the agent; only pass context when set.
+        """
+        params: dict[str, Any] = {"sessionId": session_id}
+        ctx = (context or "").strip()
+        if ctx:
+            params["context"] = ctx
+        return await self.request(
+            "_x.ai/compact_conversation",
+            params,
+            timeout=180.0,
+            session_id=session_id,
+        )
 
     async def session_prompt(
         self,
@@ -1122,6 +1460,8 @@ class AcpClient:
 
         key = cwd_key or ""
         self._register_active_turn(session_id, key)
+        # Post-load re-prompt must not inherit load-replay suppress (note_activity).
+        self.release_load_suppress(session_id)
         self._cancel_stall_watchdog(session_id)
         # Always run continuous stall watchdog for mid-turn / max duration.
         self._stall_watchdogs[session_id] = asyncio.create_task(
@@ -1129,6 +1469,11 @@ class AcpClient:
             name=f"acp-stall-{session_id[:8]}",
         )
         log.info("Prompt start session=%s (active=%d)", session_id, len(self.active_turns))
+        self._trace(
+            "prompt_start",
+            sessionId=session_id_slice(session_id),
+            active=len(self.active_turns),
+        )
         try:
             # Match request timeout to MAX_TURN_SECONDS (TUI-length agentic turns).
             # Await is outside any global lock so other sessions can prompt.
@@ -1142,21 +1487,28 @@ class AcpClient:
                 session_id=session_id,
             )
             log.info("Prompt end session=%s ok", session_id)
+            self._trace("prompt_end", sessionId=session_id_slice(session_id), ok=True)
             return result
         except Exception as exc:
             log.warning("Prompt end session=%s error: %s", session_id, exc)
+            self._trace(
+                "prompt_end",
+                sessionId=session_id_slice(session_id),
+                ok=False,
+                error=str(exc)[:200],
+            )
             raise
         finally:
             self._clear_active_turn(session_id)
 
-    async def session_cancel(self, session_id: str) -> None:
-        """Cancel agent turn for one session and unlock local hub turn state.
+    async def notify_agent_cancel(self, session_id: str) -> bool:
+        """Tell the agent to abort its in-flight turn. Does not force_clear locally.
 
-        Only clears this session's turn and its pending user questions.
-        Other projects' turns are left running.
+        Tries the same cancel methods as session_cancel with a short timeout.
+        Returns True if any method succeeded. Logs a warning if all fail.
+        Use before or after force_clear_turn so the agent does not keep the
+        old prompt and block the next session/prompt.
         """
-        self._cancel_pending_user_questions_for_session(session_id)
-        agent_ok = False
         last_exc: Exception | None = None
         for method in (
             "session/cancel",
@@ -1166,19 +1518,38 @@ class AcpClient:
         ):
             try:
                 await self.request(
-                    method, {"sessionId": session_id}, timeout=10.0, session_id=session_id
+                    method,
+                    {"sessionId": session_id},
+                    timeout=8.0,
+                    session_id=session_id,
                 )
-                agent_ok = True
-                break
+                log.info(
+                    "Agent cancel ok via %s session=%s", method, session_id[:12]
+                )
+                return True
             except Exception as exc:
                 last_exc = exc
                 log.debug("Cancel via %s failed: %s", method, exc)
+        log.warning(
+            "Agent cancel unsupported/failed session=%s: %s",
+            session_id,
+            last_exc or "no method succeeded",
+        )
+        return False
+
+    async def session_cancel(self, session_id: str) -> None:
+        """Cancel agent turn for one session and unlock local hub turn state.
+
+        Only clears this session's turn and its pending user questions.
+        Other projects' turns are left running.
+        """
+        self._cancel_pending_user_questions_for_session(session_id)
+        agent_ok = await self.notify_agent_cancel(session_id)
         cleared = self.force_clear_turn("user cancel", session_id=session_id)
         if not agent_ok:
             log.warning(
-                "Agent cancel unsupported/failed session=%s force_cleared=%s: %s",
+                "session_cancel: agent cancel failed session=%s force_cleared=%s",
                 session_id,
                 cleared,
-                last_exc or "no method succeeded",
             )
         # Never raise after local force-clear: UI must unlock on Stop.

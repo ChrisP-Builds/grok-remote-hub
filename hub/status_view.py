@@ -10,8 +10,15 @@ ACP_HEAL_MIN_DOWN_S = 10.0
 ACP_HEAL_BACKOFF_BASE_S = 5.0
 
 # ACP quality / zombie detection (half-open sockets, stalled pending RPCs).
-ACP_STALE_SECONDS = 45.0
+# Must be > session_policy.NO_OUTPUT_SECONDS so stall policy owns silent prompts
+# before quality flips to stale and heal would reconnect mid-turn.
+ACP_STALE_SECONDS = 90.0
 ACP_ZOMBIE_SEND_FAILURES = 2
+
+# Proactive WebSocket ping when idle silence looks half-open (false-green).
+ACP_PROBE_SILENCE_S = 45.0  # no recv for this long → consider probe
+ACP_PROBE_INTERVAL_S = 30.0  # min time between probes
+ACP_PROBE_TIMEOUT_S = 5.0
 
 
 def map_acp_quality(
@@ -120,6 +127,8 @@ def should_attempt_acp_heal(
     max_attempts: int = ACP_HEAL_MAX_ATTEMPTS,
     min_down_s: float = ACP_HEAL_MIN_DOWN_S,
     backoff_base_s: float = ACP_HEAL_BACKOFF_BASE_S,
+    acp_quality: str | None = None,
+    turn_active: bool = False,
 ) -> bool:
     """True when hub should call AcpClient.reconnect for process-up / ACP-down.
 
@@ -128,12 +137,94 @@ def should_attempt_acp_heal(
 
     When status uses quality-adjusted acpConnected (false for zombie/stale),
     existing callers heal those half-dead cases without extra branches here.
+
+    Mid-turn stale is an exception: if turn_active and quality is ``stale``,
+    return False. Pending session/prompt silence (TTFB, large context) is owned
+    by the stall watchdog (no-output / mid-turn), not by reconnect. Still heal
+    mid-turn when quality is ``zombie`` or ``down`` (wire truly dead).
     """
     if not agent_process_up or acp_connected or heal_in_progress:
         return False
     if attempts >= max_attempts:
         return False
+    if turn_active and str(acp_quality or "").lower() == "stale":
+        return False
     if disconnected_for_s is None:
         return False
     need = min_down_s + backoff_base_s * max(0, attempts)
     return float(disconnected_for_s) >= need
+
+
+def should_probe_acp_liveness(
+    *,
+    connected: bool,
+    has_pending: bool,
+    seconds_since_recv: float | None,
+    seconds_since_probe: float | None,
+    silence_s: float = ACP_PROBE_SILENCE_S,
+    interval_s: float = ACP_PROBE_INTERVAL_S,
+) -> bool:
+    """True when hub should send a WebSocket ping to detect half-open ACP.
+
+    Skip when not connected, when a pending RPC exists (stale path covers that),
+    when recv is recent, or when a probe ran recently. Does not KillAgent.
+    """
+    if not connected:
+        return False
+    if has_pending:
+        return False
+    if seconds_since_recv is None:
+        return False
+    if float(seconds_since_recv) < float(silence_s):
+        return False
+    if seconds_since_probe is not None and float(seconds_since_probe) < float(
+        interval_s
+    ):
+        return False
+    return True
+
+
+# ACP notification methods that session/load may replay as historical flood.
+_SESSION_LOAD_REPLAY_METHODS = frozenset(
+    {
+        "session/update",
+        "_x.ai/session/update",
+        "_x.ai/session_notification",
+        "x.ai/session_notification",
+    }
+)
+
+
+def should_suppress_session_load_fanout(
+    *,
+    loading_session_ids: set[str] | frozenset[str],
+    session_id: str | None,
+    method: str | None,
+    update_kind: str | None = None,
+    active_turn_session_ids: set[str] | frozenset[str] = frozenset(),
+) -> bool:
+    """True when an ACP notification is historical replay during session/load.
+
+    Drop session/update (+ x.ai session updates/notifications) for the loading
+    session so the UI does not strobe. Allow available_commands_update through.
+    Live turns always receive activity/fanout (never suppress mid-prompt).
+    When session_id is missing, suppress only if no active turn exists (ambiguous
+    frames during pure load); if any turn is live, do not suppress solely for load.
+    """
+    if not loading_session_ids:
+        return False
+    if method not in _SESSION_LOAD_REPLAY_METHODS:
+        return False
+    if update_kind == "available_commands_update":
+        return False
+    # Live prompt must receive note_activity + fanout (post-load re-prompt path).
+    if session_id and session_id in active_turn_session_ids:
+        return False
+    if session_id and session_id in loading_session_ids:
+        return True
+    if not session_id:
+        # Ambiguous frame during load: suppress only when no live turn is running.
+        if active_turn_session_ids:
+            return False
+        return True
+    return False

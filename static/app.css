@@ -692,12 +692,13 @@ a {
   line-height: 1.4;
 }
 
+/* Inline plan chrome — only visible when plan mode needs attention */
 .plan-await-banner {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 6px 14px;
+  padding: 6px 12px;
   border-bottom: 1px solid var(--border);
   border-left: 3px solid var(--accent);
   background: rgba(109, 160, 255, 0.08);
@@ -705,16 +706,32 @@ a {
   font-size: 12px;
   color: var(--text);
   min-width: 0;
+  flex-shrink: 0;
 }
 
 .plan-await-banner.hidden {
   display: none !important;
 }
 
+.plan-await-banner[data-kind="awaiting"] {
+  border-left-color: var(--accent);
+  background: rgba(109, 160, 255, 0.1);
+}
+
+.plan-await-banner[data-kind="active"] {
+  border-left-color: color-mix(in srgb, var(--assistant) 70%, var(--border));
+  background: rgba(109, 202, 141, 0.08);
+}
+
 .plan-await-banner-text {
   min-width: 0;
   flex: 1 1 auto;
-  line-height: 1.4;
+  line-height: 1.35;
+}
+
+.plan-inline-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .empty-sub {
@@ -1772,19 +1789,21 @@ a {
 /* Live turn status strip (display-only; never intercept composer clicks) */
 .turn-strip {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 6px 10px;
-  min-height: 28px;
-  padding: 4px 14px;
+  min-height: 26px;
+  padding: 4px 10px 6px;
+  margin: 0 0 6px;
+  border: none;
   border-bottom: 1px solid var(--border);
-  background: var(--surface);
+  background: transparent;
   font-family: var(--font);
   font-size: 11.5px;
   color: var(--muted);
   min-width: 0;
   max-width: 100%;
-  overflow-x: hidden;
+  overflow: hidden;
   pointer-events: none;
   flex-shrink: 0;
 }
@@ -1803,10 +1822,16 @@ a {
   color: var(--muted);
 }
 
+.turn-strip[data-state="residual"] {
+  color: var(--muted);
+}
+
 #turn-strip-text {
   min-width: 0;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .term-cursor {
@@ -1947,27 +1972,63 @@ a {
   color: var(--user);
 }
 
-/* Active user turn: freeze "You:" at top — opaque, higher contrast over stream */
+/* Active user: compact sticky bar — You: + text on ONE row; click expands */
 .term-line.user.active-prompt {
   position: sticky;
   top: 0;
   z-index: 5;
-  /* Solid-ish lift over transcript (not translucent wash) */
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: baseline;
+  gap: 0;
   background: color-mix(in srgb, var(--surface-2) 88%, var(--user) 12%);
   border-bottom: 1px solid color-mix(in srgb, var(--user) 55%, var(--border));
-  padding: 8px 10px 10px;
-  margin: 0 0 10px;
-  border-radius: 0 0 8px 8px;
+  padding: 5px 10px;
+  margin: 0 0 6px;
+  border-radius: 0 0 6px 6px;
   box-shadow:
-    0 1px 0 color-mix(in srgb, var(--user) 25%, transparent),
-    0 8px 20px rgba(0, 0, 0, 0.45);
+    0 1px 0 color-mix(in srgb, var(--user) 20%, transparent),
+    0 4px 12px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  min-width: 0;
+  max-width: 100%;
+  line-height: 1.35;
 }
 
-/* Long user prompts: scroll inside sticky header instead of covering the stream */
+.term-line.user.active-prompt .term-prefix {
+  flex: 0 0 auto;
+  margin-right: 0.5ch;
+}
+
 .term-line.user.active-prompt .term-body {
-  max-height: 30vh;
-  overflow-y: auto;
+  flex: 1 1 auto;
+  min-width: 0;
   color: color-mix(in srgb, var(--text) 92%, var(--user) 8%);
+}
+
+/* Collapsed: single row, ellipsis — no extra chrome */
+.term-line.user.active-prompt.is-collapsed .term-body {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-height: none;
+}
+
+/* Expanded: still compact header; body can wrap within a short max height */
+.term-line.user.active-prompt:not(.is-collapsed) {
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.term-line.user.active-prompt:not(.is-collapsed) .term-body {
+  flex: 1 1 100%;
+  max-height: 28vh;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  text-overflow: unset;
 }
 
 .term-line.assistant .term-prefix {
@@ -2282,9 +2343,7 @@ a {
   font-size: 10px;
 }
 
-.turn-strip[data-state="residual"] {
-  color: var(--warn);
-}
+
 
 .plan-item[data-status="completed"] .plan-item-text {
   color: var(--muted);
@@ -2577,10 +2636,10 @@ a {
 }
 
 .slash-palette {
-  position: fixed; /* escape chat-panel overflow:hidden clip */
-  left: 12px;
-  right: 12px;
-  bottom: auto;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
   top: auto;
   width: auto;
   max-width: none;
@@ -2596,6 +2655,7 @@ a {
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
   z-index: 200;
   font-family: var(--font);
+  margin-bottom: 4px;
 }
 
 .slash-palette.hidden {
@@ -2814,13 +2874,6 @@ a {
 
 .plan-actions {
   flex-wrap: wrap;
-}
-
-.topbar-plan {
-  flex: 0 0 auto;
-  margin-left: 4px;
-  font-size: 12px;
-  white-space: nowrap;
 }
 
 .site-preview-header {
@@ -3210,10 +3263,6 @@ a {
   font-size: 11px;
   font-family: var(--font);
   color: var(--muted);
-}
-
-#btn-reload:not(.hidden) {
-  flex: 0 0 auto;
 }
 
 .project-row {
@@ -3617,11 +3666,11 @@ a {
     overflow-x: auto;
   }
 
-  /* Sticky You: flush to top of chat scroll, full width (no padding gap) */
+  /* Sticky You: flush to top, full width, tight single row */
   .term-line.user.active-prompt {
     top: 0;
-    margin: 0 -10px 8px;
-    padding: 8px 10px 10px;
+    margin: 0 -10px 4px;
+    padding: 4px 10px;
     border-radius: 0;
     width: calc(100% + 20px);
     max-width: none;
