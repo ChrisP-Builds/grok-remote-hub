@@ -36,3 +36,4 @@ a new ADR.
 | 009 | KeepAgent default + view-first continuity (no no-output fork) | Accepted | 2026-07-12 |
 | 010 | File-first site preview, not cloud or chat artifacts | Accepted | 2026-07-12 |
 | 011 | Separate agent process health from ACP connection | Accepted | 2026-07-13 |
+| 012 | Durable Hub plan-mode approval via plan_mode.json | Accepted | 2026-07-14 |

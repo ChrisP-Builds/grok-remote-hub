@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import socket
 import sys
 from datetime import datetime, timezone
@@ -187,6 +188,159 @@ class AgentSupervisor:
             pass
         except Exception as exc:
             log.warning("Failed to kill agent pid %s: %s", pid, exc)
+
+    async def _pids_listening_on_port(self, port: int) -> list[int]:
+        """PIDs with a TCP LISTEN socket on ``port`` (any local bind)."""
+        found: list[int] = []
+        try:
+            if sys.platform == "win32":
+                proc = await asyncio.create_subprocess_exec(
+                    "netstat",
+                    "-ano",
+                    "-p",
+                    "tcp",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                out, _ = await proc.communicate()
+                text = out.decode("utf-8", errors="replace")
+                needle = f":{int(port)}"
+                for line in text.splitlines():
+                    upper = line.upper()
+                    if "LISTENING" not in upper:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 5:
+                        continue
+                    local = parts[1] if len(parts) > 1 else ""
+                    if not local.endswith(needle):
+                        # Also match 0.0.0.0:port / [::]:port style already via endswith
+                        if needle not in local:
+                            continue
+                        # Require port as full local-port segment (avoid :24190)
+                        if not (
+                            local.endswith(needle)
+                            or local.endswith(f"]{needle}")
+                        ):
+                            continue
+                    try:
+                        pid = int(parts[-1])
+                    except ValueError:
+                        continue
+                    if pid > 0 and pid not in found:
+                        found.append(pid)
+            else:
+                # Prefer ss; fall back to lsof.
+                for cmd in (
+                    ("ss", "-lptn", f"sport = :{int(port)}"),
+                    ("lsof", "-ti", f":{int(port)}", "-sTCP:LISTEN"),
+                ):
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        out, _ = await proc.communicate()
+                    except FileNotFoundError:
+                        continue
+                    text = out.decode("utf-8", errors="replace")
+                    if cmd[0] == "lsof":
+                        for tok in text.split():
+                            if tok.isdigit():
+                                pid = int(tok)
+                                if pid > 0 and pid not in found:
+                                    found.append(pid)
+                    else:
+                        # ss: users:(("name",pid=123,fd=4))
+                        for m in re.finditer(r"pid=(\d+)", text):
+                            pid = int(m.group(1))
+                            if pid > 0 and pid not in found:
+                                found.append(pid)
+                    if found:
+                        break
+        except Exception as exc:
+            log.warning("Failed to enumerate listeners on port %s: %s", port, exc)
+        return found
+
+    async def force_kill_agent(self) -> bool:
+        """Kill agent regardless of attach vs hub-spawned ownership.
+
+        Hung ACP with process still listening needs a hard kill of the port
+        holder, not only processes where ``_started_by_us`` is True.
+        Returns True if at least one kill was attempted.
+        """
+        pids: list[int] = []
+        seen: set[int] = set()
+
+        def _add(pid: int | None) -> None:
+            if pid is None or pid <= 0 or pid in seen:
+                return
+            seen.add(pid)
+            pids.append(pid)
+
+        if self._proc is not None and self._proc.pid:
+            _add(self._proc.pid)
+        _add(self._agent_pid)
+        _add(self._read_pid_file())
+        for pid in await self._pids_listening_on_port(self.config.agent_port):
+            _add(pid)
+
+        if not pids:
+            log.warning(
+                "force_kill_agent: no pid/port listener for agent port %s",
+                self.config.agent_port,
+            )
+            self._proc = None
+            self._clear_pid_file()
+            # Ensure spawn loop can create a new serve if port is free.
+            self._started_by_us = False
+            if self.status != "down":
+                await self._emit("down")
+            return False
+
+        log.warning(
+            "force_kill_agent: killing pids=%s port=%s (attached_or_owned)",
+            pids,
+            self.config.agent_port,
+        )
+        for pid in pids:
+            await self._kill_pid(pid)
+
+        self._proc = None
+        self._clear_pid_file()
+        # After external attach kill, loop must be free to spawn.
+        self._started_by_us = False
+        if self.status != "down":
+            await self._emit("down")
+        return True
+
+    async def force_restart(self, wait_up_timeout: float = 40.0) -> bool:
+        """Kill whatever holds the agent port, then wait until it is open again.
+
+        Relies on the supervisor ``_run_loop`` spawn path after the listener dies.
+        """
+        log.warning(
+            "force_restart: begin port=%s wait_up=%.1fs",
+            self.config.agent_port,
+            wait_up_timeout,
+        )
+        await self.force_kill_agent()
+        # Allow the OS to release the bind before polling / spawn.
+        await asyncio.sleep(0.4)
+        up = await self.wait_until_up(timeout=wait_up_timeout)
+        if up:
+            log.info(
+                "force_restart: agent port %s is up again",
+                self.config.agent_port,
+            )
+        else:
+            log.error(
+                "force_restart: agent port %s still down after %.1fs",
+                self.config.agent_port,
+                wait_up_timeout,
+            )
+        return up
 
     async def wait_until_up(self, timeout: float = 30.0) -> bool:
         deadline = asyncio.get_event_loop().time() + timeout

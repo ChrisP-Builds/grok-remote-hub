@@ -122,8 +122,21 @@
           <span id="turn-strip-cursor" class="term-cursor hidden" aria-hidden="true">▋</span>
         </div>
 
+        <div id="capacity-banner" class="capacity-banner hidden" data-state="idle" aria-live="polite">
+          <span id="capacity-banner-text"></span>
+        </div>
+
+        <div id="context-budget-banner" class="context-budget-banner hidden" data-level="ok" aria-live="polite">
+          <span id="context-budget-banner-text"></span>
+        </div>
+
         <div id="session-banner" class="session-banner hidden" data-mode="none" aria-live="polite">
           <span id="session-banner-text"></span>
+        </div>
+
+        <div id="plan-await-banner" class="plan-await-banner hidden" aria-live="polite">
+          <span class="plan-await-banner-text">Plan awaiting approval</span>
+          <button type="button" id="btn-plan-await-open" class="btn btn-ghost btn-sm">View plan</button>
         </div>
 
         <div class="transcript-wrap">
@@ -318,9 +331,10 @@
         <button type="button" class="btn btn-ghost btn-icon" data-close="modal-plan" aria-label="Close">×</button>
       </header>
       <div id="plan-body" class="plan-body markdown-body" tabindex="0" aria-label="Session plan markdown"></div>
-      <p class="muted modal-help plan-soft-note">Hub soft action: sends as chat text only; does not clear TUI plan-mode gate.</p>
+      <p class="muted modal-help plan-soft-note">Approve clears Hub plan-mode gate (writes plan_mode.json) and continues the session. Not the stock TUI a-key.</p>
       <div class="modal-actions plan-actions">
         <button type="button" id="btn-plan-close" class="btn btn-ghost" data-close="modal-plan">Close</button>
+        <button type="button" id="btn-plan-quit" class="btn btn-ghost">Quit plan</button>
         <button type="button" id="btn-plan-request-changes" class="btn btn-ghost">Request changes</button>
         <button type="button" id="btn-plan-approve" class="btn btn-accent">Approve</button>
       </div>

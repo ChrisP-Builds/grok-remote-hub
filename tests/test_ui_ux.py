@@ -92,6 +92,19 @@ def test_turn_progress_label_running_and_tool() -> None:
     assert "quiet" in quiet
     assert "x" in quiet
 
+    # Contract: quiet + open tools → still "running" (mid-tool wait, not bare quiet).
+    open_tools = turn_progress_label(
+        running=True,
+        quiet=True,
+        tool_open=True,
+        tool="read_file",
+        elapsed_s=45,
+    )
+    assert "running" in open_tools
+    assert "quiet" not in open_tools
+    assert "read_file" in open_tools
+    assert "45s" in open_tools
+
 
 def test_residual_status_and_stale() -> None:
     parts = residual_status_parts(plan_pending=1, plan_failed=2, tool_running=1)
@@ -448,6 +461,29 @@ def test_js_last_prompt_resend_and_optimistic_user() -> None:
     assert "toast-with-action" in css or "toast-action" in css
 
 
+def pick_user_prompt_index(tops: list[float], anchor: float) -> int:
+    """Mirror of app.js pickUserPromptIndex: last index with tops[i] <= anchor, else -1."""
+    idx = -1
+    for i, t in enumerate(tops):
+        if t <= anchor:
+            idx = i
+    return idx
+
+
+def test_pick_user_prompt_index_algorithm() -> None:
+    """Pure contract for scroll-linked sticky user prompt selection."""
+    assert pick_user_prompt_index([], 100) == -1
+    assert pick_user_prompt_index([10, 50, 90], 0) == -1
+    assert pick_user_prompt_index([10, 50, 90], 10) == 0
+    assert pick_user_prompt_index([10, 50, 90], 49) == 0
+    assert pick_user_prompt_index([10, 50, 90], 50) == 1
+    assert pick_user_prompt_index([10, 50, 90], 89) == 1
+    assert pick_user_prompt_index([10, 50, 90], 90) == 2
+    assert pick_user_prompt_index([10, 50, 90], 999) == 2
+    # Equal tops still advance to last qualifying index
+    assert pick_user_prompt_index([20, 20, 40], 20) == 1
+
+
 def test_js_active_user_prompt_sticky() -> None:
     """CLI-like active You: line: sticky pin while turn runs, clear when idle."""
     js = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -462,6 +498,8 @@ def test_js_active_user_prompt_sticky() -> None:
     # CSS sticky pin for active user line
     assert ".term-line.user.active-prompt" in css
     assert "position: sticky" in css
+    assert ".term-line.user.active-prompt .term-body" in css
+    assert "max-height: 30vh" in css
 
     # submitPrompt activates only on !alreadyRunning (not queue-only echoes)
     submit_idx = js.find("function submitPrompt")
@@ -490,6 +528,59 @@ def test_js_active_user_prompt_sticky() -> None:
     assert "clearActiveUserPrompt" in clear_chunk
 
 
+def test_js_scroll_linked_sticky_user_prompt() -> None:
+    """Scroll-linked sticky: pick by anchor; live stickToBottom pins latest user."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    assert "function pickUserPromptIndex" in js
+    assert "function syncStickyUserFromScroll" in js
+    assert "function scheduleStickyUserFromScroll" in js
+    # Algorithm contract (mirrors pick_user_prompt_index)
+    pick_idx = js.find("function pickUserPromptIndex")
+    assert pick_idx >= 0
+    pick_chunk = js[pick_idx : pick_idx + 400]
+    assert "return idx" in pick_chunk
+    assert "tops[i] <= anchorY" in pick_chunk
+
+    sync_idx = js.find("function syncStickyUserFromScroll")
+    assert sync_idx >= 0
+    sync_chunk = js[sync_idx : sync_idx + 1800]
+    assert "stickToBottom" in sync_chunk
+    assert "turnRunningOnSelected" in sync_chunk
+    assert "scrollTop + 56" in sync_chunk
+    assert "pickUserPromptIndex" in sync_chunk
+    assert 'activateUserPrompt(last, { scrollToTop: false })' in sync_chunk or (
+        "scrollToTop: false" in sync_chunk and "activateUserPrompt" in sync_chunk
+    )
+    assert "idx < 0" in sync_chunk  # pin first when above all
+
+    # Scroll listener schedules sticky sync alongside jump-latest
+    assert "scheduleStickyUserFromScroll()" in js
+    scroll_listener = 'els.transcript.addEventListener("scroll"'
+    sl_idx = js.find(scroll_listener)
+    assert sl_idx >= 0
+    sl_chunk = js[sl_idx : sl_idx + 200]
+    assert "updateJumpLatest" in sl_chunk
+    assert "scheduleStickyUserFromScroll" in sl_chunk
+
+    # Wired after history / openSession / jump settle
+    assert "applyHistoryMessages" in js
+    ah_idx = js.find("function applyHistoryMessages")
+    ah_chunk = js[ah_idx : ah_idx + 1200]
+    assert "scheduleStickyUserFromScroll" in ah_chunk
+
+    open_idx = js.find("async function openSession")
+    open_chunk = js[open_idx : open_idx + 5500]
+    assert "scheduleStickyUserFromScroll" in open_chunk
+
+    # Exposed for tests
+    hooks_idx = js.find("window.__hubTestHooks")
+    assert hooks_idx >= 0
+    hooks_chunk = js[hooks_idx : hooks_idx + 2500]
+    assert "pickUserPromptIndex" in hooks_chunk
+    assert "syncStickyUserFromScroll" in hooks_chunk
+
+
 def test_js_attach_session_live_helper() -> None:
     """attachSessionLive shared by openSession and resume-after-restart."""
     js = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -509,7 +600,7 @@ def test_js_attach_session_live_helper() -> None:
     # Status trusts empty server liveTurns (no forever quiet · queue)
     status_idx = js.find('if (type === "status")')
     assert status_idx >= 0
-    status_chunk = js[status_idx : status_idx + 7000]
+    status_chunk = js[status_idx : status_idx + 9000]
     assert "msg.liveTurns.length === 0" in status_chunk
     assert "clearStaleLiveTurns" in status_chunk
     assert "all: true" in status_chunk
@@ -791,7 +882,7 @@ def test_js_status_merge_reapplies_question_for_pending() -> None:
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     status_idx = js.find('if (type === "status")')
     assert status_idx >= 0
-    chunk = js[status_idx : status_idx + 2200]
+    chunk = js[status_idx : status_idx + 3200]
     assert "sessionFlags" in chunk
     assert "pendingQuestionSessions" in chunk
     # force question flag for pending ids after server flags apply
@@ -878,7 +969,7 @@ def test_js_honest_agent_vs_acp_status_pill() -> None:
     css = (STATIC / "app.css").read_text(encoding="utf-8")
     idx = js.find("function updateStatusPill")
     assert idx >= 0
-    chunk = js[idx : idx + 2200]
+    chunk = js[idx : idx + 2800]
     assert "agentProcess" in chunk
     assert "acpConnected" in chunk
     assert "Agent reconnecting" in chunk
@@ -890,10 +981,16 @@ def test_js_honest_agent_vs_acp_status_pill() -> None:
     assert 'stateKey = "acp-hung"' in chunk
     assert "acpHealError" in chunk
     assert "acpHealAttempts" in chunk
+    # Zombie / stale quality (half-open ACP must not show Connected green)
+    assert "acp-zombie" in chunk
+    assert "acpQuality" in chunk
+    assert "ACP stale" in chunk
+    assert "acp-stale" in chunk
     # Status merge carries new fields
     assert "agentProcess: msg.agentProcess" in js
     assert "acpConnected: msg.acpConnected" in js
     assert "agentDetail: msg.agentDetail" in js
+    assert "acpQuality: msg.acpQuality" in js
     assert "acpHealAttempts" in js
     assert "acpHealError: msg.acpHealError" in js
     # Distinct warn style for ACP-only path; danger for hung
@@ -906,6 +1003,155 @@ def test_js_honest_agent_vs_acp_status_pill() -> None:
     assert "agentDetail" in src
     assert "acpHealAttempts" in src
     assert "acpHealError" in src
+    assert "acpQuality" in src
+    assert "acp_liveness_snapshot" in src or "acpLastRecvAgeSeconds" in src
+
+
+def test_restart_agent_admin_api_and_ui() -> None:
+    """In-hub KillAgent-style restart: route, supervisor force_restart, hung pill click."""
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    sup = (ROOT / "hub" / "agent_supervisor.py").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+
+    # API route + handler
+    assert '"/api/admin/restart-agent"' in src or "'/api/admin/restart-agent'" in src
+    assert "handle_restart_agent" in src
+    assert "force_restart" in src
+    assert "_agent_restart_in_progress" in src
+    # Does not restart hub process from this path
+    handler_idx = src.find("async def handle_restart_agent")
+    assert handler_idx >= 0
+    handler = src[handler_idx : handler_idx + 4500]
+    assert "force_clear_turn" in handler
+    assert "force_restart" in handler
+    assert "reconnect" in handler
+    assert "_acp_heal_attempts = 0" in handler
+    assert "sys.exit" not in handler
+    assert "os._exit" not in handler
+
+    # Supervisor force kill + restart (attached listener, not only _started_by_us)
+    assert "async def force_kill_agent" in sup
+    assert "async def force_restart" in sup
+    assert "_pids_listening_on_port" in sup
+    assert "taskkill" in sup
+    fk_idx = sup.find("async def force_kill_agent")
+    fk = sup[fk_idx : fk_idx + 2200]
+    assert "_started_by_us" in fk
+    assert "pid" in fk.lower()
+
+    # UI: POSTs restart-agent; pill clickable when hung / agent-down
+    assert "/api/admin/restart-agent" in js
+    assert "function restartAgentFromPill" in js
+    assert "restartingAgent" in js
+    assert "Restarting agent…" in js or "Restarting agent" in js
+    assert "Agent restarted" in js
+    pill_idx = js.find("function updateStatusPill")
+    pill = js[pill_idx : pill_idx + 3600]
+    assert "status-pill-action" in pill or "status-pill-action" in js
+    assert 'stateKey === "acp-hung"' in js or 'st === "acp-hung"' in js
+    assert 'stateKey === "agent-down"' in js or 'st === "agent-down"' in js
+    assert 'role", "button"' in js or "role=button" in js or 'setAttribute("role", "button")' in js
+    assert "confirm" in js
+    # Click + keyboard on status pill
+    assert "restartAgentFromPill" in js
+    bind_idx = js.find("function bindEvents")
+    bind = js[bind_idx : bind_idx + 900]
+    assert "statusPill" in bind
+    assert "restartAgentFromPill" in bind
+    # CSS affordance
+    assert "status-pill-action" in css
+    assert "is-restarting" in css
+
+
+def test_capacity_banner_structural() -> None:
+    """Capacity banner HTML/CSS/JS for multi-turn quiet / other-session busy."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert 'id="capacity-banner"' in html
+    assert 'id="capacity-banner-text"' in html
+    assert ".capacity-banner" in css
+    assert 'data-state="warn"' in css or '[data-state="warn"]' in css
+    assert "function updateCapacityBanner" in js
+    assert "Working ·" in js
+    assert "waiting first token" in js
+    assert "Busy on other session" in js
+    assert "quiet " in js
+    assert "tool open" in js
+    # Soft language: no "stuck" in capacity banner path
+    cap_idx = js.find("function updateCapacityBanner")
+    assert cap_idx >= 0
+    cap_chunk = js[cap_idx : cap_idx + 3200]
+    assert "stuck" not in cap_chunk.lower()
+    assert "silenceSeconds" in cap_chunk or "silence" in cap_chunk
+    assert "sawUpdate" in cap_chunk
+    assert "tool open" in cap_chunk
+    # Status merge stores capacity / turn silence
+    assert "msg.capacity" in js
+    assert "turnSilenceSeconds" in js
+    assert "updateCapacityBanner" in js
+    # Called from turn strip + status path
+    assert "updateCapacityBanner()" in js
+
+
+def test_open_tool_wait_visibility_structural() -> None:
+    """Mid-tool wait: heartbeat, openedAt, quiet suppress, status-only tool_call_update."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "function tickOpenToolHeartbeat" in js
+    assert "function ensureOpenToolHeartbeat" in js
+    assert "function clearOpenToolHeartbeat" in js
+    assert "function syncOpenToolHeartbeat" in js
+    assert "OPEN_TOOL_HEARTBEAT_MS" in js
+    assert "waiting · " in js
+    assert "dataset.openedAt" in js
+    assert "tool_open" in js
+    assert "hasOpenTools" in js
+    # Quiet suppress when tools open (strip path)
+    strip_idx = js.find("function updateTurnStrip")
+    assert strip_idx >= 0
+    strip_chunk = js[strip_idx : strip_idx + 2800]
+    assert "hasOpenTools" in strip_chunk
+    assert "quietForLabel" in strip_chunk or "tool_open" in strip_chunk
+    assert "syncOpenToolHeartbeat" in strip_chunk
+    # Heartbeat must not fake server activity
+    beat_idx = js.find("function tickOpenToolHeartbeat")
+    beat_chunk = js[beat_idx : beat_idx + 1800]
+    assert "noteTermLineActivity" not in beat_chunk
+    # Status-only tool_call_update always notes activity + scheduleTurnStrip
+    upd_idx = js.find('if (kind === "tool_call_update")')
+    assert upd_idx >= 0
+    upd_chunk = js[upd_idx : upd_idx + 1800]
+    assert "noteTermLineActivity()" in upd_chunk
+    assert "scheduleTurnStrip()" in upd_chunk
+    assert "updateToolLine" in upd_chunk
+
+
+def test_context_budget_banner_structural() -> None:
+    """Soft context budget banner: advisory only, never hard-blocks Send."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert 'id="context-budget-banner"' in html
+    assert 'id="context-budget-banner-text"' in html
+    assert ".context-budget-banner" in css
+    assert "function updateContextBudgetBanner" in js
+    assert "Heavy session" in js
+    assert "use New only to fork" in js
+    assert "msg.contextBudget" in js
+    assert "state.contextBudget" in js
+    assert "updateContextBudgetBanner()" in js
+    # Soft only: banner path must not gate Send / force session-new
+    idx = js.find("function updateContextBudgetBanner")
+    assert idx >= 0
+    end = js.find("\n  function ", idx + 10)
+    chunk = js[idx : end if end > idx else idx + 900]
+    assert "session/new" not in chunk
+    assert "KillAgent" not in chunk
+    assert "btnSend" not in chunk
+    assert "disabled = true" not in chunk
+    # Composer force-unlock still present (Send not hard-gated by budget)
+    assert "forceComposerUnlocked" in js
 
 
 def test_js_history_batch_depth() -> None:
@@ -1206,7 +1452,7 @@ def test_fs_upload_and_attach_contract() -> None:
 
 
 def test_session_plan_viewer_contract() -> None:
-    """PR3: Hub plan viewer route, modal, soft approve inject (not TUI handshake)."""
+    """Hub plan viewer + durable plan_mode.json handshake (not stock TUI a-key)."""
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     css = (STATIC / "app.css").read_text(encoding="utf-8")
@@ -1214,41 +1460,56 @@ def test_session_plan_viewer_contract() -> None:
     plan_view = (ROOT / "hub" / "plan_view.py").read_text(encoding="utf-8")
 
     assert "/api/sessions/{id}/plan" in server
+    assert "/api/sessions/{id}/plan/action" in server
     assert "handle_session_plan" in server
+    assert "handle_session_plan_action" in server
     assert "read_session_plan" in server
+    assert "apply_plan_action" in server
     assert "PlanViewError" in server
 
     assert "def read_session_plan" in plan_view
+    assert "def apply_plan_action" in plan_view
+    assert "def merge_plan_mode_action" in plan_view
+    assert "def write_plan_mode" in plan_view
     assert "plan.md" in plan_view
     assert "plan_mode.json" in plan_view
     assert "awaiting_plan_approval" in plan_view
-    # Read-only: open for read, no writes to plan files
-    assert '.open("w"' not in plan_view
-    assert "path.write_text" not in plan_view
-    assert "atomic_write" not in plan_view
+    # plan.md remains read-only; only plan_mode.json is written (atomic via os.replace)
+    assert "os.replace" in plan_view
+    assert "write_plan_mode" in plan_view
 
     assert 'id="btn-view-plan"' in html
     assert 'id="modal-plan"' in html
     assert 'id="plan-body"' in html
     assert 'id="btn-plan-approve"' in html
     assert 'id="btn-plan-request-changes"' in html
-    assert "Hub soft action: sends as chat text only; does not clear TUI plan-mode gate." in html
+    assert 'id="btn-plan-quit"' in html
+    assert 'id="plan-await-banner"' in html
+    assert (
+        "Approve clears Hub plan-mode gate (writes plan_mode.json) and continues the session. Not the stock TUI a-key."
+        in html
+    )
 
     assert "btnViewPlan" in js
     assert "modalPlan" in js or "modal-plan" in js
     assert "openPlanModal" in js
-    assert "softApprovePlan" in js
-    assert "softRequestPlanChanges" in js
+    assert "hardApprovePlan" in js
+    assert "hardRequestPlanChanges" in js
+    assert "hardQuitPlan" in js
+    assert "postPlanAction" in js
+    assert "/plan/action" in js
     assert "refreshSessionPlan" in js
     assert "/api/sessions/" in js and "/plan" in js
     assert "approved — implement the plan in plan.md" in js
     assert "Request changes to the plan:" in js
-    # Soft inject only — no exit_plan_mode RPC call (comments may mention the name)
+    # No exit_plan_mode RPC call (comments may mention the name)
     assert "exit_plan_mode(" not in js
     assert '"exit_plan_mode"' not in js
     assert "'exit_plan_mode'" not in js
     assert "PLAN_APPROVE_INJECT" in js
     assert "injectPlanComposerText" in js
+    assert "updatePlanAwaitBanner" in js
 
     assert ".modal-card-plan" in css
     assert ".plan-body" in css
+    assert ".plan-await-banner" in css

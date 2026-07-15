@@ -34,7 +34,7 @@ from hub.site_preview import (
     build_preview_plan,
 )
 from hub.history import load_session_history
-from hub.plan_view import PlanViewError, read_session_plan
+from hub.plan_view import PlanViewError, apply_plan_action, read_session_plan
 from hub.projects import ProjectError, create_project, list_project_browse
 from hub.multi_turn import (
     STATUS_IDLE,
@@ -59,7 +59,9 @@ from hub.status_view import (
 )
 from hub.session_signals import read_session_signals, read_signals_file, find_signals_path
 from hub.session_policy import (
+    CONTEXT_SOFT_MESSAGE,
     STUCK_TURN_SECONDS,
+    context_budget_level,
     cwd_key,
     is_hub_resume_candidate,
     is_no_output_error_message,
@@ -68,6 +70,7 @@ from hub.session_policy import (
     resolve_ensure_action,
     save_remote_sessions,
     should_auto_retry_no_output,
+    turn_telemetry,
 )
 from hub.session_tailer import EventDedupe, SessionTailer
 from hub.skills_index import list_skills
@@ -171,6 +174,7 @@ class Hub:
         self._acp_disconnected_at: float | None = None  # monotonic
         self._acp_heal_last_error: str | None = None
         self._acp_heal_in_progress = False
+        self._agent_restart_in_progress = False
         self.clients: set[web.WebSocketResponse] = set()
         self.subscriptions: dict[web.WebSocketResponse, set[str]] = {}
         # Background WS work (prompt/cancel) so the receive loop can process pings.
@@ -183,6 +187,7 @@ class Hub:
             on_connection=self._on_acp_connection,
         )
         self.acp.on_user_question = self._on_user_question
+        self.acp.on_terminal_out = self._on_terminal_out
         self._acp_dedupe = EventDedupe(maxlen=2000)
         self.tailer = SessionTailer(
             config.sessions_root,
@@ -288,16 +293,141 @@ class Hub:
             out.append(d)
         return out
 
-    def status_payload(self) -> dict[str, Any]:
+    def _map_agent_from_live(self) -> tuple[dict[str, str | bool], dict[str, Any]]:
+        """Quality-aware agent status from process flag + ACP wire liveness."""
+        live = self.acp.acp_liveness_snapshot()
         mapped = map_agent_status(
-            self.agent_status == "up", self.acp_connected
+            self.agent_status == "up",
+            self.acp_connected,
+            consecutive_send_failures=int(live.get("consecutive_send_failures") or 0),
+            seconds_since_recv=live.get("seconds_since_recv"),
+            has_pending=bool(live.get("has_pending")),
         )
+        return mapped, live
+
+    def _live_turns_payload(self) -> list[dict[str, Any]]:
+        """liveTurns entries with age/silence/sawUpdate/ttfb telemetry."""
+        now = time.monotonic()
+        out: list[dict[str, Any]] = []
+        for sid in self.acp.turn_session_ids:
+            meta = self.acp.active_turns.get(sid) or {}
+            tel = turn_telemetry(
+                started_at=meta.get("started_at"),
+                last_activity=meta.get("last_activity"),
+                saw_update=bool(meta.get("saw_update")),
+                now=now,
+                first_update_at=meta.get("first_update_at"),
+            )
+            out.append(
+                {
+                    "sessionId": sid,
+                    "state": "running",
+                    "ageSeconds": tel["ageSeconds"],
+                    "silenceSeconds": tel["silenceSeconds"],
+                    "sawUpdate": tel["sawUpdate"],
+                    "ttfbSeconds": tel["ttfbSeconds"],
+                }
+            )
+        return out
+
+    def _primary_turn_telemetry(self) -> dict[str, Any]:
+        """Telemetry for primary (most recent) active turn; empty when idle."""
+        sid = self.acp.turn_session_id
+        if not sid:
+            return {
+                "ageSeconds": None,
+                "silenceSeconds": None,
+                "sawUpdate": False,
+                "ttfbSeconds": None,
+            }
+        meta = self.acp.active_turns.get(sid) or {}
+        return turn_telemetry(
+            started_at=meta.get("started_at"),
+            last_activity=meta.get("last_activity"),
+            saw_update=bool(meta.get("saw_update")),
+            now=time.monotonic(),
+            first_update_at=meta.get("first_update_at"),
+        )
+
+    def _capacity_payload(self) -> dict[str, Any]:
+        busy = list(self.acp.turn_session_ids)
+        return {
+            "activeTurnCount": len(busy),
+            "maxConcurrentTurns": self._max_concurrent_turns,
+            "busySessionIds": busy,
+        }
+
+    def _resolve_loaded_session_dir(self, session_id: str) -> Path | None:
+        """Cheap path resolve for primary loaded session (no full scan).
+
+        Layout: sessions_root / <encoded_cwd> / <session_id> /
+        Best effort only; returns None when unknown.
+        """
+        sid = str(session_id or "").strip()
+        root = Path(self.config.sessions_root)
+        if not sid or not root.is_dir():
+            return None
+        try:
+            for child in root.iterdir():
+                if not child.is_dir():
+                    continue
+                candidate = child / sid
+                if candidate.is_dir():
+                    return candidate
+        except OSError:
+            return None
+        return None
+
+    def _context_budget_payload(self) -> dict[str, Any] | None:
+        """Soft context budget for primary loadedSessionId only. Omit if unknown."""
+        sid = self.acp.loaded_session_id
+        if not sid:
+            return None
+        updates_bytes: int | None = None
+        total_tokens: int | None = None
+        try:
+            session_dir = self._resolve_loaded_session_dir(str(sid))
+            if session_dir is not None:
+                updates = session_dir / "updates.jsonl"
+                if updates.is_file():
+                    updates_bytes = int(updates.stat().st_size)
+                # Optional tokens from signals.json when present (skip if hard).
+                signals_path = session_dir / "signals.json"
+                if signals_path.is_file():
+                    try:
+                        raw = json.loads(signals_path.read_text(encoding="utf-8"))
+                        if isinstance(raw, dict):
+                            tok = raw.get("contextTokensUsed")
+                            if tok is not None and not isinstance(tok, bool):
+                                total_tokens = int(tok)
+                    except (
+                        OSError,
+                        json.JSONDecodeError,
+                        TypeError,
+                        ValueError,
+                        UnicodeError,
+                    ):
+                        pass
+        except OSError:
+            pass
+        level = context_budget_level(
+            updates_bytes=updates_bytes,
+            total_tokens=total_tokens,
+        )
+        return {
+            "level": level,
+            "updatesBytes": updates_bytes,
+            "message": CONTEXT_SOFT_MESSAGE if level == "soft" else "",
+        }
+
+    def status_payload(self) -> dict[str, Any]:
+        mapped, live = self._map_agent_from_live()
         compat = self.compat or {}
         issues = list(compat.get("issues") or [])
-        live_turns = [
-            {"sessionId": sid, "state": "running"}
-            for sid in self.acp.turn_session_ids
-        ]
+        live_turns = self._live_turns_payload()
+        primary_tel = self._primary_turn_telemetry()
+        capacity = self._capacity_payload()
+        context_budget = self._context_budget_payload()
         pending_q = sorted(self.acp.sessions_with_pending_questions())
         session_flags = self._session_flags_map()
         heal_exhausted = (
@@ -305,24 +435,33 @@ class Hub:
             and not bool(mapped["acpConnected"])
             and mapped["agentProcess"] == "up"
         )
-        return {
+        body: dict[str, Any] = {
             "type": "status",
             "agent": mapped["agent"],
             "agentProcess": mapped["agentProcess"],
             "agentDetail": mapped["agentDetail"],
+            "acpQuality": mapped.get("acpQuality", "down"),
             "bind": self.bind_mode,
             "tailscaleIp": self.tailscale_ip,
             "acpConnected": mapped["acpConnected"],
+            "acpConsecutiveSendFailures": int(
+                live.get("consecutive_send_failures") or 0
+            ),
+            "acpLastRecvAgeSeconds": live.get("seconds_since_recv"),
+            "acpLastSendOkAgeSeconds": live.get("seconds_since_send_ok"),
             "acpHealAttempts": self._acp_heal_attempts,
             "acpHealError": self._acp_heal_last_error if heal_exhausted else None,
             "loadedSessionId": self.acp.loaded_session_id,
             "turnRunning": self.acp.turn_running,
             "turnSessionId": self.acp.turn_session_id,
+            "turnAgeSeconds": primary_tel["ageSeconds"],
+            "turnSilenceSeconds": primary_tel["silenceSeconds"],
             "liveTurns": live_turns,
             "pendingQuestionSessions": pending_q,
             "sessionFlags": session_flags,
             "maxConcurrentTurns": self._max_concurrent_turns,
-            "activeTurnCount": len(self.acp.turn_session_ids),
+            "activeTurnCount": capacity["activeTurnCount"],
+            "capacity": capacity,
             "promptQueueLength": self._queue_total_length(),
             "hubVersion": HUB_VERSION,
             "cliVersion": self.cli_version or compat.get("cliVersion"),
@@ -333,6 +472,9 @@ class Hub:
             "bootId": self.boot_id,
             "startedAt": self._started_at_iso(),
         }
+        if context_budget is not None:
+            body["contextBudget"] = context_budget
+        return body
 
     def _started_at_iso(self) -> str:
         return (
@@ -447,6 +589,19 @@ class Hub:
         # Refresh sessionFlags / pendingQuestionSessions so rail shows question.
         await self.broadcast(self.status_payload())
 
+    async def _on_terminal_out(self, payload: dict[str, Any]) -> None:
+        """Fan out hub-hosted terminal/* pump deltas to subscribed UIs."""
+        session_id = payload.get("sessionId")
+        await self.broadcast(
+            {
+                "type": "terminal_out",
+                "terminalId": payload.get("terminalId"),
+                "delta": payload.get("delta") or "",
+                "sessionId": session_id,
+            },
+            session_id=session_id if isinstance(session_id, str) else None,
+        )
+
     async def _ws_user_question_answer(
         self, ws: web.WebSocketResponse, payload: dict[str, Any]
     ) -> None:
@@ -552,7 +707,7 @@ class Hub:
             "user_question",
             "user_question_resolved",
         )
-        scoped = ("acp", "history", "commands", "turn", "system")
+        scoped = ("acp", "history", "commands", "turn", "system", "terminal_out")
         for ws in list(self.clients):
             if session_id:
                 subs = self.subscriptions.get(ws) or set()
@@ -881,6 +1036,7 @@ class Hub:
         app.router.add_get("/api/sessions", self.handle_sessions)
         app.router.add_get("/api/sessions/{id}/history", self.handle_history)
         app.router.add_get("/api/sessions/{id}/plan", self.handle_session_plan)
+        app.router.add_post("/api/sessions/{id}/plan/action", self.handle_session_plan_action)
         app.router.add_get("/api/sessions/{id}/usage", self.handle_session_usage)
         app.router.add_get("/api/usage/plan", self.handle_usage_plan)
         app.router.add_post("/api/sessions", self.handle_new_session)
@@ -890,6 +1046,7 @@ class Hub:
         app.router.add_post("/api/sessions/{id}/attach", self.handle_attach_session)
         app.router.add_post("/api/admin/reset-turn", self.handle_reset_turn)
         app.router.add_post("/api/admin/reconnect-acp", self.handle_reconnect_acp)
+        app.router.add_post("/api/admin/restart-agent", self.handle_restart_agent)
         app.router.add_get("/api/projects", self.handle_projects)
         app.router.add_get("/api/projects/browse", self.handle_projects_browse)
         app.router.add_post("/api/projects", self.handle_create_project)
@@ -1014,12 +1171,16 @@ class Hub:
             return
 
     async def _maybe_heal_acp(self) -> None:
-        """Reconnect ACP when agent process is up but the WebSocket is down.
+        """Reconnect ACP when agent process is up but chat-usable ACP is down.
 
-        Capped attempts with backoff; never spawns extra agent processes.
+        Uses quality-adjusted acpConnected (false for zombie/stale half-dead
+        sockets) so heal runs without a separate quality branch. Capped
+        attempts with backoff; never spawns extra agent processes.
         """
+        mapped, _live = self._map_agent_from_live()
+        chat_acp = bool(mapped["acpConnected"])
         if self._acp_disconnected_at is None and (
-            self.agent_status == "up" and not self.acp_connected
+            self.agent_status == "up" and not chat_acp
         ):
             self._acp_disconnected_at = time.monotonic()
         disconnected_for: float | None = None
@@ -1027,7 +1188,7 @@ class Hub:
             disconnected_for = time.monotonic() - self._acp_disconnected_at
         if not should_attempt_acp_heal(
             agent_process_up=self.agent_status == "up",
-            acp_connected=self.acp_connected,
+            acp_connected=chat_acp,
             heal_in_progress=self._acp_heal_in_progress,
             attempts=self._acp_heal_attempts,
             disconnected_for_s=disconnected_for,
@@ -1076,15 +1237,22 @@ class Hub:
 
     async def handle_health(self, request: web.Request) -> web.Response:
         compat = self.compat or {}
-        mapped = map_agent_status(
-            self.agent_status == "up", self.acp_connected
-        )
-        body = {
+        mapped, live = self._map_agent_from_live()
+        primary_tel = self._primary_turn_telemetry()
+        capacity = self._capacity_payload()
+        context_budget = self._context_budget_payload()
+        body: dict[str, Any] = {
             "ok": True,
             "agent": mapped["agent"],
             "agentProcess": mapped["agentProcess"],
             "agentDetail": mapped["agentDetail"],
+            "acpQuality": mapped.get("acpQuality", "down"),
             "acpConnected": mapped["acpConnected"],
+            "acpConsecutiveSendFailures": int(
+                live.get("consecutive_send_failures") or 0
+            ),
+            "acpLastRecvAgeSeconds": live.get("seconds_since_recv"),
+            "acpLastSendOkAgeSeconds": live.get("seconds_since_send_ok"),
             "acpHealAttempts": self._acp_heal_attempts,
             "acpHealError": (
                 self._acp_heal_last_error
@@ -1103,13 +1271,12 @@ class Hub:
             "loadedSessionId": self.acp.loaded_session_id,
             "turnRunning": self.acp.turn_running,
             "turnSessionId": self.acp.turn_session_id,
-            "turnAgeSeconds": self.acp.turn_age_seconds(),
-            "liveTurns": [
-                {"sessionId": sid, "state": "running"}
-                for sid in self.acp.turn_session_ids
-            ],
-            "activeTurnCount": len(self.acp.turn_session_ids),
+            "turnAgeSeconds": primary_tel["ageSeconds"],
+            "turnSilenceSeconds": primary_tel["silenceSeconds"],
+            "liveTurns": self._live_turns_payload(),
+            "activeTurnCount": capacity["activeTurnCount"],
             "maxConcurrentTurns": self._max_concurrent_turns,
+            "capacity": capacity,
             "pendingQuestionSessions": sorted(
                 self.acp.sessions_with_pending_questions()
             ),
@@ -1121,6 +1288,8 @@ class Hub:
             "bootId": self.boot_id,
             "startedAt": self._started_at_iso(),
         }
+        if context_budget is not None:
+            body["contextBudget"] = context_budget
         return web.json_response(body)
 
     async def handle_compat(self, request: web.Request) -> web.Response:
@@ -1224,6 +1393,109 @@ class Hub:
             body["error"] = err
         return web.json_response(body, status=200 if ok else 502)
 
+    async def handle_restart_agent(self, request: web.Request) -> web.Response:
+        """KillAgent-style agent process restart without restarting the hub.
+
+        Force-clears turns, closes ACP, kills the serve process (including
+        attached listeners), waits for supervisor respawn, reconnects ACP.
+        """
+        if self._agent_restart_in_progress:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": "agent restart already in progress",
+                    "acpConnected": self.acp_connected,
+                    "agentProcess": self.agent_status,
+                },
+                status=409,
+            )
+        self._agent_restart_in_progress = True
+        log.warning("Admin restart-agent: begin (KillAgent-style, hub stays up)")
+        err: str | None = None
+        try:
+            # 1) Drop in-flight turns so clients unlock after kill.
+            try:
+                sids = list(self.acp.turn_session_ids)
+                cleared = self.acp.force_clear_turn(
+                    "admin POST /api/admin/restart-agent"
+                )
+                if cleared:
+                    self._last_broadcast_force_clear = self.acp.last_force_clear_reason
+                for sid in sids:
+                    if sid:
+                        await self.broadcast(
+                            {
+                                "type": "turn",
+                                "sessionId": sid,
+                                "state": "idle",
+                                "error": "Agent restart — turn stopped",
+                            },
+                            session_id=sid,
+                        )
+            except Exception as exc:
+                log.warning("restart-agent: force_clear_turn failed: %s", exc)
+
+            # 2) Close ACP websocket before killing the process.
+            try:
+                await self.acp._close_ws()
+            except Exception as exc:
+                log.warning("restart-agent: ACP close failed: %s", exc)
+
+            # 3) Reset heal state so reconnect budget is fresh after spawn.
+            self._acp_heal_attempts = 0
+            self._acp_heal_last_error = None
+            self._acp_disconnected_at = None
+            self._acp_heal_in_progress = False
+
+            # 4) Force-kill listener / pid and wait for supervisor respawn.
+            up = await self.supervisor.force_restart(wait_up_timeout=40.0)
+            if not up:
+                err = "agent process did not come back up within timeout"
+                log.error("restart-agent: %s", err)
+                await self.broadcast(self.status_payload())
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": err,
+                        "acpConnected": bool(self.acp_connected),
+                        "agentProcess": self.agent_status,
+                    },
+                    status=504,
+                )
+
+            # 5) Reconnect ACP to the new serve process.
+            try:
+                await self.acp.reconnect(timeout=15.0)
+            except Exception as exc:
+                err = f"agent up but ACP reconnect failed: {exc}"
+                self._acp_heal_last_error = str(exc)
+                if self._acp_disconnected_at is None:
+                    self._acp_disconnected_at = time.monotonic()
+                log.warning("restart-agent: %s", err)
+
+            ok = bool(self.acp_connected) and self.agent_status == "up"
+            if ok:
+                self._acp_heal_attempts = 0
+                self._acp_heal_last_error = None
+                self._acp_disconnected_at = None
+                log.info("restart-agent: success agentProcess=up acpConnected=true")
+            else:
+                if not err:
+                    err = "agent up but ACP not connected"
+                log.warning("restart-agent: partial failure: %s", err)
+
+            await self.broadcast(self.status_payload())
+            body: dict[str, Any] = {
+                "ok": ok,
+                "acpConnected": bool(self.acp_connected),
+                "agentProcess": self.agent_status,
+            }
+            if err and not ok:
+                body["error"] = err
+            return web.json_response(body, status=200 if ok else 502)
+        finally:
+            self._agent_restart_in_progress = False
+
     async def handle_sessions(self, request: web.Request) -> web.Response:
         return web.json_response({"items": self._sessions_items_with_status()})
 
@@ -1292,7 +1564,7 @@ class Hub:
         return web.json_response({"sessionId": session_id, "messages": messages})
 
     async def handle_session_plan(self, request: web.Request) -> web.Response:
-        """Read-only plan.md + plan_mode.json for Hub plan viewer (no TUI handshake)."""
+        """Read plan.md + plan_mode.json for Hub plan viewer."""
         session_id = request.match_info["id"]
         session = find_session(self.config.sessions_root, session_id)
         path = session.path if session else None
@@ -1305,6 +1577,48 @@ class Hub:
             )
         except PlanViewError as exc:
             return web.json_response({"error": exc.message}, status=exc.status)
+        return web.json_response(payload)
+
+    async def handle_session_plan_action(self, request: web.Request) -> web.Response:
+        """Write plan_mode.json via Hub handshake (approve / request_changes / quit)."""
+        session_id = request.match_info["id"]
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+        if not isinstance(body, dict):
+            return web.json_response({"error": "body must be a JSON object"}, status=400)
+        action = body.get("action")
+        if not isinstance(action, str) or not action.strip():
+            return web.json_response(
+                {"error": "action required (approve|request_changes|quit)"},
+                status=400,
+            )
+        session = find_session(self.config.sessions_root, session_id)
+        path = session.path if session else None
+        try:
+            payload = await asyncio.to_thread(
+                apply_plan_action,
+                self.config.sessions_root,
+                session_id,
+                action.strip(),
+                path,
+            )
+        except PlanViewError as exc:
+            return web.json_response({"error": exc.message}, status=exc.status)
+        try:
+            await self.broadcast(
+                {
+                    "type": "plan",
+                    "sessionId": session_id,
+                    "awaitingApproval": payload.get("awaitingApproval"),
+                    "state": payload.get("state"),
+                    "action": payload.get("action"),
+                },
+                session_id=session_id,
+            )
+        except Exception:
+            log.debug("plan action broadcast failed", exc_info=True)
         return web.json_response(payload)
 
     async def handle_session_usage(self, request: web.Request) -> web.Response:

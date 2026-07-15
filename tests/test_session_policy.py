@@ -7,10 +7,14 @@ from pathlib import Path
 from hub.session_policy import (
     CLIENT_STALL_UNLOCK_SECONDS,
     CLIENT_STALL_WARN_SECONDS,
+    CONTEXT_SOFT_MESSAGE,
+    CONTEXT_SOFT_TOKENS,
+    CONTEXT_SOFT_UPDATES_BYTES,
     MAX_TURN_SECONDS,
     MID_TURN_STALL_SECONDS,
     NO_OUTPUT_SECONDS,
     STUCK_TURN_SECONDS,
+    context_budget_level,
     cwd_key,
     entry_requires_resume_choice,
     is_hub_resume_candidate,
@@ -26,6 +30,7 @@ from hub.session_policy import (
     sessions_matching_cwd,
     should_auto_retry_no_output,
     should_force_clear_turn,
+    turn_telemetry,
 )
 
 
@@ -36,6 +41,73 @@ def test_tui_aligned_timeout_constants() -> None:
     assert STUCK_TURN_SECONDS == 1800.0
     assert CLIENT_STALL_WARN_SECONDS == 120.0
     assert CLIENT_STALL_UNLOCK_SECONDS == 0
+
+
+def test_turn_telemetry_before_first_update() -> None:
+    tel = turn_telemetry(
+        started_at=100.0,
+        last_activity=100.0,
+        saw_update=False,
+        now=108.0,
+        first_update_at=None,
+    )
+    assert tel["ageSeconds"] == 8.0
+    assert tel["silenceSeconds"] == 8.0
+    assert tel["sawUpdate"] is False
+    assert tel["ttfbSeconds"] is None
+
+
+def test_turn_telemetry_silence_after_activity() -> None:
+    tel = turn_telemetry(
+        started_at=100.0,
+        last_activity=120.0,
+        saw_update=True,
+        now=135.0,
+        first_update_at=105.0,
+    )
+    assert tel["ageSeconds"] == 35.0
+    assert tel["silenceSeconds"] == 15.0
+    assert tel["sawUpdate"] is True
+    # TTFB frozen at first_update_at, not last_activity
+    assert tel["ttfbSeconds"] == 5.0
+
+
+def test_turn_telemetry_ttfb_fallback_without_first_update_at() -> None:
+    tel = turn_telemetry(
+        started_at=50.0,
+        last_activity=53.5,
+        saw_update=True,
+        now=60.0,
+        first_update_at=None,
+    )
+    assert tel["ttfbSeconds"] == 3.5
+    assert tel["ageSeconds"] == 10.0
+    assert tel["silenceSeconds"] == 6.5
+
+
+def test_turn_telemetry_missing_start() -> None:
+    tel = turn_telemetry(
+        started_at=None,
+        last_activity=None,
+        saw_update=False,
+        now=10.0,
+    )
+    assert tel["ageSeconds"] is None
+    assert tel["silenceSeconds"] is None
+    assert tel["ttfbSeconds"] is None
+    assert tel["sawUpdate"] is False
+
+
+def test_turn_telemetry_no_activity_stamp_uses_age_for_silence() -> None:
+    tel = turn_telemetry(
+        started_at=10.0,
+        last_activity=None,
+        saw_update=False,
+        now=22.0,
+    )
+    assert tel["ageSeconds"] == 12.0
+    assert tel["silenceSeconds"] == 12.0
+    assert tel["ttfbSeconds"] is None
 
 
 def test_needs_fresh_when_empty_id() -> None:
@@ -747,3 +819,47 @@ def test_client_stall_never_auto_unlocks() -> None:
     """Client soft-warn only; server owns unlock (CLIENT_STALL_UNLOCK_SECONDS=0)."""
     assert CLIENT_STALL_WARN_SECONDS == 120
     assert CLIENT_STALL_UNLOCK_SECONDS == 0
+
+
+def test_context_budget_level_defaults_ok() -> None:
+    assert CONTEXT_SOFT_UPDATES_BYTES == 6_000_000
+    assert CONTEXT_SOFT_TOKENS == 80_000
+    assert "Heavy session" in CONTEXT_SOFT_MESSAGE
+    assert context_budget_level() == "ok"
+    assert context_budget_level(updates_bytes=None, total_tokens=None) == "ok"
+    assert context_budget_level(updates_bytes=0) == "ok"
+    assert context_budget_level(updates_bytes=CONTEXT_SOFT_UPDATES_BYTES) == "ok"
+    assert context_budget_level(total_tokens=CONTEXT_SOFT_TOKENS) == "ok"
+
+
+def test_context_budget_level_soft_on_updates_bytes() -> None:
+    assert (
+        context_budget_level(updates_bytes=CONTEXT_SOFT_UPDATES_BYTES + 1) == "soft"
+    )
+    assert context_budget_level(updates_bytes=10_000_000) == "soft"
+    # tokens under threshold alone stay ok
+    assert context_budget_level(total_tokens=CONTEXT_SOFT_TOKENS - 1) == "ok"
+
+
+def test_context_budget_level_soft_on_tokens() -> None:
+    assert context_budget_level(total_tokens=CONTEXT_SOFT_TOKENS + 1) == "soft"
+    assert context_budget_level(total_tokens=200_000) == "soft"
+    # either signal trips soft
+    assert (
+        context_budget_level(
+            updates_bytes=100,
+            total_tokens=CONTEXT_SOFT_TOKENS + 5,
+        )
+        == "soft"
+    )
+
+
+def test_context_budget_level_custom_thresholds() -> None:
+    assert (
+        context_budget_level(updates_bytes=100, soft_updates_bytes=50) == "soft"
+    )
+    assert (
+        context_budget_level(updates_bytes=50, soft_updates_bytes=50) == "ok"
+    )
+    assert context_budget_level(total_tokens=10, soft_tokens=9) == "soft"
+    assert context_budget_level(total_tokens=9, soft_tokens=9) == "ok"

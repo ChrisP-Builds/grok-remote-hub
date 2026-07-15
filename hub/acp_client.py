@@ -78,7 +78,8 @@ class AcpClient:
         self.connected = False
         self.loaded_session_id: str | None = None
         self.available_commands: list[dict[str, Any]] = []
-        # session_id -> {started_at, last_activity, saw_update, cwd_key, prompt_req_id?}
+        # session_id -> {started_at, last_activity, saw_update, first_update_at,
+        #                cwd_key, prompt_req_id?}
         self.active_turns: dict[str, dict[str, Any]] = {}
         self._stall_watchdogs: dict[str, asyncio.Task] = {}
         # Last watchdog/admin force-clear (Hub may broadcast idle from these).
@@ -96,6 +97,70 @@ class AcpClient:
         self._pending_user_question_sessions: dict[str, str] = {}
         # Hub sets this to fan out user_question events to the web UI.
         self.on_user_question: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None
+        # Hub sets this to fan out live terminal/* pump deltas to the web UI.
+        self.on_terminal_out: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None
+        # Wire terminal pump → hub fanout
+        self._terminals.on_output = self._on_terminal_output_chunk
+        # ACP wire liveness (half-open / zombie detection for status quality).
+        self.last_send_ok_at: float | None = None
+        self.last_recv_at: float | None = None
+        self.last_send_error_at: float | None = None
+        self.consecutive_send_failures: int = 0
+        self._force_unhealthy_scheduled: bool = False
+
+    def acp_liveness_snapshot(self) -> dict[str, Any]:
+        """Ages (seconds or None) and pending-RPC flag for status quality mapping."""
+        now = time.monotonic()
+
+        def _age(ts: float | None) -> float | None:
+            if ts is None:
+                return None
+            return now - float(ts)
+
+        return {
+            "consecutive_send_failures": int(self.consecutive_send_failures),
+            "seconds_since_send_ok": _age(self.last_send_ok_at),
+            "seconds_since_recv": _age(self.last_recv_at),
+            "seconds_since_send_error": _age(self.last_send_error_at),
+            "has_pending": bool(self._pending),
+        }
+
+    def _schedule_force_unhealthy(self) -> None:
+        """Close half-dead WS so maintain reconnects; never await under send lock."""
+        if self._force_unhealthy_scheduled:
+            return
+        self._force_unhealthy_scheduled = True
+        # Immediate false so status is not chat-ready while close is scheduled.
+        # Notify hub now: _close_ws only calls on_connection when connected was True.
+        was_connected = self.connected
+        self.connected = False
+        if was_connected and self.on_connection is not None:
+            try:
+                result = self.on_connection(False)
+                if asyncio.iscoroutine(result):
+                    asyncio.get_running_loop().create_task(
+                        result, name="acp-zombie-on-conn"
+                    )
+            except Exception:
+                log.debug("ACP zombie on_connection notify failed", exc_info=True)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._force_unhealthy_scheduled = False
+            return
+        loop.create_task(self._force_unhealthy(), name="acp-force-unhealthy")
+
+    async def _force_unhealthy(self) -> None:
+        try:
+            log.warning(
+                "ACP unhealthy after %s consecutive send failures; closing WS",
+                self.consecutive_send_failures,
+            )
+            await self._close_ws()
+        except Exception:
+            log.debug("ACP force unhealthy close failed", exc_info=True)
+        finally:
+            self._force_unhealthy_scheduled = False
 
     # --- back-compat properties over multi-session active_turns ---
 
@@ -137,6 +202,7 @@ class AcpClient:
                 "started_at": now,
                 "last_activity": now,
                 "saw_update": False,
+                "first_update_at": None,
                 "cwd_key": "",
             }
 
@@ -338,16 +404,25 @@ class AcpClient:
         self._cancel_all_stall_watchdogs()
 
     def note_activity(self, session_id: str | None = None) -> None:
-        """Record ACP session/update activity for hang detection."""
+        """Record ACP session/update activity for hang detection.
+
+        First activity freezes first_update_at (TTFB) when saw_update becomes true.
+        """
         now = time.monotonic()
+
+        def _touch(sid: str) -> None:
+            meta = self.active_turns[sid]
+            meta["last_activity"] = now
+            if not meta.get("saw_update") and meta.get("first_update_at") is None:
+                meta["first_update_at"] = now
+            meta["saw_update"] = True
+
         if session_id and session_id in self.active_turns:
-            self.active_turns[session_id]["last_activity"] = now
-            self.active_turns[session_id]["saw_update"] = True
+            _touch(session_id)
             return
         # Fan out to all active turns when session unknown (tool RPCs, etc.)
         for sid in list(self.active_turns):
-            self.active_turns[sid]["last_activity"] = now
-            self.active_turns[sid]["saw_update"] = True
+            _touch(sid)
 
     def _url(self) -> str:
         key = quote(self.secret, safe="")
@@ -380,6 +455,15 @@ class AcpClient:
             await self._close_ws()
         except Exception as exc:
             log.warning("ACP reconnect close failed: %s", exc)
+        # If maintain died (e.g. prior cancel race) or was never started, revive it.
+        if self._maintain_task is None or self._maintain_task.done():
+            if not self._stop.is_set():
+                log.warning(
+                    "ACP maintain not running; restarting loop for reconnect"
+                )
+                self._maintain_task = asyncio.create_task(
+                    self._maintain(), name="acp-client"
+                )
         deadline = time.monotonic() + max(0.5, float(timeout))
         # If already mid-reconnect, wait for the next connected edge.
         while time.monotonic() < deadline:
@@ -397,13 +481,7 @@ class AcpClient:
                 await result
 
     async def _close_ws(self) -> None:
-        if self._recv_task and not self._recv_task.done():
-            self._recv_task.cancel()
-            try:
-                await self._recv_task
-            except asyncio.CancelledError:
-                pass
-        self._recv_task = None
+        # Close socket first so recv can exit cleanly; cancel only if stuck.
         ws = self._ws
         self._ws = None
         for fut in list(self._pending.values()):
@@ -420,6 +498,14 @@ class AcpClient:
             try:
                 await ws.close()
             except Exception:
+                pass
+        recv = self._recv_task
+        self._recv_task = None
+        if recv is not None and not recv.done():
+            recv.cancel()
+            try:
+                await recv
+            except asyncio.CancelledError:
                 pass
         if self.connected:
             await self._set_connected(False)
@@ -459,7 +545,20 @@ class AcpClient:
                     # Stay until recv ends or stop
                     await self._recv_task
             except asyncio.CancelledError:
-                raise
+                # Re-raise only when this task is stopping/cancelled.
+                # Awaiting a cancelled recv (reconnect path) must not kill maintain.
+                if self._stop.is_set():
+                    raise
+                cur = asyncio.current_task()
+                cancelling = 0
+                if cur is not None and hasattr(cur, "cancelling"):
+                    try:
+                        cancelling = int(cur.cancelling())  # type: ignore[attr-defined]
+                    except Exception:
+                        cancelling = 0
+                if cancelling:
+                    raise
+                log.info("ACP recv cancelled (reconnect); maintain continues")
             except Exception as exc:
                 log.warning("ACP connection error: %s", exc)
             finally:
@@ -519,6 +618,9 @@ class AcpClient:
 
         if not isinstance(msg, dict):
             return
+
+        # Any successfully parsed inbound message counts as recv liveness.
+        self.last_recv_at = time.monotonic()
 
         msg_id = msg.get("id")
         method = msg.get("method")
@@ -801,6 +903,33 @@ class AcpClient:
                 self.active_turns.pop(only, None)
                 self._cancel_stall_watchdog(only)
 
+    def _on_terminal_output_chunk(
+        self, terminal_id: str, delta: str, session_id: str | None
+    ) -> None:
+        """TerminalManager on_output: note activity + fan out to hub UI."""
+        if not delta:
+            return
+        sid = session_id or self.turn_session_id or self.loaded_session_id
+        sid_str = str(sid) if sid else None
+        self.note_activity(sid_str)
+        if not self.on_terminal_out:
+            return
+        payload: dict[str, Any] = {
+            "terminalId": terminal_id,
+            "delta": delta,
+            "sessionId": sid_str,
+        }
+        try:
+            result = self.on_terminal_out(payload)
+            if asyncio.iscoroutine(result):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    return
+                loop.create_task(result, name=f"hub-term-out-{terminal_id[:8]}")
+        except Exception:
+            log.debug("on_terminal_out failed id=%s", terminal_id, exc_info=True)
+
     async def _fanout(self, msg: dict[str, Any]) -> None:
         if not self.on_message:
             return
@@ -812,7 +941,16 @@ class AcpClient:
         ws = self._ws
         if ws is None:
             raise ConnectionError("ACP not connected")
-        await ws.send(json.dumps(payload))
+        try:
+            await ws.send(json.dumps(payload))
+        except Exception:
+            self.consecutive_send_failures += 1
+            self.last_send_error_at = time.monotonic()
+            if self.consecutive_send_failures >= 2:
+                self._schedule_force_unhealthy()
+            raise
+        self.last_send_ok_at = time.monotonic()
+        self.consecutive_send_failures = 0
 
     async def request(
         self,
@@ -925,6 +1063,7 @@ class AcpClient:
             "started_at": now,
             "last_activity": now,
             "saw_update": False,
+            "first_update_at": None,
             "cwd_key": str(cwd_key or ""),
         }
 

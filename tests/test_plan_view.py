@@ -13,6 +13,8 @@ from hub.plan_view import (
     PLAN_MODE_NAME,
     PlanViewError,
     _safe_plan_file,
+    apply_plan_action,
+    merge_plan_mode_action,
     read_session_plan,
 )
 
@@ -170,3 +172,87 @@ def test_plan_mode_false_awaiting(tmp_path: Path) -> None:
     out = read_session_plan(root, sid, session_path=session_dir)
     assert out["awaitingApproval"] is False
     assert out["state"] == "Idle"
+
+
+def test_merge_approve_clears_awaiting_preserves_keys() -> None:
+    existing = {
+        "awaiting_plan_approval": True,
+        "state": "Active",
+        "extra_key": 42,
+        "nested": {"a": 1},
+    }
+    out = merge_plan_mode_action(existing, "approve")
+    assert out["awaiting_plan_approval"] is False
+    assert out["state"] == "Inactive"
+    assert out["extra_key"] == 42
+    assert out["nested"] == {"a": 1}
+    # Input not mutated
+    assert existing["awaiting_plan_approval"] is True
+    assert existing["state"] == "Active"
+
+
+def test_merge_request_changes_stays_active() -> None:
+    existing = {"awaiting_plan_approval": True, "state": "Active", "keep": "yes"}
+    out = merge_plan_mode_action(existing, "request_changes")
+    assert out["awaiting_plan_approval"] is False
+    assert out["state"] == "Active"
+    assert out["keep"] == "yes"
+
+
+def test_merge_quit() -> None:
+    existing = {"awaiting_plan_approval": True, "state": "Active", "x": 1}
+    out = merge_plan_mode_action(existing, "quit")
+    assert out["awaiting_plan_approval"] is False
+    assert out["state"] == "Inactive"
+    assert out["x"] == 1
+
+
+def test_merge_invalid_action() -> None:
+    with pytest.raises(PlanViewError) as ei:
+        merge_plan_mode_action({"awaiting_plan_approval": True}, "nope")
+    assert ei.value.status == 400
+    with pytest.raises(PlanViewError) as ei2:
+        merge_plan_mode_action(None, "")
+    assert ei2.value.status == 400
+
+
+def test_apply_plan_action_roundtrip(tmp_path: Path) -> None:
+    root = tmp_path / "sessions"
+    root.mkdir()
+    sid = "11111111-bbbb-cccc-dddd-eeeeeeeeeeee"
+    session_dir = _session_dir(tmp_path, sid)
+    (session_dir / PLAN_MD_NAME).write_text("# Plan\n\ndo it\n", encoding="utf-8")
+    (session_dir / PLAN_MODE_NAME).write_text(
+        json.dumps(
+            {
+                "awaiting_plan_approval": True,
+                "state": "Active",
+                "custom": "kept",
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = read_session_plan(root, sid, session_path=session_dir)
+    assert before["awaitingApproval"] is True
+    assert before["state"] == "Active"
+
+    out = apply_plan_action(root, sid, "approve", session_path=session_dir)
+    assert out["action"] == "approve"
+    assert out["awaitingApproval"] is False
+    assert out["state"] == "Inactive"
+    assert out["exists"] is True
+    assert "do it" in out["markdown"]
+    assert isinstance(out["planMode"], dict)
+    assert out["planMode"]["awaiting_plan_approval"] is False
+    assert out["planMode"]["state"] == "Inactive"
+    assert out["planMode"]["custom"] == "kept"
+
+    # Disk durable
+    disk = json.loads((session_dir / PLAN_MODE_NAME).read_text(encoding="utf-8"))
+    assert disk["awaiting_plan_approval"] is False
+    assert disk["state"] == "Inactive"
+    assert disk["custom"] == "kept"
+
+    again = read_session_plan(root, sid, session_path=session_dir)
+    assert again["awaitingApproval"] is False
+    assert again["state"] == "Inactive"
