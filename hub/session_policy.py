@@ -23,6 +23,83 @@ STUCK_TURN_SECONDS = 1800.0
 CLIENT_STALL_WARN_SECONDS = 120.0
 CLIENT_STALL_UNLOCK_SECONDS = 0  # 0 = disabled auto-unlock
 
+# Soft context budget (same-id continuity). Soft banner only; never hard-block Send.
+CONTEXT_SOFT_UPDATES_BYTES = 6_000_000  # ~6MB updates.jsonl
+CONTEXT_SOFT_TOKENS = 80_000  # if totalTokens known
+CONTEXT_SOFT_MESSAGE = (
+    "Heavy session — responses may be slow. Prefer compact/continue same thread; "
+    "use New only to fork."
+)
+
+
+def context_budget_level(
+    *,
+    updates_bytes: int | None = None,
+    total_tokens: int | None = None,
+    soft_updates_bytes: int = CONTEXT_SOFT_UPDATES_BYTES,
+    soft_tokens: int = CONTEXT_SOFT_TOKENS,
+) -> str:
+    """Return 'ok' | 'soft'. soft if either signal exceeds soft threshold when provided."""
+    if updates_bytes is not None:
+        try:
+            if int(updates_bytes) > int(soft_updates_bytes):
+                return "soft"
+        except (TypeError, ValueError):
+            pass
+    if total_tokens is not None:
+        try:
+            if int(total_tokens) > int(soft_tokens):
+                return "soft"
+        except (TypeError, ValueError):
+            pass
+    return "ok"
+
+
+def turn_telemetry(
+    *,
+    started_at: float | None,
+    last_activity: float | None,
+    saw_update: bool,
+    now: float,
+    first_update_at: float | None = None,
+) -> dict[str, Any]:
+    """Return ageSeconds, silenceSeconds, sawUpdate, ttfbSeconds for a live turn.
+
+    - age = now - started_at (None if no start)
+    - silence = now - last_activity, or age if no activity stamp
+    - ttfb = first_update_at - started_at when first_update_at set;
+      else last_activity - started_at when saw_update; else None
+    """
+    saw = bool(saw_update)
+    age: float | None = None
+    silence: float | None = None
+    ttfb: float | None = None
+    if started_at is not None:
+        start = float(started_at)
+        age = float(now) - start
+        if age < 0:
+            age = 0.0
+        if last_activity is not None:
+            silence = float(now) - float(last_activity)
+            if silence < 0:
+                silence = 0.0
+        else:
+            silence = age
+        if first_update_at is not None:
+            ttfb = float(first_update_at) - start
+            if ttfb < 0:
+                ttfb = 0.0
+        elif saw and last_activity is not None:
+            ttfb = float(last_activity) - start
+            if ttfb < 0:
+                ttfb = 0.0
+    return {
+        "ageSeconds": age,
+        "silenceSeconds": silence,
+        "sawUpdate": saw,
+        "ttfbSeconds": ttfb,
+    }
+
 
 def should_force_clear_turn(
     saw_update: bool,

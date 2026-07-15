@@ -1,4 +1,4 @@
-"""Read session plan.md + plan_mode.json for Hub plan viewer (read-only)."""
+"""Read session plan.md + plan_mode.json; Hub plan actions write plan_mode.json (disk handshake)."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ PLAN_MD_NAME = "plan.md"
 PLAN_MODE_NAME = "plan_mode.json"
 # Soft cap for plan.md text (~1.5 MiB). Larger files are truncated for the viewer.
 PLAN_MD_MAX_BYTES = 1_500_000
+
+PLAN_ACTIONS = frozenset({"approve", "request_changes", "quit"})
 
 
 class PlanViewError(Exception):
@@ -138,6 +140,76 @@ def _plan_state(plan_mode: dict[str, Any] | None) -> str | None:
         if text:
             return text
     return None
+
+
+def merge_plan_mode_action(
+    existing: dict[str, Any] | None,
+    action: str,
+) -> dict[str, Any]:
+    """Merge action into plan_mode dict; preserve unknown keys.
+
+    approve: awaiting_plan_approval=False, state=Inactive
+    request_changes: awaiting_plan_approval=False, state=Active (agent can revise plan.md)
+    quit: awaiting_plan_approval=False, state=Inactive
+    Raises PlanViewError 400 on invalid action.
+    """
+    act = (action or "").strip().lower()
+    if act not in PLAN_ACTIONS:
+        raise PlanViewError(
+            f"invalid plan action (expected one of: {', '.join(sorted(PLAN_ACTIONS))})",
+            400,
+        )
+    out: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+    if act == "approve":
+        out["awaiting_plan_approval"] = False
+        out["state"] = "Inactive"
+    elif act == "request_changes":
+        out["awaiting_plan_approval"] = False
+        out["state"] = "Active"
+    else:  # quit
+        out["awaiting_plan_approval"] = False
+        out["state"] = "Inactive"
+    return out
+
+
+def write_plan_mode(session_dir: Path, data: dict[str, Any]) -> None:
+    """Atomic write plan_mode.json under session_dir via _safe_plan_file."""
+    if not isinstance(data, dict):
+        raise PlanViewError("plan_mode data must be an object", 400)
+    path = _safe_plan_file(Path(session_dir), PLAN_MODE_NAME)
+    text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    tmp = path.with_suffix(path.suffix + ".hubtmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        try:
+            path.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            raise PlanViewError(f"failed to write plan_mode.json: {exc}", 500) from exc
+
+
+def apply_plan_action(
+    sessions_root: Path,
+    session_id: str,
+    action: str,
+    session_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Resolve session dir, merge mode, write, return read_session_plan payload + action applied."""
+    sid = (session_id or "").strip()
+    session_dir = _resolve_session_dir(sessions_root, sid, session_path=session_path)
+    mode_path = _safe_plan_file(session_dir, PLAN_MODE_NAME)
+    existing = _parse_plan_mode(mode_path)
+    merged = merge_plan_mode_action(existing, action)
+    write_plan_mode(session_dir, merged)
+    payload = read_session_plan(sessions_root, sid, session_path=session_dir)
+    payload["action"] = (action or "").strip().lower()
+    return payload
 
 
 def read_session_plan(

@@ -6,12 +6,63 @@ import asyncio
 import logging
 import os
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 log = logging.getLogger("hub.acp.terminal")
 
 DEFAULT_OUTPUT_BYTE_LIMIT = 1_000_000
 WAIT_EXIT_CAP_SECONDS = 120.0
+
+# (terminal_id, delta_text, session_id | None) — sync or async ok
+OutputCallback = Callable[[str, str, str | None], Any]
+
+
+def utf8_delta(chunk: bytes, carry: bytearray) -> str:
+    """Decode *chunk* as UTF-8, carrying incomplete trailing sequences.
+
+    Mutates *carry* in place: leftover incomplete bytes stay for the next call.
+    Incomplete lead bytes at the end of the buffer are held back; invalid
+    sequences decode with errors=\"replace\".
+    """
+    if not chunk and not carry:
+        return ""
+    buf = bytearray(carry)
+    buf.extend(chunk)
+    carry.clear()
+    if not buf:
+        return ""
+    # Hold back a trailing incomplete multi-byte sequence (1–3 bytes).
+    n = len(buf)
+    hold = 0
+    # Check last 1–3 bytes for an incomplete UTF-8 start.
+    for i in range(1, min(4, n + 1)):
+        b = buf[n - i]
+        if (b & 0x80) == 0:
+            # ASCII — complete; nothing after this is incomplete from prior.
+            break
+        if (b & 0xC0) == 0x80:
+            # Continuation — keep scanning left.
+            continue
+        # Leading byte: expected total length
+        if (b & 0xE0) == 0xC0:
+            need = 2
+        elif (b & 0xF0) == 0xE0:
+            need = 3
+        elif (b & 0xF8) == 0xF0:
+            need = 4
+        else:
+            # Invalid lead; let errors=replace handle it.
+            break
+        if i < need:
+            hold = i
+        break
+    if hold:
+        carry.extend(buf[n - hold :])
+        del buf[n - hold :]
+    if not buf:
+        return ""
+    return bytes(buf).decode("utf-8", errors="replace")
 
 
 class ManagedTerminal:
@@ -20,10 +71,14 @@ class ManagedTerminal:
         terminal_id: str,
         process: asyncio.subprocess.Process,
         output_byte_limit: int,
+        session_id: str | None = None,
+        on_output: OutputCallback | None = None,
     ):
         self.terminal_id = terminal_id
         self.process = process
         self.output_byte_limit = max(0, output_byte_limit)
+        self.session_id = session_id
+        self._on_output = on_output
         self._buf = bytearray()
         self._truncated = False
         self._lock = asyncio.Lock()
@@ -31,6 +86,7 @@ class ManagedTerminal:
         self._signal: str | None = None
         self._done = asyncio.Event()
         self._pump_task: asyncio.Task | None = None
+        self._decode_carry = bytearray()
 
     def start_pump(self) -> None:
         self._pump_task = asyncio.create_task(self._pump(), name=f"term-pump-{self.terminal_id[:8]}")
@@ -45,12 +101,21 @@ class ManagedTerminal:
                     break
                 async with self._lock:
                     self._append(chunk)
+                    delta = utf8_delta(chunk, self._decode_carry)
+                if delta:
+                    self._emit_output(delta)
             rc = await proc.wait()
             self._exit_code = int(rc) if rc is not None else None
             if rc and rc < 0:
                 # POSIX signal encoding when available
                 self._signal = str(-rc)
                 self._exit_code = None
+            # Flush any remaining incomplete sequence as replacement char.
+            if self._decode_carry:
+                leftover = bytes(self._decode_carry).decode("utf-8", errors="replace")
+                self._decode_carry.clear()
+                if leftover:
+                    self._emit_output(leftover)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -65,6 +130,25 @@ class ManagedTerminal:
                 self._exit_code = int(proc.returncode)
         finally:
             self._done.set()
+
+    def _emit_output(self, delta: str) -> None:
+        """Notify manager/hub of a decoded output delta (sync; schedule if coro)."""
+        if not delta or self._on_output is None:
+            return
+        try:
+            result = self._on_output(self.terminal_id, delta, self.session_id)
+            if asyncio.iscoroutine(result):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    return
+                loop.create_task(result, name=f"term-out-{self.terminal_id[:8]}")
+        except Exception:
+            log.debug("terminal on_output failed id=%s", self.terminal_id, exc_info=True)
+
+    def notify_output(self, delta: str) -> None:
+        """Public hook for tests / external inject of a decoded delta."""
+        self._emit_output(delta)
 
     def _append(self, chunk: bytes) -> None:
         if self.output_byte_limit <= 0:
@@ -147,6 +231,16 @@ class TerminalManager:
 
     def __init__(self) -> None:
         self._terms: dict[str, ManagedTerminal] = {}
+        # Hub/AcpClient sets this to fan out live terminal output.
+        self.on_output: OutputCallback | None = None
+
+    def _forward_output(
+        self, terminal_id: str, delta: str, session_id: str | None
+    ) -> Any:
+        cb = self.on_output
+        if cb is None or not delta:
+            return None
+        return cb(terminal_id, delta, session_id)
 
     async def create(self, params: dict[str, Any]) -> dict[str, Any]:
         command = params.get("command")
@@ -185,6 +279,9 @@ class TerminalManager:
             limit_i = int(limit)
         except (TypeError, ValueError):
             limit_i = DEFAULT_OUTPUT_BYTE_LIMIT
+
+        session_raw = params.get("sessionId") or params.get("session_id")
+        session_id = str(session_raw) if session_raw else None
 
         # Prefer exec when we have a real executable + args. Use shell when the
         # command string looks like a pipeline / bare shell builtin (dir, Get-ChildItem).
@@ -225,7 +322,13 @@ class TerminalManager:
                 )
 
         term_id = f"term_{uuid.uuid4().hex[:16]}"
-        managed = ManagedTerminal(term_id, proc, limit_i)
+        managed = ManagedTerminal(
+            term_id,
+            proc,
+            limit_i,
+            session_id=session_id,
+            on_output=self._forward_output,
+        )
         managed.start_pump()
         self._terms[term_id] = managed
         log.info("terminal created id=%s cmd=%s", term_id, command)

@@ -12,7 +12,8 @@ This file is the **public narrative**. Session chat context is not required to u
 ### Added
 - **Files media Share/Save** — video preview (mp4/mov/webm/m4v), Web Share API from Files, higher raw serve limit (150 MB), optional `?download=1` Content-Disposition (file-first; ADR 006/010).
 - **Binary upload + attach** — `POST /api/fs/upload` into session `uploads/`; composer paperclip and Files Upload; path prefill; image 40 MB / video 150 MB caps + MIME allowlist.
-- **Hub plan viewer** — `GET /api/sessions/{id}/plan` reads `plan.md` + `plan_mode.json`; View plan modal with soft Approve / Request changes as composer inject only (not TUI `a`-key handshake; Hub-only, no `exit_plan_mode`).
+- **Hub plan viewer** — `GET /api/sessions/{id}/plan` reads `plan.md` + `plan_mode.json`; View plan modal.
+- **Hub plan-mode handshake** — `POST /api/sessions/{id}/plan/action` writes `plan_mode.json` (approve / request_changes / quit) so Approve clears `awaiting_plan_approval` without stock TUI `a`-key / `exit_plan_mode` (ADR 012); Approve also auto-sends continue inject text.
 - **Tool-row site Preview** — when a tool summary/path ends in `.html`/`.htm`, a compact **Preview** control opens the existing in-hub site preview (file-first; ADR 010).
 - **Sticky active user prompt** — current **You:** line pins to the top of the transcript while the turn runs.
 

@@ -81,7 +81,8 @@
     if (!running) {
       return idleTurnLabel(o);
     }
-    const parts = o.quiet ? ["quiet"] : ["running"];
+    // Open tools/plan: prefer "running" over bare "quiet" (mid-tool wait).
+    const parts = o.quiet && !o.tool_open ? ["quiet"] : ["running"];
     if (o.elapsed_s != null && o.elapsed_s >= 0) {
       parts.push(`${Math.floor(o.elapsed_s)}s`);
     }
@@ -265,6 +266,7 @@
       agent: "down",
       agentProcess: null,
       agentDetail: null,
+      acpQuality: null,
       acpConnected: false,
       acpHealAttempts: 0,
       acpHealError: null,
@@ -274,6 +276,8 @@
       turnRunning: false,
       turnSessionId: null,
     },
+    /** True while POST /api/admin/restart-agent is in flight. */
+    restartingAgent: false,
     hubVersion: null,
     cliVersion: null,
     compatOk: null,
@@ -281,11 +285,19 @@
     hubSessionIds: [],
     /** @type {Record<string, "working"|"question"|"idle">} */
     sessionFlags: {},
-    /** @type {{sessionId: string, state: string}[]} */
+    /** @type {{sessionId: string, state: string, ageSeconds?: number|null, silenceSeconds?: number|null, sawUpdate?: boolean, ttfbSeconds?: number|null}[]} */
     liveTurns: [],
     /** @type {string[]} */
     pendingQuestionSessions: [],
     maxConcurrentTurns: 3,
+    /** @type {{activeTurnCount: number, maxConcurrentTurns: number, busySessionIds: string[]}|null} */
+    capacity: null,
+    /** @type {{level: string, updatesBytes: number|null, message: string}|null} */
+    contextBudget: null,
+    turnAgeSeconds: null,
+    turnSilenceSeconds: null,
+    /** Wall clock when last status/health capacity fields arrived (for live silence drift). */
+    _capacityStatusAt: null,
     sessionMode: "none", // none | history | live-remote
     attachSwitched: false, // true when live id != viewed foreign history id
     /** Hub-owned session id for prompts when viewing a different history id */
@@ -298,6 +310,8 @@
     selectedMeta: null,
     /** Last plan API payload for selected session (or null). */
     sessionPlan: null,
+    /** Session ids for which plan-await modal was auto-opened once. */
+    _planAwaitOpened: new Set(),
     commands: [],
     turnRunning: false,
     promptQueueLength: 0,
@@ -332,6 +346,7 @@
       planEl: null,
       activityEl: null,
       tools: new Map(),
+      terminals: new Map(),
       lastToolTitle: "",
       activeUserEl: null,
     },
@@ -421,7 +436,10 @@
     planStatusChip: $("#plan-status-chip"),
     btnPlanApprove: $("#btn-plan-approve"),
     btnPlanRequestChanges: $("#btn-plan-request-changes"),
+    btnPlanQuit: $("#btn-plan-quit"),
     btnPlanClose: $("#btn-plan-close"),
+    planAwaitBanner: $("#plan-await-banner"),
+    btnPlanAwaitOpen: $("#btn-plan-await-open"),
     chatProject: $("#chat-project"),
     chatModel: $("#chat-model"),
     chatCwd: $("#chat-cwd"),
@@ -431,6 +449,10 @@
     turnStrip: $("#turn-strip"),
     turnStripText: $("#turn-strip-text"),
     turnStripCursor: $("#turn-strip-cursor"),
+    capacityBanner: $("#capacity-banner"),
+    capacityBannerText: $("#capacity-banner-text"),
+    contextBudgetBanner: $("#context-budget-banner"),
+    contextBudgetBannerText: $("#context-budget-banner-text"),
     form: $("#composer-form"),
     input: $("#composer-input"),
     composerFileInput: $("#composer-file-input"),
@@ -1414,19 +1436,35 @@
         text = state.wsState === "reconnecting" ? "Reconnecting" : "Connecting";
       }
     } else if (state.wsState === "open") {
-      // Honest split: process down vs ACP-only disconnect (not "Agent down").
+      // Honest split: process down vs ACP quality (zombie/stale/disconnected).
       const ap = state.status.agentProcess;
       const acp = state.status.acpConnected;
+      const detail = state.status.agentDetail;
+      const quality = state.status.acpQuality;
       const processDown =
-        ap === "down" || (ap == null && state.status.agent !== "up");
+        ap === "down" ||
+        detail === "process-down" ||
+        (ap == null && state.status.agent !== "up");
+      const acpZombie =
+        detail === "acp-zombie" || quality === "zombie";
+      const acpStale =
+        detail === "acp-stale" || quality === "stale";
       const acpOnlyDown =
         ap === "up" &&
+        !acpZombie &&
+        !acpStale &&
         (acp === false ||
-          state.status.agentDetail === "acp-disconnected" ||
+          detail === "acp-disconnected" ||
           state.status.agent !== "up");
       if (processDown) {
         stateKey = "agent-down";
         text = "Agent down";
+      } else if (acpZombie) {
+        stateKey = "acp-hung";
+        text = "Agent hung — restart";
+      } else if (acpStale) {
+        stateKey = "acp-down";
+        text = "ACP stale";
       } else if (acpOnlyDown) {
         // After heal exhaustion, stop implying a silent reconnect is still running.
         const healAttempts = Number(state.status.acpHealAttempts) || 0;
@@ -1451,9 +1489,84 @@
       text = "Reconnecting";
     }
 
+    if (state.restartingAgent) {
+      text = "Restarting agent…";
+    }
+
     pill.dataset.state = stateKey;
     label.textContent = text;
+
+    // Hung / process-down: pill is a KillAgent-style restart control (click only).
+    const restartable =
+      !state.restartingAgent &&
+      (stateKey === "acp-hung" || stateKey === "agent-down");
+    if (restartable) {
+      pill.setAttribute("role", "button");
+      pill.tabIndex = 0;
+      pill.title = "Restart agent (KillAgent-style)";
+      pill.classList.add("status-pill-action");
+      pill.classList.remove("is-restarting");
+      pill.setAttribute("aria-disabled", "false");
+    } else if (state.restartingAgent) {
+      pill.setAttribute("role", "button");
+      pill.tabIndex = -1;
+      pill.title = "Restarting agent…";
+      pill.classList.add("status-pill-action", "is-restarting");
+      pill.setAttribute("aria-disabled", "true");
+    } else {
+      pill.removeAttribute("role");
+      pill.removeAttribute("tabindex");
+      pill.title = "Connection status";
+      pill.classList.remove("status-pill-action", "is-restarting");
+      pill.removeAttribute("aria-disabled");
+    }
     updateTurnStrip();
+  }
+
+  /**
+   * POST /api/admin/restart-agent — KillAgent-style serve kill + respawn + ACP reconnect.
+   * Does not restart the hub process.
+   */
+  async function restartAgentFromPill() {
+    if (state.restartingAgent) return;
+    const st = els.statusPill && els.statusPill.dataset.state;
+    if (st !== "acp-hung" && st !== "agent-down") return;
+    if (
+      !window.confirm(
+        "Restart agent process? In-flight turns will stop."
+      )
+    ) {
+      return;
+    }
+    state.restartingAgent = true;
+    updateStatusPill();
+    toast("Restarting agent…");
+    try {
+      const res = await fetch(apiUrl("/api/admin/restart-agent"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      let data = {};
+      try {
+        data = await res.json();
+      } catch (_) {
+        data = {};
+      }
+      if (!res.ok || !data.ok) {
+        toast(
+          (data && data.error) || "Agent restart failed",
+          "danger",
+          10000
+        );
+        return;
+      }
+      toast("Agent restarted");
+    } catch (err) {
+      toast("Agent restart failed: " + err, "danger", 10000);
+    } finally {
+      state.restartingAgent = false;
+      updateStatusPill();
+    }
   }
 
   // Client soft-warn only (matches hub.session_policy CLIENT_STALL_WARN_SECONDS).
@@ -1762,6 +1875,80 @@
     });
   }
 
+  /** ~5s client-only cue while open tools wait with no new ACP detail. */
+  const OPEN_TOOL_HEARTBEAT_MS = 5000;
+  let _openToolHeartbeat = null;
+
+  function clearOpenToolHeartbeat() {
+    if (_openToolHeartbeat) {
+      clearInterval(_openToolHeartbeat);
+      _openToolHeartbeat = null;
+    }
+  }
+
+  function ensureOpenToolHeartbeat() {
+    if (_openToolHeartbeat) return;
+    _openToolHeartbeat = setInterval(tickOpenToolHeartbeat, OPEN_TOOL_HEARTBEAT_MS);
+  }
+
+  function syncOpenToolHeartbeat(running, hasOpenTools) {
+    if (running && hasOpenTools) ensureOpenToolHeartbeat();
+    else clearOpenToolHeartbeat();
+  }
+
+  function tickOpenToolHeartbeat() {
+    if (!state.turnRunning || !turnRunningOnSelected()) {
+      clearOpenToolHeartbeat();
+      scheduleTurnStrip();
+      return;
+    }
+    const pane =
+      (state.activePane && !state.activePane.hidden && state.activePane) ||
+      (state.selectedId && state.sessionViews.get(state.selectedId)
+        ? state.sessionViews.get(state.selectedId).pane
+        : null);
+    if (!pane) {
+      clearOpenToolHeartbeat();
+      return;
+    }
+    const residual = countResidualInPane(pane);
+    const hasOpenTools =
+      residual.tool_pending + residual.tool_running > 0 ||
+      residual.plan_pending + residual.plan_running > 0;
+    if (!hasOpenTools) {
+      clearOpenToolHeartbeat();
+      scheduleTurnStrip();
+      return;
+    }
+    const users = pane.querySelectorAll(".term-line.user");
+    const lastUser = users.length ? users[users.length - 1] : null;
+    const tools = pane.querySelectorAll("details.term-line.tool, .term-line.tool");
+    for (const row of tools) {
+      if (
+        lastUser &&
+        !(lastUser.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING)
+      ) {
+        continue;
+      }
+      const st = normalizeStatus(row.dataset.status || "");
+      if (st !== "pending" && st !== "running" && st !== "in_progress") continue;
+      if (!row.dataset.openedAt) row.dataset.openedAt = String(Date.now());
+      const openedAt = Number(row.dataset.openedAt) || Date.now();
+      const waitS = Math.max(0, Math.floor((Date.now() - openedAt) / 1000));
+      const oneLiner = row.querySelector(".tool-one-liner");
+      if (!oneLiner) continue;
+      // Only fill waiting cue when there is no real detail yet (do not fake stream).
+      const stored = String(row._toolSummary || "").trim();
+      const nameText = String(row._toolTitle || "").trim();
+      if (!stored || toolOneLinerRedundant(nameText, stored)) {
+        oneLiner.textContent = "waiting · " + waitS + "s";
+        oneLiner.hidden = false;
+      }
+    }
+    // Repaint strip elapsed/tool; never noteTermLineActivity (no fake server activity).
+    scheduleTurnStrip();
+  }
+
   function updateTurnStrip() {
     if (!els.turnStrip || !els.turnStripText) return;
     const running = turnRunningOnSelected();
@@ -1794,15 +1981,21 @@
         residual.tool_running +
         residual.tool_failed >
       0;
+    // Mid-tool / open plan: do not paint bare quiet hang while work is still open.
+    const hasOpenTools =
+      residual.tool_pending + residual.tool_running > 0 ||
+      residual.plan_pending + residual.plan_running > 0;
+    const quietForLabel = quietVisual && !hasOpenTools;
 
     if (running) {
-      els.turnStrip.dataset.state = quietVisual ? "stalled" : "running";
+      els.turnStrip.dataset.state = quietForLabel ? "stalled" : "running";
       els.turnStripText.textContent = turnProgressLabel({
         running: true,
         tool,
         queue: state.promptQueueLength || 0,
         model,
-        quiet: quietVisual,
+        quiet: quietForLabel,
+        tool_open: hasOpenTools,
         elapsed_s: elapsedS,
       });
       if (els.turnStripCursor) els.turnStripCursor.classList.remove("hidden");
@@ -1819,6 +2012,113 @@
         shouldMarkPlanStale({ turn_running: false, has_open_or_failed: hasResidual })
       );
     }
+    syncOpenToolHeartbeat(running, hasOpenTools);
+    updateCapacityBanner();
+  }
+
+  /**
+   * Compact multi-turn capacity strip from status.liveTurns / capacity.
+   * Soft language: "quiet" (not stuck) until silence >= 120s; warn tint then.
+   */
+  function updateCapacityBanner() {
+    if (!els.capacityBanner || !els.capacityBannerText) return;
+    const capacity = state.capacity || null;
+    const turns = state.liveTurns || [];
+    const activeCount =
+      capacity && capacity.activeTurnCount != null
+        ? Number(capacity.activeTurnCount) || 0
+        : turns.length;
+    if (activeCount <= 0) {
+      els.capacityBanner.classList.add("hidden");
+      els.capacityBanner.dataset.state = "idle";
+      els.capacityBannerText.textContent = "";
+      return;
+    }
+
+    const busyIds =
+      (capacity && Array.isArray(capacity.busySessionIds) && capacity.busySessionIds) ||
+      turns.map((t) => (t && t.sessionId) || null).filter(Boolean);
+    const selected = state.selectedId;
+    let turn = null;
+    for (let i = 0; i < turns.length; i++) {
+      if (turns[i] && turns[i].sessionId === selected) {
+        turn = turns[i];
+        break;
+      }
+    }
+    const selectedBusy =
+      !!turn || (selected && busyIds.indexOf(selected) >= 0);
+    const onOther = !!selected && !selectedBusy && busyIds.length > 0;
+
+    // Prefer selected turn metrics; else primary / first live turn.
+    if (!turn && turns.length) turn = turns[0];
+
+    let silence = turn && turn.silenceSeconds != null ? Number(turn.silenceSeconds) : null;
+    let sawUpdate = turn ? !!turn.sawUpdate : false;
+    if (silence == null && state.turnSilenceSeconds != null) {
+      silence = Number(state.turnSilenceSeconds);
+    }
+    if (turn == null && state.liveTurnSessionId) {
+      // top-level primary turn may still have sawUpdate via liveTurns only
+      sawUpdate = false;
+    }
+    // Drift silence from last status so banner ticks between WS broadcasts.
+    if (silence != null && state._capacityStatusAt) {
+      silence = silence + (Date.now() - state._capacityStatusAt) / 1000;
+    }
+    if (silence == null || Number.isNaN(silence) || silence < 0) silence = 0;
+    const silenceS = Math.floor(silence);
+    const warn = silenceS >= 120;
+    // Selected pane open tools/plan: mid-tool wait, not bare hang.
+    const pane =
+      (state.activePane && !state.activePane.hidden && state.activePane) ||
+      (state.selectedId && state.sessionViews.get(state.selectedId)
+        ? state.sessionViews.get(state.selectedId).pane
+        : null);
+    const residual = countResidualInPane(pane);
+    const hasOpenTools =
+      residual.tool_pending + residual.tool_running > 0 ||
+      residual.plan_pending + residual.plan_running > 0;
+    // Soft language until warn threshold; still "quiet" (tint carries severity).
+    // When silence high but tools open: "Working · tool open · quiet Ns".
+    let detail;
+    if (hasOpenTools && selectedBusy) {
+      detail = `tool open · quiet ${silenceS}s`;
+    } else if (sawUpdate) {
+      detail = `quiet ${silenceS}s`;
+    } else {
+      detail = `waiting first token ${silenceS}s`;
+    }
+    const text = onOther
+      ? `Busy on other session · ${detail}`
+      : `Working · ${detail}`;
+
+    els.capacityBannerText.textContent = text;
+    els.capacityBanner.classList.remove("hidden");
+    els.capacityBanner.dataset.state = warn ? "warn" : "working";
+  }
+
+  /**
+   * Soft same-id context budget banner. Advisory only; never blocks Send.
+   * Server: status.contextBudget { level, updatesBytes, message }.
+   */
+  function updateContextBudgetBanner() {
+    if (!els.contextBudgetBanner || !els.contextBudgetBannerText) return;
+    const budget = state.contextBudget;
+    const level = budget && budget.level ? String(budget.level) : "ok";
+    const soft = level === "soft";
+    if (!soft) {
+      els.contextBudgetBanner.classList.add("hidden");
+      els.contextBudgetBanner.dataset.level = "ok";
+      els.contextBudgetBannerText.textContent = "";
+      return;
+    }
+    const msg =
+      (budget && budget.message) ||
+      "Heavy session — responses may be slow. Prefer compact/continue same thread; use New only to fork.";
+    els.contextBudgetBannerText.textContent = msg;
+    els.contextBudgetBanner.dataset.level = "soft";
+    els.contextBudgetBanner.classList.remove("hidden");
   }
 
   function composerConnected() {
@@ -1901,6 +2201,7 @@
       state.stallTimer = null;
     }
     state.stallWarned = false;
+    clearOpenToolHeartbeat();
   }
 
   function noteTermLineActivity() {
@@ -2230,6 +2531,12 @@
     renderSessions();
     // Turn ended: re-parse any assistant tables that finished after last stream chunk.
     if (!running) {
+      try {
+        const planSid = sessionId || state.selectedId;
+        if (planSid && planSid === state.selectedId) {
+          refreshSessionPlan(planSid);
+        }
+      } catch (_) {}
       const idleSid = sessionId || state.selectedId;
       let idleRoot = null;
       if (idleSid && state.sessionViews) {
@@ -2704,9 +3011,91 @@
       planEl: null,
       activityEl: null,
       tools: new Map(),
+      /** @type {Map<string, HTMLElement>} terminalId → live terminal tool row */
+      terminals: new Map(),
       lastToolTitle: "",
       activeUserEl: null,
     };
+  }
+
+  const TERM_OUT_MAX_CHARS = 200000;
+
+  /**
+   * Live hub-hosted terminal/* pump delta → CLI-like tool row.
+   * @param {{ terminalId?: string, delta?: string, sessionId?: string|null }} msg
+   */
+  function onTerminalOut(msg) {
+    const terminalId = String((msg && msg.terminalId) || "").trim();
+    const delta = msg && msg.delta != null ? String(msg.delta) : "";
+    if (!terminalId || !delta) return;
+    const sessionId =
+      (msg.sessionId && String(msg.sessionId)) ||
+      liveTurnId() ||
+      (state.status && state.status.turnSessionId) ||
+      state.selectedId ||
+      null;
+
+    const apply = () => {
+      if (!state.streamBuffers) state.streamBuffers = emptyStreamBuffers();
+      if (!state.streamBuffers.terminals) {
+        state.streamBuffers.terminals = new Map();
+      }
+      const toolKey = `term:${terminalId}`;
+      let row =
+        state.streamBuffers.terminals.get(terminalId) ||
+        state.streamBuffers.tools.get(toolKey);
+      if (!row || !row.isConnected) {
+        row = appendToolLine(
+          {
+            label: "terminal",
+            status: "running",
+            toolCallId: toolKey,
+            summary: "",
+          },
+          ""
+        );
+        if (!row) return;
+        row.dataset.terminal = "1";
+        row.dataset.terminalId = terminalId;
+        row.open = true;
+        state.streamBuffers.terminals.set(terminalId, row);
+        if (toolKey) state.streamBuffers.tools.set(toolKey, row);
+        state.streamBuffers.lastToolTitle = "terminal";
+      }
+      const detail =
+        row.querySelector(".tool-detail") || row.querySelector(".term-body");
+      if (!detail) return;
+      let raw = detail._rawText != null ? String(detail._rawText) : detail.textContent || "";
+      raw += delta;
+      if (raw.length > TERM_OUT_MAX_CHARS) {
+        raw = raw.slice(raw.length - TERM_OUT_MAX_CHARS);
+      }
+      detail._rawText = raw;
+      detail.textContent = raw;
+      detail.hidden = false;
+      row.dataset.hasDetail = "1";
+      // Keep open while streaming (CLI-like live output).
+      if (!row.open) row.open = true;
+      noteTermLineActivity();
+      scheduleTurnStrip();
+      scrollIfSticky();
+    };
+
+    if (sessionId && sessionId !== state.selectedId) {
+      // Still apply when a session pane exists or is live (subscribe fanout).
+      if (
+        state.sessionViews.has(sessionId) ||
+        sessionId === liveTurnId() ||
+        shouldApplyAcpToSession(sessionId)
+      ) {
+        markSessionActivity(sessionId, "working");
+        getSessionPane(sessionId);
+        withSessionTarget(sessionId, apply);
+      }
+      return;
+    }
+    if (sessionId) markSessionActivity(sessionId, "working");
+    apply();
   }
 
   function transcriptRoot() {
@@ -2735,12 +3124,16 @@
   function rebuildToolsFromPane(v) {
     if (!v || !v.pane || !v.streamBuffers) return;
     const tools = new Map();
+    const terminals = new Map();
     const rows = v.pane.querySelectorAll("[data-tool-call-id]");
     for (const row of rows) {
       const id = row.getAttribute("data-tool-call-id");
       if (id) tools.set(id, row);
+      const tid = row.getAttribute("data-terminal-id");
+      if (tid) terminals.set(tid, row);
     }
     v.streamBuffers.tools = tools;
+    v.streamBuffers.terminals = terminals;
     // Recover live stream refs when possible
     const lastAssistant = v.pane.querySelector(".term-line.assistant:last-of-type");
     if (lastAssistant) v.streamBuffers.assistantEl = lastAssistant;
@@ -2927,6 +3320,7 @@
         clampHorizontalScroll();
         state._ignoreScroll = false;
         updateJumpLatestUiOnly();
+        scheduleStickyUserFromScroll();
       });
     });
   }
@@ -2952,6 +3346,8 @@
     state.stickToBottom = true;
     scrollTranscriptToBottom();
     updateJumpLatestUiOnly();
+    // Sticky re-sync runs after scroll settles (scrollTranscriptToBottom rAF).
+    scheduleStickyUserFromScroll();
   }
 
   function beginHistoryBatch() {
@@ -2970,7 +3366,10 @@
       finalizeAssistantTables(transcriptRoot());
       updateTurnStrip();
       if (jump && state.stickToBottom && !state._reconnectScrollFreeze) jumpToLatest();
-      else updateJumpLatestUiOnly();
+      else {
+        updateJumpLatestUiOnly();
+        scheduleStickyUserFromScroll();
+      }
     }
   }
 
@@ -3033,6 +3432,66 @@
       setTop();
       state._ignoreScroll = false;
       updateJumpLatestUiOnly();
+    });
+  }
+
+  /**
+   * Pick sticky user prompt index from content tops (ascending).
+   * Returns last index where tops[i] <= anchorY, or -1 if none.
+   */
+  function pickUserPromptIndex(tops, anchorY) {
+    let idx = -1;
+    for (let i = 0; i < tops.length; i++) {
+      if (tops[i] <= anchorY) idx = i;
+    }
+    return idx;
+  }
+
+  /**
+   * Pin sticky active-prompt to the user line for the section under review
+   * (last user line at or above top anchor). Live stick-to-bottom pins latest.
+   */
+  function syncStickyUserFromScroll() {
+    if (state._ignoreScroll || state._resumeAfterReconnect) return;
+    const scroller = els.transcript;
+    const root = transcriptRoot();
+    if (!scroller || !root) return;
+    // Live at bottom: pin latest user for this pane
+    if (state.stickToBottom && turnRunningOnSelected()) {
+      const users = root.querySelectorAll(".term-line.user");
+      const last = users[users.length - 1];
+      if (last && !last.classList.contains("active-prompt")) {
+        activateUserPrompt(last, { scrollToTop: false });
+      }
+      return;
+    }
+    const users = Array.from(root.querySelectorAll(".term-line.user"));
+    if (!users.length) {
+      clearActiveUserPrompt(root);
+      return;
+    }
+    const scRect = scroller.getBoundingClientRect();
+    // top inset under sticky zone
+    const anchorY = scroller.scrollTop + 56;
+    // Compute each user's offset relative to scroller content
+    const tops = users.map((el) => {
+      const elRect = el.getBoundingClientRect();
+      return scroller.scrollTop + (elRect.top - scRect.top);
+    });
+    let idx = pickUserPromptIndex(tops, anchorY);
+    if (idx < 0) idx = 0; // pin first when above all
+    const target = users[idx];
+    if (!target.classList.contains("active-prompt")) {
+      activateUserPrompt(target, { scrollToTop: false });
+    }
+  }
+
+  let _stickyScrollRaf = 0;
+  function scheduleStickyUserFromScroll() {
+    if (_stickyScrollRaf) return;
+    _stickyScrollRaf = requestAnimationFrame(() => {
+      _stickyScrollRaf = 0;
+      syncStickyUserFromScroll();
     });
   }
 
@@ -3256,6 +3715,8 @@
     row.dataset.status = st;
     if (st === "running" || st === "pending") row.classList.add("running");
     if (toolCallId) row.dataset.toolCallId = toolCallId;
+    // Heartbeat waiting elapsed: time since row opened (client-only cue).
+    if (!row.dataset.openedAt) row.dataset.openedAt = String(Date.now());
 
     const sum = document.createElement("summary");
     const prefix = document.createElement("span");
@@ -3301,6 +3762,13 @@
         pill.textContent = st;
         pill.className = `term-status ${statusClass(st)}`;
       }
+      // Status-only / re-open: ensure opened-at for waiting heartbeat.
+      if (
+        (st === "running" || st === "pending" || st === "in_progress") &&
+        !row.dataset.openedAt
+      ) {
+        row.dataset.openedAt = String(Date.now());
+      }
     }
     if (title) {
       const name = row.querySelector(".tool-name");
@@ -3309,15 +3777,18 @@
     }
     if (summary != null) {
       const full = String(summary).trim();
-      row._toolSummary = full;
-      const nameText = String(row._toolTitle || "").trim();
-      const oneLiner = row.querySelector(".tool-one-liner");
-      if (oneLiner) {
-        const hideOne = toolOneLinerRedundant(nameText, full);
-        oneLiner.textContent = full && !hideOne ? truncate(full, 80) : "";
-        oneLiner.hidden = hideOne;
+      // Empty summary on status-only update: keep prior detail/one-liner.
+      if (full) {
+        row._toolSummary = full;
+        const nameText = String(row._toolTitle || "").trim();
+        const oneLiner = row.querySelector(".tool-one-liner");
+        if (oneLiner) {
+          const hideOne = toolOneLinerRedundant(nameText, full);
+          oneLiner.textContent = !hideOne ? truncate(full, 80) : "";
+          oneLiner.hidden = hideOne;
+        }
+        setToolDetailBody(row, full);
       }
-      setToolDetailBody(row, full);
     } else if (title) {
       // Title-only update: re-evaluate one-liner redundancy against stored summary.
       const full = String(row._toolSummary || "").trim();
@@ -3478,6 +3949,7 @@
       const shouldJump =
         !state._reconnectScrollFreeze && (wasNearBottom || !!opts.jump);
       endHistoryBatch({ jump: shouldJump });
+      scheduleStickyUserFromScroll();
     }
     return true;
   }
@@ -3501,6 +3973,7 @@
       state.streamBuffers.planEl = null;
       state.streamBuffers.activityEl = null;
       state.streamBuffers.tools = new Map();
+      state.streamBuffers.terminals = new Map();
       state.streamBuffers.lastToolTitle = "";
       // Do not force stick-to-bottom during reconnect if user scrolled up.
       if (!state._reconnectScrollFreeze) {
@@ -3538,6 +4011,7 @@
     state.streamBuffers.planEl = null;
     state.streamBuffers.activityEl = null;
     state.streamBuffers.tools = new Map();
+    state.streamBuffers.terminals = new Map();
     state.streamBuffers.lastToolTitle = "";
     state.streamBuffers.activeUserEl = null;
     updateTurnStrip();
@@ -3674,6 +4148,7 @@
       const label = toolLabelFromUpdate(update);
       const detailText =
         extractToolContentSnippet(update, 8000) || toolSummaryFromUpdate(update);
+      // Status-only updates still count as activity and must repaint strip/status.
       noteTermLineActivity();
       let row = id ? state.streamBuffers.tools.get(id) : null;
       if (!row || !row.isConnected) {
@@ -3689,9 +4164,13 @@
         );
         if (id && row) state.streamBuffers.tools.set(id, row);
       } else {
-        updateToolLine(row, { title: label, status, summary: detailText });
+        // Always patch status; only push title/summary when non-empty (status-only safe).
+        const patch = { status };
+        if (label) patch.title = label;
+        if (detailText) patch.summary = detailText;
+        updateToolLine(row, patch);
       }
-      state.streamBuffers.lastToolTitle = label;
+      if (label) state.streamBuffers.lastToolTitle = label;
       scheduleTurnStrip();
       scrollIfSticky();
       return;
@@ -4018,6 +4497,8 @@
         state.historyFingerprint = null;
       }
     }
+    // Transcript visible: pin sticky user for section under view / live turn.
+    scheduleStickyUserFromScroll();
 
     // Attach-on-open: ensure live hub session for cwd (no foreign session/load).
     // While a turn is running on another session, attach takes the ACP lock and
@@ -4306,6 +4787,7 @@
         v.streamBuffers.planEl = null;
         v.streamBuffers.activityEl = null;
         v.streamBuffers.tools = new Map();
+        v.streamBuffers.terminals = new Map();
         v.streamBuffers.lastToolTitle = "";
       } finally {
         endHistoryBatch({ jump: false });
@@ -4356,6 +4838,37 @@
       if (!j) return null;
       noteBootId(j.bootId, j.startedAt);
       if (Array.isArray(j.liveTurns)) state.liveTurns = j.liveTurns;
+      if (j.capacity && typeof j.capacity === "object") {
+        state.capacity = {
+          activeTurnCount: Number(j.capacity.activeTurnCount) || 0,
+          maxConcurrentTurns:
+            Number(j.capacity.maxConcurrentTurns) ||
+            state.maxConcurrentTurns ||
+            3,
+          busySessionIds: Array.isArray(j.capacity.busySessionIds)
+            ? j.capacity.busySessionIds.slice()
+            : [],
+        };
+      }
+      if (j.turnAgeSeconds != null) state.turnAgeSeconds = j.turnAgeSeconds;
+      if (j.turnSilenceSeconds != null) {
+        state.turnSilenceSeconds = j.turnSilenceSeconds;
+      }
+      if (j.turnRunning || (Array.isArray(j.liveTurns) && j.liveTurns.length)) {
+        state._capacityStatusAt = Date.now();
+      }
+      if (j.contextBudget && typeof j.contextBudget === "object") {
+        state.contextBudget = {
+          level: j.contextBudget.level || "ok",
+          updatesBytes:
+            j.contextBudget.updatesBytes != null
+              ? Number(j.contextBudget.updatesBytes)
+              : null,
+          message: j.contextBudget.message || "",
+        };
+      } else {
+        state.contextBudget = null;
+      }
       if (Array.isArray(j.pendingQuestionSessions)) {
         state.pendingQuestionSessions = j.pendingQuestionSessions;
       }
@@ -4368,6 +4881,8 @@
         }
       }
       state.hubReachable = j.ok === true;
+      updateCapacityBanner();
+      updateContextBudgetBanner();
       return j;
     } catch (_) {
       return null;
@@ -4601,6 +5116,7 @@
         agent: msg.agent || "down",
         agentProcess: msg.agentProcess || null,
         agentDetail: msg.agentDetail || null,
+        acpQuality: msg.acpQuality || null,
         acpConnected: msg.acpConnected === true,
         acpHealAttempts:
           msg.acpHealAttempts != null ? Number(msg.acpHealAttempts) || 0 : 0,
@@ -4648,6 +5164,42 @@
       }
       if (msg.maxConcurrentTurns != null) {
         state.maxConcurrentTurns = Number(msg.maxConcurrentTurns) || 3;
+      }
+      // Capacity + primary turn silence/age (for capacity banner).
+      if (msg.capacity && typeof msg.capacity === "object") {
+        state.capacity = {
+          activeTurnCount: Number(msg.capacity.activeTurnCount) || 0,
+          maxConcurrentTurns:
+            Number(msg.capacity.maxConcurrentTurns) ||
+            state.maxConcurrentTurns ||
+            3,
+          busySessionIds: Array.isArray(msg.capacity.busySessionIds)
+            ? msg.capacity.busySessionIds.slice()
+            : [],
+        };
+      } else if (Array.isArray(msg.liveTurns)) {
+        state.capacity = {
+          activeTurnCount:
+            msg.activeTurnCount != null
+              ? Number(msg.activeTurnCount) || 0
+              : msg.liveTurns.length,
+          maxConcurrentTurns: state.maxConcurrentTurns || 3,
+          busySessionIds: msg.liveTurns
+            .map((t) => (t && t.sessionId) || null)
+            .filter(Boolean),
+        };
+      }
+      if (msg.turnAgeSeconds != null) state.turnAgeSeconds = msg.turnAgeSeconds;
+      else if (!msg.turnRunning) state.turnAgeSeconds = null;
+      if (msg.turnSilenceSeconds != null) {
+        state.turnSilenceSeconds = msg.turnSilenceSeconds;
+      } else if (!msg.turnRunning) {
+        state.turnSilenceSeconds = null;
+      }
+      if (msg.turnRunning || (Array.isArray(msg.liveTurns) && msg.liveTurns.length)) {
+        state._capacityStatusAt = Date.now();
+      } else {
+        state._capacityStatusAt = null;
       }
       if (msg.turnSessionId) {
         state.liveTurnSessionId = msg.turnSessionId;
@@ -4755,9 +5307,23 @@
           updateTurnStrip();
         }
       }
+      if (msg.contextBudget && typeof msg.contextBudget === "object") {
+        state.contextBudget = {
+          level: msg.contextBudget.level || "ok",
+          updatesBytes:
+            msg.contextBudget.updatesBytes != null
+              ? Number(msg.contextBudget.updatesBytes)
+              : null,
+          message: msg.contextBudget.message || "",
+        };
+      } else {
+        state.contextBudget = null;
+      }
       updateVersionBadge();
       updateStatusPill();
       scheduleSessionPills();
+      updateCapacityBanner();
+      updateContextBudgetBanner();
       setComposerEnabled(composerConnected());
       forceComposerUnlocked();
       return;
@@ -4985,6 +5551,10 @@
     }
     if (type === "user_question_resolved") {
       onUserQuestionResolved(msg);
+      return;
+    }
+    if (type === "terminal_out") {
+      onTerminalOut(msg);
       return;
     }
   }
@@ -5688,7 +6258,7 @@
     }
   }
 
-  // Soft composer inject only — NOT the Grok TUI a-key / exit_plan_mode handshake.
+  // Hub disk handshake (plan_mode.json) + composer inject. Not the stock TUI a-key / exit_plan_mode.
   const PLAN_APPROVE_INJECT = "approved — implement the plan in plan.md";
   const PLAN_REQUEST_CHANGES_INJECT = "Request changes to the plan:\n\n";
 
@@ -5699,6 +6269,22 @@
 
   function closePlanModal() {
     if (els.modalPlan) els.modalPlan.classList.add("hidden");
+  }
+
+  function updatePlanAwaitBanner(plan) {
+    if (!els.planAwaitBanner) return;
+    const awaiting = !!(plan && plan.awaitingApproval && plan.exists);
+    els.planAwaitBanner.classList.toggle("hidden", !awaiting);
+  }
+
+  function maybeAutoOpenPlanAwait(plan) {
+    if (!plan || !plan.awaitingApproval || !plan.exists) return;
+    const sid = String(plan.sessionId || state.selectedId || "").trim();
+    if (!sid || state.selectedId !== sid) return;
+    if (!state._planAwaitOpened) state._planAwaitOpened = new Set();
+    if (state._planAwaitOpened.has(sid)) return;
+    state._planAwaitOpened.add(sid);
+    openPlanModal();
   }
 
   function renderPlanMarkdown(source) {
@@ -5746,6 +6332,7 @@
     if (!sid) {
       state.sessionPlan = null;
       setViewPlanVisible(false);
+      updatePlanAwaitBanner(null);
       return null;
     }
     try {
@@ -5756,6 +6343,7 @@
       if (res.status === 404) {
         state.sessionPlan = null;
         setViewPlanVisible(false);
+        updatePlanAwaitBanner(null);
         return null;
       }
       const data = await res.json().catch(() => ({}));
@@ -5763,15 +6351,19 @@
       if (!res.ok) {
         state.sessionPlan = null;
         setViewPlanVisible(false);
+        updatePlanAwaitBanner(null);
         return null;
       }
       state.sessionPlan = data;
       setViewPlanVisible(!!data.exists);
+      updatePlanAwaitBanner(data);
+      maybeAutoOpenPlanAwait(data);
       return data;
     } catch (_) {
       if (state.selectedId === sid) {
         state.sessionPlan = null;
         setViewPlanVisible(false);
+        updatePlanAwaitBanner(null);
       }
       return null;
     }
@@ -5819,13 +6411,62 @@
     setComposerEnabled(composerConnected());
   }
 
-  function softApprovePlan() {
-    // Inject only — does not call exit_plan_mode or write plan_mode.json.
-    injectPlanComposerText(PLAN_APPROVE_INJECT);
+  async function postPlanAction(action) {
+    const sid = state.selectedId;
+    if (!sid) throw new Error("No session selected");
+    const res = await fetch(
+      apiUrl(`/api/sessions/${encodeURIComponent(sid)}/plan/action`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action }),
+      }
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "Plan action failed");
+    state.sessionPlan = data;
+    setViewPlanVisible(!!data.exists);
+    updatePlanAwaitBanner(data);
+    updatePlanStatusChip(data);
+    return data;
   }
 
-  function softRequestPlanChanges() {
+  async function hardApprovePlan() {
+    try {
+      await postPlanAction("approve");
+    } catch (err) {
+      toast(String(err && err.message ? err.message : err), "danger");
+      return;
+    }
+    closePlanModal();
+    if (els.input) {
+      els.input.value = PLAN_APPROVE_INJECT;
+      try {
+        if (typeof autoGrow === "function") autoGrow();
+      } catch (_) {}
+    }
+    submitPrompt();
+  }
+
+  async function hardRequestPlanChanges() {
+    try {
+      await postPlanAction("request_changes");
+    } catch (err) {
+      toast(String(err && err.message ? err.message : err), "danger");
+      return;
+    }
     injectPlanComposerText(PLAN_REQUEST_CHANGES_INJECT);
+  }
+
+  async function hardQuitPlan() {
+    try {
+      await postPlanAction("quit");
+    } catch (err) {
+      toast(String(err && err.message ? err.message : err), "danger");
+      return;
+    }
+    closePlanModal();
+    toast("Plan mode cleared on Hub", "");
   }
 
   function hideImagePreview() {
@@ -7455,6 +8096,24 @@
   }
 
   function bindEvents() {
+    if (els.statusPill) {
+      els.statusPill.addEventListener("click", (e) => {
+        const st = els.statusPill.dataset.state;
+        if (st !== "acp-hung" && st !== "agent-down") return;
+        if (state.restartingAgent) return;
+        e.preventDefault();
+        void restartAgentFromPill();
+      });
+      els.statusPill.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        const st = els.statusPill.dataset.state;
+        if (st !== "acp-hung" && st !== "agent-down") return;
+        if (state.restartingAgent) return;
+        e.preventDefault();
+        void restartAgentFromPill();
+      });
+    }
+
     els.sessionSearch.addEventListener("input", () => {
       state.filter = els.sessionSearch.value;
       renderSessions();
@@ -7625,13 +8284,25 @@
     if (els.btnPlanApprove) {
       els.btnPlanApprove.addEventListener("click", (e) => {
         e.preventDefault();
-        softApprovePlan();
+        hardApprovePlan();
       });
     }
     if (els.btnPlanRequestChanges) {
       els.btnPlanRequestChanges.addEventListener("click", (e) => {
         e.preventDefault();
-        softRequestPlanChanges();
+        hardRequestPlanChanges();
+      });
+    }
+    if (els.btnPlanQuit) {
+      els.btnPlanQuit.addEventListener("click", (e) => {
+        e.preventDefault();
+        hardQuitPlan();
+      });
+    }
+    if (els.btnPlanAwaitOpen) {
+      els.btnPlanAwaitOpen.addEventListener("click", (e) => {
+        e.preventDefault();
+        openPlanModal();
       });
     }
 
@@ -7886,6 +8557,7 @@
 
     els.transcript.addEventListener("scroll", () => {
       updateJumpLatest();
+      scheduleStickyUserFromScroll();
     });
 
     if (els.btnJumpLatest) {
@@ -8485,6 +9157,9 @@
     sessionsMatchingCwd,
     entryRequiresResumeChoice,
     stopTurnForSession,
+    pickUserPromptIndex,
+    syncStickyUserFromScroll,
+    scheduleStickyUserFromScroll,
   };
 
   bootstrap();

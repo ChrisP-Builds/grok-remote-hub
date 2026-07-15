@@ -692,6 +692,31 @@ a {
   line-height: 1.4;
 }
 
+.plan-await-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  background: rgba(109, 160, 255, 0.08);
+  font-family: var(--font);
+  font-size: 12px;
+  color: var(--text);
+  min-width: 0;
+}
+
+.plan-await-banner.hidden {
+  display: none !important;
+}
+
+.plan-await-banner-text {
+  min-width: 0;
+  flex: 1 1 auto;
+  line-height: 1.4;
+}
+
 .empty-sub {
   color: var(--accent);
   font-family: var(--font);
@@ -1632,12 +1657,116 @@ a {
   background: var(--danger);
 }
 
+/* Clickable hung / agent-down pill → POST /api/admin/restart-agent */
+.status-pill.status-pill-action,
+.status-pill[data-state="acp-hung"],
+.status-pill[data-state="agent-down"] {
+  cursor: pointer;
+  user-select: none;
+}
+
+.status-pill.status-pill-action:hover:not(.is-restarting),
+.status-pill[data-state="acp-hung"]:hover:not(.is-restarting),
+.status-pill[data-state="agent-down"]:hover:not(.is-restarting) {
+  filter: brightness(1.12);
+}
+
+.status-pill.status-pill-action:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.status-pill.is-restarting {
+  opacity: 0.75;
+  pointer-events: none;
+  cursor: wait;
+}
+
 .status-pill[data-state="local"] {
   color: var(--muted);
 }
 
 .status-pill[data-state="local"] .status-dot {
   background: var(--muted);
+}
+
+/* Capacity / multi-turn quiet banner (soft language until silence >= 120s) */
+.capacity-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 22px;
+  padding: 2px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  pointer-events: none;
+  flex-shrink: 0;
+}
+
+.capacity-banner.hidden {
+  display: none !important;
+}
+
+.capacity-banner[data-state="working"] {
+  color: var(--muted);
+}
+
+.capacity-banner[data-state="warn"] {
+  color: var(--warn);
+  background: rgba(230, 184, 77, 0.08);
+  border-bottom-color: rgba(230, 184, 77, 0.35);
+}
+
+#capacity-banner-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+/* Soft context budget (heavy same-id session). Advisory only; never blocks Send. */
+.context-budget-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-height: 20px;
+  padding: 2px 14px 4px;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  flex-shrink: 0;
+}
+
+.context-budget-banner.hidden {
+  display: none !important;
+}
+
+.context-budget-banner[data-level="soft"] {
+  color: var(--muted);
+  background: rgba(230, 184, 77, 0.05);
+}
+
+#context-budget-banner-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.4;
+  opacity: 0.9;
+  text-decoration: none;
+  font-style: normal;
+  /* link-style muted advisory near capacity / usage */
+  border-bottom: 1px dotted color-mix(in srgb, var(--muted) 55%, transparent);
+  padding-bottom: 0;
 }
 
 /* Live turn status strip (display-only; never intercept composer clicks) */
@@ -1818,17 +1947,27 @@ a {
   color: var(--user);
 }
 
-/* Active user turn: freeze "You:" at top of transcript while agent streams */
+/* Active user turn: freeze "You:" at top — opaque, higher contrast over stream */
 .term-line.user.active-prompt {
   position: sticky;
   top: 0;
   z-index: 5;
-  background: var(--surface);
-  border-bottom: 1px solid color-mix(in srgb, var(--user) 35%, var(--border));
-  padding-top: 6px;
-  padding-bottom: 8px;
-  margin-bottom: 8px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.28);
+  /* Solid-ish lift over transcript (not translucent wash) */
+  background: color-mix(in srgb, var(--surface-2) 88%, var(--user) 12%);
+  border-bottom: 1px solid color-mix(in srgb, var(--user) 55%, var(--border));
+  padding: 8px 10px 10px;
+  margin: 0 0 10px;
+  border-radius: 0 0 8px 8px;
+  box-shadow:
+    0 1px 0 color-mix(in srgb, var(--user) 25%, transparent),
+    0 8px 20px rgba(0, 0, 0, 0.45);
+}
+
+/* Long user prompts: scroll inside sticky header instead of covering the stream */
+.term-line.user.active-prompt .term-body {
+  max-height: 30vh;
+  overflow-y: auto;
+  color: color-mix(in srgb, var(--text) 92%, var(--user) 8%);
 }
 
 .term-line.assistant .term-prefix {
@@ -1895,6 +2034,12 @@ a {
 .term-line.system .term-body {
   color: var(--muted);
   white-space: pre-wrap;
+}
+
+.term-line.tool[data-terminal="1"] .term-body {
+  white-space: pre-wrap;
+  font-family: var(--font);
+  color: var(--text);
 }
 
 .term-line.thought .term-body {
@@ -3461,9 +3606,33 @@ a {
     font-size: 11px;
   }
 
+  /* Live-remote / history mode strip: free vertical space on phone */
+  .session-banner {
+    display: none !important;
+  }
+
   .transcript {
-    padding: 10px 10px;
+    /* No top padding: sticky user prompt sits flush at top of chat scroll */
+    padding: 0 10px 10px;
     overflow-x: auto;
+  }
+
+  /* Sticky You: flush to top of chat scroll, full width (no padding gap) */
+  .term-line.user.active-prompt {
+    top: 0;
+    margin: 0 -10px 8px;
+    padding: 8px 10px 10px;
+    border-radius: 0;
+    width: calc(100% + 20px);
+    max-width: none;
+    box-sizing: border-box;
+  }
+
+  /* Top inset when first line is not the sticky pin */
+  .transcript > .empty-main,
+  .transcript > .session-pane:not([hidden]) > .term-line:first-child:not(.active-prompt),
+  .transcript > .term-line:first-child:not(.active-prompt) {
+    margin-top: 10px;
   }
 
   .term-table-wrap {

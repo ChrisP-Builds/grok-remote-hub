@@ -35,6 +35,7 @@ def turn_progress_label(
     queue: int = 0,
     model: str = "",
     quiet: bool = False,
+    tool_open: bool = False,
     elapsed_s: int | None = None,
     plan_pending: int = 0,
     plan_running: int = 0,
@@ -43,7 +44,11 @@ def turn_progress_label(
     tool_running: int = 0,
     tool_failed: int = 0,
 ) -> str:
-    """Human turn-strip text (idle + residual / running · elapsed · tool · model)."""
+    """Human turn-strip text (idle + residual / running · elapsed · tool · model).
+
+    When tools/plan are still open mid-turn, prefer ``running`` over ``quiet``
+    even if silence crossed the visual-quiet threshold (honest mid-tool wait).
+    """
     m = (model or "").strip()
     if not running:
         return idle_turn_label(
@@ -56,9 +61,8 @@ def turn_progress_label(
             tool_failed=tool_failed,
         )
 
-    parts = ["running"]
-    if quiet:
-        parts = ["quiet"]
+    # Open tools/plan: stay on "running" (not bare quiet hang).
+    parts = ["quiet"] if quiet and not tool_open else ["running"]
     if elapsed_s is not None and elapsed_s >= 0:
         parts.append(f"{int(elapsed_s)}s")
     q = int(queue or 0)
