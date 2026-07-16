@@ -39,7 +39,9 @@ def should_show_tool_line() -> bool:
     return True
 
 
-_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$")
+# More permissive than strict GFM: 1+ dashes per cell (agent tables often use 1–2).
+_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$")
+_TABLE_SEP_LOOSE_RE = re.compile(r"^\|?:?-{1,}:?(\|:?-{1,}:?)+\|?$")
 _TABLE_ROW_RE = re.compile(r"^\s*\|.+\|\s*$")
 
 
@@ -52,9 +54,20 @@ def _split_table_row(line: str) -> list[str]:
     return [c.strip() for c in s.split("|")]
 
 
+def _is_table_separator(line: str) -> bool:
+    """True if line is a GFM-style table separator (1+ dashes per cell)."""
+    if _TABLE_SEP_RE.match(line):
+        return True
+    loose = line.strip().replace(" ", "")
+    return bool(_TABLE_SEP_LOOSE_RE.match(loose))
+
+
 def parse_simple_markdown_table(text: str) -> list[list[str]] | None:
     """
     Parse a simple GitHub-style markdown table block from text.
+
+    Separator cells accept 1+ dashes (more permissive than strict GFM, which
+    wants 3+) so agent-generated tables with short seps still render.
 
     Returns rows as list[list[str]] (header + body, separator omitted),
     or None if no table is found.
@@ -72,11 +85,8 @@ def parse_simple_markdown_table(text: str) -> list[list[str]] | None:
         # Accept rows that look like pipe tables even without leading |
         if header.count("|") < 1:
             continue
-        if not _TABLE_SEP_RE.match(sep):
-            # Also accept loose separators: ---|---
-            loose = sep.strip().replace(" ", "")
-            if not re.match(r"^\|?:?-{3,}:?(\|:?-{3,}:?)+\|?$", loose):
-                continue
+        if not _is_table_separator(sep):
+            continue
 
         cells_header = _split_table_row(header)
         if len(cells_header) < 2:
