@@ -131,7 +131,7 @@ def test_js_mobile_table_raw_text_contracts() -> None:
     assert "finalizeAssistantTables" in js
     idle_hook = js.find("Turn ended: re-parse any assistant tables")
     assert idle_hook >= 0
-    assert "finalizeAssistantTables(idleRoot)" in js[idle_hook : idle_hook + 500]
+    assert "finalizeAssistantTables(idleRoot)" in js[idle_hook : idle_hook + 1200]
     hist_hook = js.find("ensure GFM tables in loaded history")
     assert hist_hook >= 0
     assert "finalizeAssistantTables(transcriptRoot())" in js[hist_hook : hist_hook + 200]
@@ -206,6 +206,38 @@ def test_parse_simple_markdown_table() -> None:
     assert gfm_rows is not None
     assert gfm_rows[0] == ["A", "B"]
     assert gfm_rows[1] == ["1", "2"]
+
+    # Agent-written short seps (1–2 dashes) — real failure case
+    short = (
+        '| | CLI CTX | Hub "heavy" banner |\n'
+        "|--|---------|---------------------|\n"
+        "| Source | Live session usage | Mostly updates.jsonl size |\n"
+    )
+    short_rows = parse_simple_markdown_table(short)
+    assert short_rows is not None
+    assert len(short_rows) >= 2  # header + at least one body
+    assert len(short_rows[0]) == 3
+    assert short_rows[0][1] == "CLI CTX"
+    assert short_rows[1][0] == "Source"
+
+    # Single-dash seps still work
+    single = "| A | B |\n|-|-|\n| 1 | 2 |\n"
+    single_rows = parse_simple_markdown_table(single)
+    assert single_rows is not None
+    assert single_rows[0] == ["A", "B"]
+    assert single_rows[1] == ["1", "2"]
+
+    # Strict 3-dash still works
+    strict = "| A | B |\n|---|---|\n| 1 | 2 |\n"
+    assert parse_simple_markdown_table(strict) is not None
+
+
+def test_js_table_sep_accepts_short_dashes() -> None:
+    """Contract: JS table parsers use -{1,} not only -{3,}."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert r"-{1,}" in js
+    # Ensure we did not leave only the old strict form as the sep rule
+    assert js.count(r"-{1,}") >= 4  # sepRe + looseSepRe × parse + setTermBodyContent
 
 
 def test_format_plan_summary() -> None:

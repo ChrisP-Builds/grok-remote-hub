@@ -30,6 +30,7 @@ This file is the **public narrative**. Session chat context is not required to u
 - **Heavy-session soft context banner** — dropped `#context-budget-banner` / `contextBudget` status field (journal-size false positives after compact). Context UX matches the CLI usage bar only; `updates.jsonl` size still scales no-output stall thresholds internally.
 
 ### Fixed
+- **Short GFM table separators** — agent-written tables with 1–2 dashes per separator cell (e.g. `|--|---|`) now render as tables instead of plain text.
 - **Orphan agent turn after hub force-clear** — stall watchdog, admin reset-turn, and no-output recovery now call `session/cancel` (via `notify_agent_cancel`) so the agent releases the old prompt; UI unlock no longer leaves the next message blocked forever.
 - **Heavy-session no-output false kill** — scale stall threshold by `updates.jsonl` size (60s base / 180s soft / 300s heavy); never suppress ACP activity mid-turn; skip redundant `session/load` on no-output retry when already loaded; release load-suppress before re-prompt.
 - **Turn elapsed/silence timers seed from server age** — strip `running · Ns` and tool `waiting · Ns` survive hard-refresh/reconnect (no more client-only `Date.now()` reset to 0s).

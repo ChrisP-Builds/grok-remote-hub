@@ -388,8 +388,9 @@
   function parseSimpleMarkdownTable(text) {
     if (!text || !String(text).includes("|")) return null;
     const lines = String(text).split(/\r?\n/);
-    const sepRe = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
-    const looseSepRe = /^\|?:?-{3,}:?(\|:?-{3,}:?)+\|?$/;
+    // 1+ dashes per cell (more permissive than strict GFM) for agent-written tables
+    const sepRe = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/;
+    const looseSepRe = /^\|?:?-{1,}:?(\|:?-{1,}:?)+\|?$/;
 
     function splitRow(line) {
       let s = line.trim();
@@ -4265,8 +4266,9 @@
     bodyEl.innerHTML = "";
     const lines = raw.split(/\r?\n/);
     let tableStart = -1;
-    const sepRe = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/;
-    const looseSepRe = /^\|?:?-{3,}:?(\|:?-{3,}:?)+\|?$/;
+    // 1+ dashes per cell (more permissive than strict GFM) for agent-written tables
+    const sepRe = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/;
+    const looseSepRe = /^\|?:?-{1,}:?(\|:?-{1,}:?)+\|?$/;
     for (let i = 0; i < lines.length - 1; i++) {
       if ((lines[i].match(/\|/g) || []).length < 1) continue;
       if (sepRe.test(lines[i + 1]) || looseSepRe.test(lines[i + 1].trim().replace(/\s+/g, ""))) {
