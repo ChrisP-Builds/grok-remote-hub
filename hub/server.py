@@ -67,10 +67,8 @@ from hub.status_view import (
 from hub.acp_trace import session_id_slice
 from hub.session_signals import read_session_signals, read_signals_file, find_signals_path
 from hub.session_policy import (
-    CONTEXT_SOFT_MESSAGE,
     NO_OUTPUT_RETRY_SECONDS,
     STUCK_TURN_SECONDS,
-    context_budget_level,
     cwd_key,
     is_hub_resume_candidate,
     is_no_output_error_message,
@@ -424,45 +422,6 @@ class Hub:
             return None
         return None
 
-    def _context_budget_payload(self) -> dict[str, Any] | None:
-        """Soft context budget for primary loadedSessionId only. Omit if unknown."""
-        sid = self.acp.loaded_session_id
-        if not sid:
-            return None
-        updates_bytes: int | None = self._session_updates_bytes(str(sid))
-        total_tokens: int | None = None
-        try:
-            session_dir = self._resolve_loaded_session_dir(str(sid))
-            if session_dir is not None:
-                # Optional tokens from signals.json when present (skip if hard).
-                signals_path = session_dir / "signals.json"
-                if signals_path.is_file():
-                    try:
-                        raw = json.loads(signals_path.read_text(encoding="utf-8"))
-                        if isinstance(raw, dict):
-                            tok = raw.get("contextTokensUsed")
-                            if tok is not None and not isinstance(tok, bool):
-                                total_tokens = int(tok)
-                    except (
-                        OSError,
-                        json.JSONDecodeError,
-                        TypeError,
-                        ValueError,
-                        UnicodeError,
-                    ):
-                        pass
-        except OSError:
-            pass
-        level = context_budget_level(
-            updates_bytes=updates_bytes,
-            total_tokens=total_tokens,
-        )
-        return {
-            "level": level,
-            "updatesBytes": updates_bytes,
-            "message": CONTEXT_SOFT_MESSAGE if level == "soft" else "",
-        }
-
     def status_payload(self) -> dict[str, Any]:
         mapped, live = self._map_agent_from_live()
         compat = self.compat or {}
@@ -470,7 +429,6 @@ class Hub:
         live_turns = self._live_turns_payload()
         primary_tel = self._primary_turn_telemetry()
         capacity = self._capacity_payload()
-        context_budget = self._context_budget_payload()
         pending_q = sorted(self.acp.sessions_with_pending_questions())
         session_flags = self._session_flags_map()
         heal_exhausted = (
@@ -515,8 +473,6 @@ class Hub:
             "bootId": self.boot_id,
             "startedAt": self._started_at_iso(),
         }
-        if context_budget is not None:
-            body["contextBudget"] = context_budget
         try:
             body["acpTraceRecent"] = self.acp.trace.snapshot(5)
         except Exception:
@@ -1459,7 +1415,6 @@ class Hub:
         mapped, live = self._map_agent_from_live()
         primary_tel = self._primary_turn_telemetry()
         capacity = self._capacity_payload()
-        context_budget = self._context_budget_payload()
         body: dict[str, Any] = {
             "ok": True,
             "agent": mapped["agent"],
@@ -1507,8 +1462,6 @@ class Hub:
             "bootId": self.boot_id,
             "startedAt": self._started_at_iso(),
         }
-        if context_budget is not None:
-            body["contextBudget"] = context_budget
         try:
             body["acpTraceRecent"] = self.acp.trace.snapshot(5)
         except Exception:

@@ -6,8 +6,12 @@ import json
 from pathlib import Path
 
 from hub.ui_ux import (
+    apply_goal_tool_input,
     elapsed_seconds_from_wall,
+    format_goal_elapsed,
+    goal_banner_text,
     idle_turn_label,
+    parse_goal_slash,
     pick_turn_age_seconds,
     residual_status_parts,
     session_list_progress_hint,
@@ -1280,31 +1284,18 @@ def test_js_server_turn_timers_structural() -> None:
     assert "if (!state.turnStartedAt)" in stall_chunk
 
 
-def test_context_budget_banner_structural() -> None:
-    """Soft context budget banner: advisory only, never hard-blocks Send."""
+def test_context_budget_banner_removed() -> None:
+    """Heavy-session soft banner is gone; context UX is CLI CTX bar only."""
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     css = (STATIC / "app.css").read_text(encoding="utf-8")
     js = (STATIC / "app.js").read_text(encoding="utf-8")
-    assert 'id="context-budget-banner"' in html
-    assert 'id="context-budget-banner-text"' in html
-    assert ".context-budget-banner" in css
-    assert "function updateContextBudgetBanner" in js
-    assert "Heavy session" in js
-    assert "use New only to fork" in js
-    assert "msg.contextBudget" in js
-    assert "state.contextBudget" in js
-    assert "updateContextBudgetBanner()" in js
-    # Soft only: banner path must not gate Send / force session-new
-    idx = js.find("function updateContextBudgetBanner")
-    assert idx >= 0
-    end = js.find("\n  function ", idx + 10)
-    chunk = js[idx : end if end > idx else idx + 900]
-    assert "session/new" not in chunk
-    assert "KillAgent" not in chunk
-    assert "btnSend" not in chunk
-    assert "disabled = true" not in chunk
-    # Composer force-unlock still present (Send not hard-gated by budget)
-    assert "forceComposerUnlocked" in js
+    assert "context-budget-banner" not in html
+    assert "context-budget-banner" not in css
+    assert "updateContextBudgetBanner" not in js
+    assert "state.contextBudget" not in js
+    assert "j.contextBudget" not in js
+    assert "msg.contextBudget" not in js
+    assert "Heavy session" not in js
 
 
 def test_js_history_batch_depth() -> None:
@@ -1675,3 +1666,166 @@ def test_session_plan_viewer_contract() -> None:
     assert ".modal-card-plan" in css
     assert ".plan-body" in css
     assert ".plan-await-banner" in css
+
+
+# ---------------------------------------------------------------------------
+# Goal mode helpers + session restore contracts
+# ---------------------------------------------------------------------------
+
+
+def test_parse_goal_slash() -> None:
+    assert parse_goal_slash(None) is None
+    assert parse_goal_slash("") is None
+    assert parse_goal_slash("hello") is None
+    assert parse_goal_slash("/goalie") is None
+    assert parse_goal_slash("/goal") == {"action": "status"}
+    assert parse_goal_slash("/goal status") == {"action": "status"}
+    assert parse_goal_slash("/goal pause") == {"action": "pause"}
+    assert parse_goal_slash("/goal resume") == {"action": "resume"}
+    assert parse_goal_slash("/goal clear") == {"action": "clear"}
+    assert parse_goal_slash("/goal Fix the login bug") == {
+        "action": "start",
+        "objective": "Fix the login bug",
+    }
+    assert parse_goal_slash("  /GOAL  pause  ") == {"action": "pause"}
+    # start keeps multi-word objective (not treated as status)
+    assert parse_goal_slash("/goal status update the docs") == {
+        "action": "start",
+        "objective": "status update the docs",
+    }
+
+
+def test_format_goal_elapsed() -> None:
+    assert format_goal_elapsed(0) == "0s"
+    assert format_goal_elapsed(45) == "45s"
+    assert format_goal_elapsed(72) == "1m 12s"
+    assert format_goal_elapsed(3 * 60 + 5) == "3m 05s"
+    assert format_goal_elapsed(3600 + 5 * 60) == "1h 05m"
+    assert format_goal_elapsed(2 * 3600 + 12 * 60 + 3) == "2h 12m"
+    assert format_goal_elapsed(-3) == "0s"
+    assert format_goal_elapsed(None) == "0s"
+
+
+def test_goal_banner_text() -> None:
+    t = goal_banner_text(
+        status="active",
+        elapsed_s=14 * 60 + 32,
+        message="Reading PR0 brief",
+    )
+    assert t == "Goal · 14m 32s · Reading PR0 brief"
+    paused = goal_banner_text(
+        status="paused",
+        elapsed_s=45,
+        objective="Ship it",
+    )
+    assert paused.startswith("Goal · paused · 45s")
+    assert "Ship it" in paused
+    long_msg = "x" * 100
+    truncated = goal_banner_text(status="active", elapsed_s=1, message=long_msg)
+    assert truncated.endswith("…")
+    assert len(truncated) < 100
+
+
+def test_apply_goal_tool_input() -> None:
+    now = 1_700_000_000_000.0
+    # Non-goal tool
+    assert apply_goal_tool_input(None, {"path": "a.py"}, "read_file", now) is None
+
+    # First update_goal starts cycle
+    r1 = apply_goal_tool_input(
+        None,
+        {"message": "Reading PR0..."},
+        "update_goal",
+        now,
+    )
+    assert r1 is not None
+    assert r1["status"] == "active"
+    assert r1["message"] == "Reading PR0..."
+    assert r1["startedAt"] == now
+
+    # Progress keeps startedAt
+    later = now + 60_000
+    r2 = apply_goal_tool_input(
+        r1,
+        {
+            "variant": "UpdateGoal",
+            "completed": None,
+            "message": "Still reading…",
+            "blocked_reason": None,
+        },
+        "Goal: Still reading…",
+        later,
+    )
+    assert r2 is not None
+    assert r2["status"] == "active"
+    assert r2["startedAt"] == now
+    assert r2["message"] == "Still reading…"
+
+    # completed:true ends
+    r3 = apply_goal_tool_input(
+        r2,
+        {"variant": "UpdateGoal", "completed": True, "message": "Done"},
+        "update_goal",
+        later + 1000,
+    )
+    assert r3 is not None
+    assert r3["status"] == "done"
+    assert r3["startedAt"] == now
+
+    # Title Goal: without raw is enough to detect
+    r4 = apply_goal_tool_input(None, None, "Goal: Hello", now)
+    assert r4 is not None
+    assert r4["message"] == "Hello"
+
+
+def test_session_restore_and_goal_banner_contract() -> None:
+    """Selected-session restore key + goal banner HTML/CSS/JS wiring."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    py = (ROOT / "hub" / "ui_ux.py").read_text(encoding="utf-8")
+
+    # HTML banner near plan-await
+    assert 'id="goal-banner"' in html
+    assert 'id="goal-banner-text"' in html
+    assert 'id="plan-await-banner"' in html  # not removed
+
+    # CSS states
+    assert ".goal-banner" in css
+    assert '[data-status="active"]' in css or 'data-status="active"' in css
+    assert '[data-status="paused"]' in css or 'data-status="paused"' in css
+
+    # Storage keys (localStorage)
+    assert "grh.selectedSession.v1" in js
+    assert "grh.sessionGoals.v1" in js
+    assert "function saveSelectedSession" in js
+    assert "function loadSelectedSessionId" in js
+    assert "function updateGoalBanner" in js
+    assert "function rehydrateGoalFromHistory" in js
+    assert "function noteGoalFromTool" in js
+    assert "function noteGoalFromUserText" in js
+    assert "function parseGoalSlash" in js
+    assert "function formatGoalElapsed" in js
+    assert "function goalBannerText" in js
+    assert "function applyGoalToolInput" in js
+    assert "syncGoalTick" in js
+
+    # bootstrap restores saved session after /api/sessions
+    boot_idx = js.find("async function bootstrap")
+    assert boot_idx >= 0
+    boot_chunk = js[boot_idx : boot_idx + 4500]
+    assert "loadSelectedSessionId" in boot_chunk
+    assert "openSession" in boot_chunk
+    assert "/api/sessions" in boot_chunk
+
+    # openSession persists selection
+    open_idx = js.find("async function openSession")
+    assert open_idx >= 0
+    open_chunk = js[open_idx : open_idx + 1200]
+    assert "saveSelectedSession" in open_chunk
+
+    # Pure helpers exist in Python source of truth
+    assert "def parse_goal_slash" in py
+    assert "def format_goal_elapsed" in py
+    assert "def goal_banner_text" in py
+    assert "def apply_goal_tool_input" in py

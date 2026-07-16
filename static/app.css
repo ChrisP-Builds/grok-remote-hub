@@ -734,6 +734,46 @@ a {
   white-space: nowrap;
 }
 
+/* Goal mode strip — wall-clock elapsed across turns (CLI /goal + update_goal) */
+.goal-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid color-mix(in srgb, var(--assistant) 75%, var(--border));
+  background: rgba(109, 202, 141, 0.08);
+  font-family: var(--font);
+  font-size: 12px;
+  color: var(--text);
+  min-width: 0;
+  flex-shrink: 0;
+}
+
+.goal-banner.hidden {
+  display: none !important;
+}
+
+.goal-banner[data-status="active"] {
+  border-left-color: color-mix(in srgb, var(--assistant) 80%, var(--border));
+  background: rgba(109, 202, 141, 0.1);
+}
+
+.goal-banner[data-status="paused"] {
+  border-left-color: color-mix(in srgb, var(--warn, #d4a017) 70%, var(--border));
+  background: rgba(212, 160, 23, 0.08);
+  color: var(--muted, var(--text));
+}
+
+.goal-banner-text {
+  min-width: 0;
+  flex: 1 1 auto;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .empty-sub {
   color: var(--accent);
   font-family: var(--font);
@@ -1744,46 +1784,6 @@ a {
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
-}
-
-/* Soft context budget (heavy same-id session). Advisory only; never blocks Send. */
-.context-budget-banner {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-  min-height: 20px;
-  padding: 2px 14px 4px;
-  border-bottom: 1px solid var(--border);
-  background: transparent;
-  font-family: var(--font);
-  font-size: 11px;
-  color: var(--muted);
-  min-width: 0;
-  max-width: 100%;
-  overflow-x: hidden;
-  flex-shrink: 0;
-}
-
-.context-budget-banner.hidden {
-  display: none !important;
-}
-
-.context-budget-banner[data-level="soft"] {
-  color: var(--muted);
-  background: rgba(230, 184, 77, 0.05);
-}
-
-#context-budget-banner-text {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-  line-height: 1.4;
-  opacity: 0.9;
-  text-decoration: none;
-  font-style: normal;
-  /* link-style muted advisory near capacity / usage */
-  border-bottom: 1px dotted color-mix(in srgb, var(--muted) 55%, transparent);
-  padding-bottom: 0;
 }
 
 /* Live turn status strip (display-only; never intercept composer clicks) */

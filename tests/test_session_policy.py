@@ -7,8 +7,6 @@ from pathlib import Path
 from hub.session_policy import (
     CLIENT_STALL_UNLOCK_SECONDS,
     CLIENT_STALL_WARN_SECONDS,
-    CONTEXT_SOFT_MESSAGE,
-    CONTEXT_SOFT_TOKENS,
     CONTEXT_SOFT_UPDATES_BYTES,
     MAX_TURN_SECONDS,
     MID_TURN_STALL_SECONDS,
@@ -18,7 +16,6 @@ from hub.session_policy import (
     NO_OUTPUT_SECONDS,
     NO_OUTPUT_SOFT_SECONDS,
     STUCK_TURN_SECONDS,
-    context_budget_level,
     cwd_key,
     entry_requires_resume_choice,
     is_hub_resume_candidate,
@@ -869,45 +866,19 @@ def test_client_stall_never_auto_unlocks() -> None:
     assert CLIENT_STALL_UNLOCK_SECONDS == 0
 
 
-def test_context_budget_level_defaults_ok() -> None:
+def test_context_soft_updates_bytes_used_for_no_output_scaling() -> None:
+    """CONTEXT_SOFT_UPDATES_BYTES remains for internal stall scaling, not UI banner."""
     assert CONTEXT_SOFT_UPDATES_BYTES == 6_000_000
-    assert CONTEXT_SOFT_TOKENS == 80_000
-    assert "Heavy session" in CONTEXT_SOFT_MESSAGE
-    assert context_budget_level() == "ok"
-    assert context_budget_level(updates_bytes=None, total_tokens=None) == "ok"
-    assert context_budget_level(updates_bytes=0) == "ok"
-    assert context_budget_level(updates_bytes=CONTEXT_SOFT_UPDATES_BYTES) == "ok"
-    assert context_budget_level(total_tokens=CONTEXT_SOFT_TOKENS) == "ok"
-
-
-def test_context_budget_level_soft_on_updates_bytes() -> None:
+    assert no_output_seconds_for_session(updates_bytes=0) == NO_OUTPUT_SECONDS
     assert (
-        context_budget_level(updates_bytes=CONTEXT_SOFT_UPDATES_BYTES + 1) == "soft"
-    )
-    assert context_budget_level(updates_bytes=10_000_000) == "soft"
-    # tokens under threshold alone stay ok
-    assert context_budget_level(total_tokens=CONTEXT_SOFT_TOKENS - 1) == "ok"
-
-
-def test_context_budget_level_soft_on_tokens() -> None:
-    assert context_budget_level(total_tokens=CONTEXT_SOFT_TOKENS + 1) == "soft"
-    assert context_budget_level(total_tokens=200_000) == "soft"
-    # either signal trips soft
-    assert (
-        context_budget_level(
-            updates_bytes=100,
-            total_tokens=CONTEXT_SOFT_TOKENS + 5,
-        )
-        == "soft"
-    )
-
-
-def test_context_budget_level_custom_thresholds() -> None:
-    assert (
-        context_budget_level(updates_bytes=100, soft_updates_bytes=50) == "soft"
+        no_output_seconds_for_session(updates_bytes=CONTEXT_SOFT_UPDATES_BYTES)
+        == NO_OUTPUT_SECONDS
     )
     assert (
-        context_budget_level(updates_bytes=50, soft_updates_bytes=50) == "ok"
+        no_output_seconds_for_session(updates_bytes=CONTEXT_SOFT_UPDATES_BYTES + 1)
+        == NO_OUTPUT_SOFT_SECONDS
     )
-    assert context_budget_level(total_tokens=10, soft_tokens=9) == "soft"
-    assert context_budget_level(total_tokens=9, soft_tokens=9) == "ok"
+    assert (
+        no_output_seconds_for_session(updates_bytes=NO_OUTPUT_HEAVY_UPDATES_BYTES + 1)
+        == NO_OUTPUT_HEAVY_SECONDS
+    )
