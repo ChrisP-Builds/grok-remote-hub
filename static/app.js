@@ -123,6 +123,114 @@
     return s < 0 ? 0 : s;
   }
 
+  /* Goal mode helpers (mirror hub/ui_ux.py) */
+  function parseGoalSlash(text) {
+    if (text == null) return null;
+    const s = String(text).trim();
+    if (!s) return null;
+    const lower = s.toLowerCase();
+    if (lower === "/goal") return { action: "status" };
+    if (!lower.startsWith("/goal")) return null;
+    if (s.length > 5 && !" \t\n\r".includes(s[5])) return null;
+    const rest = s.slice(5).trim();
+    if (!rest) return { action: "status" };
+    // Whole-rest match for lifecycle keywords (multi-word = start objective).
+    const restLower = rest.toLowerCase();
+    if (restLower === "status") return { action: "status" };
+    if (restLower === "pause") return { action: "pause" };
+    if (restLower === "resume") return { action: "resume" };
+    if (restLower === "clear") return { action: "clear" };
+    return { action: "start", objective: rest };
+  }
+
+  function formatGoalElapsed(seconds) {
+    let s = Math.floor(Number(seconds));
+    if (!Number.isFinite(s) || s < 0) s = 0;
+    if (s < 60) return s + "s";
+    if (s < 3600) {
+      const m = Math.floor(s / 60);
+      const sec = s % 60;
+      return m + "m " + String(sec).padStart(2, "0") + "s";
+    }
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    return h + "h " + String(m).padStart(2, "0") + "m";
+  }
+
+  function goalBannerText(opts) {
+    const o = opts || {};
+    const elapsed = formatGoalElapsed(o.elapsed_s);
+    let detail = String(o.message || o.objective || "").trim();
+    if (detail.length > 72) detail = detail.slice(0, 71) + "…";
+    const st = String(o.status || "").trim().toLowerCase();
+    const parts = ["Goal"];
+    if (st === "paused") parts.push("paused");
+    parts.push(elapsed);
+    if (detail) parts.push(detail);
+    return parts.join(" · ");
+  }
+
+  function applyGoalToolInput(record, rawInput, title, nowMs) {
+    const titleS = String(title || "").trim();
+    const raw = rawInput && typeof rawInput === "object" && !Array.isArray(rawInput) ? rawInput : {};
+    const variant = raw.variant;
+    const isGoal =
+      titleS.toLowerCase() === "update_goal" ||
+      titleS.toLowerCase().startsWith("goal:") ||
+      String(variant || "") === "UpdateGoal";
+    if (!isGoal) return null;
+
+    let msg = "";
+    if (raw.message != null) msg = String(raw.message || "").trim();
+    if (!msg && titleS.toLowerCase().startsWith("goal:")) {
+      msg = titleS.slice(5).trim();
+    }
+    const completed = raw.completed;
+    const blocked = raw.blocked_reason;
+    const rec = record && typeof record === "object" ? record : {};
+    const prevStatus = String(rec.status || "")
+      .trim()
+      .toLowerCase();
+    let prevStarted = rec.startedAt != null ? Number(rec.startedAt) : null;
+    if (prevStarted != null && !Number.isFinite(prevStarted)) prevStarted = null;
+    const objective = String(rec.objective || "").trim();
+    const now = Number(nowMs);
+
+    if (completed === true) {
+      return {
+        status: "done",
+        objective,
+        message: msg || String(rec.message || ""),
+        startedAt: prevStarted != null ? prevStarted : now,
+        updatedAt: now,
+      };
+    }
+    if (prevStatus !== "active" && prevStatus !== "paused") {
+      const seed = msg || objective;
+      return {
+        status: "active",
+        objective: objective || msg,
+        message: seed,
+        startedAt: now,
+        updatedAt: now,
+      };
+    }
+    let newMsg;
+    if (blocked) {
+      const blockedS = String(blocked).trim();
+      newMsg = msg || blockedS || String(rec.message || "");
+    } else {
+      newMsg = msg || String(rec.message || "");
+    }
+    return {
+      status: "active",
+      objective,
+      message: newMsg,
+      startedAt: prevStarted != null ? prevStarted : now,
+      updatedAt: now,
+    };
+  }
+
   /**
    * Prefer liveTurns entry matching selected session; else primary age when selected
    * is primary (or only one live turn). Mirror of hub.ui_ux.pick_turn_age_seconds.
@@ -381,8 +489,6 @@
     maxConcurrentTurns: 3,
     /** @type {{activeTurnCount: number, maxConcurrentTurns: number, busySessionIds: string[]}|null} */
     capacity: null,
-    /** @type {{level: string, updatesBytes: number|null, message: string}|null} */
-    contextBudget: null,
     turnAgeSeconds: null,
     turnSilenceSeconds: null,
     /** Wall clock when last status/health capacity fields arrived (for live silence drift). */
@@ -530,6 +636,8 @@
     btnPlanClose: $("#btn-plan-close"),
     planAwaitBanner: $("#plan-await-banner"),
     planAwaitBannerText: $("#plan-await-banner-text"),
+    goalBanner: $("#goal-banner"),
+    goalBannerText: $("#goal-banner-text"),
     chatProject: $("#chat-project"),
     chatModel: $("#chat-model"),
     chatCwd: $("#chat-cwd"),
@@ -541,8 +649,6 @@
     turnStripCursor: $("#turn-strip-cursor"),
     capacityBanner: $("#capacity-banner"),
     capacityBannerText: $("#capacity-banner-text"),
-    contextBudgetBanner: $("#context-budget-banner"),
-    contextBudgetBannerText: $("#context-budget-banner-text"),
     form: $("#composer-form"),
     input: $("#composer-input"),
     composerFileInput: $("#composer-file-input"),
@@ -2286,29 +2392,6 @@
     els.capacityBanner.dataset.state = warn ? "warn" : "working";
   }
 
-  /**
-   * Soft same-id context budget banner. Advisory only; never blocks Send.
-   * Server: status.contextBudget { level, updatesBytes, message }.
-   */
-  function updateContextBudgetBanner() {
-    if (!els.contextBudgetBanner || !els.contextBudgetBannerText) return;
-    const budget = state.contextBudget;
-    const level = budget && budget.level ? String(budget.level) : "ok";
-    const soft = level === "soft";
-    if (!soft) {
-      els.contextBudgetBanner.classList.add("hidden");
-      els.contextBudgetBanner.dataset.level = "ok";
-      els.contextBudgetBannerText.textContent = "";
-      return;
-    }
-    const msg =
-      (budget && budget.message) ||
-      "Heavy session — responses may be slow. Prefer compact/continue same thread; use New only to fork.";
-    els.contextBudgetBannerText.textContent = msg;
-    els.contextBudgetBanner.dataset.level = "soft";
-    els.contextBudgetBanner.classList.remove("hidden");
-  }
-
   function composerConnected() {
     return state.wsState === "open" && state.status.agent === "up";
   }
@@ -2630,6 +2713,345 @@
   }
 
   const LAST_PROMPT_KEY = "grh.lastPrompt.v1";
+  /** Last selected chat — localStorage so mobile tab discard still restores. */
+  const SELECTED_SESSION_KEY = "grh.selectedSession.v1";
+  /** Per-session goal records: sessionId → { status, objective, message, startedAt, updatedAt }. */
+  const SESSION_GOALS_KEY = "grh.sessionGoals.v1";
+  const SESSION_GOALS_CAP = 40;
+
+  function saveSelectedSession(sessionId) {
+    try {
+      const id = String(sessionId || "").trim();
+      if (!id) {
+        localStorage.removeItem(SELECTED_SESSION_KEY);
+        return;
+      }
+      localStorage.setItem(
+        SELECTED_SESSION_KEY,
+        JSON.stringify({ sessionId: id, at: Date.now() })
+      );
+    } catch (_) {}
+  }
+
+  function loadSelectedSessionId() {
+    try {
+      const raw = localStorage.getItem(SELECTED_SESSION_KEY);
+      if (!raw) return null;
+      const j = JSON.parse(raw);
+      if (!j || typeof j !== "object") return null;
+      const id = String(j.sessionId || "").trim();
+      return id || null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function clearSelectedSession() {
+    try {
+      localStorage.removeItem(SELECTED_SESSION_KEY);
+    } catch (_) {}
+  }
+
+  /** @type {Map<string, {status:string, objective:string, message:string, startedAt:number, updatedAt:number}>} */
+  let sessionGoals = new Map();
+  let _goalTickTimer = null;
+  let _goalBannerTextCache = "";
+
+  function loadSessionGoals() {
+    const map = new Map();
+    try {
+      const raw = localStorage.getItem(SESSION_GOALS_KEY);
+      if (!raw) return map;
+      const j = JSON.parse(raw);
+      if (!j || typeof j !== "object" || Array.isArray(j)) return map;
+      for (const [k, v] of Object.entries(j)) {
+        if (!k || !v || typeof v !== "object") continue;
+        const st = String(v.status || "").toLowerCase();
+        if (st !== "active" && st !== "paused" && st !== "done") continue;
+        map.set(String(k), {
+          status: st,
+          objective: String(v.objective || ""),
+          message: String(v.message || ""),
+          startedAt: Number(v.startedAt) || 0,
+          updatedAt: Number(v.updatedAt) || 0,
+        });
+      }
+    } catch (_) {}
+    return map;
+  }
+
+  function persistSessionGoals() {
+    try {
+      // Cap by most-recently updated
+      let entries = [...sessionGoals.entries()];
+      if (entries.length > SESSION_GOALS_CAP) {
+        entries.sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0));
+        entries = entries.slice(0, SESSION_GOALS_CAP);
+        sessionGoals = new Map(entries);
+      }
+      const obj = {};
+      for (const [k, v] of sessionGoals) {
+        obj[k] = v;
+      }
+      localStorage.setItem(SESSION_GOALS_KEY, JSON.stringify(obj));
+    } catch (_) {}
+  }
+
+  function getGoalRecord(sessionId) {
+    const id = String(sessionId || "").trim();
+    if (!id) return null;
+    return sessionGoals.get(id) || null;
+  }
+
+  function setGoalRecord(sessionId, record) {
+    const id = String(sessionId || "").trim();
+    if (!id || !record) return;
+    sessionGoals.set(id, {
+      status: String(record.status || "active"),
+      objective: String(record.objective || ""),
+      message: String(record.message || ""),
+      startedAt: Number(record.startedAt) || Date.now(),
+      updatedAt: Number(record.updatedAt) || Date.now(),
+    });
+    persistSessionGoals();
+  }
+
+  function removeGoalRecord(sessionId) {
+    const id = String(sessionId || "").trim();
+    if (!id) return;
+    if (sessionGoals.delete(id)) persistSessionGoals();
+  }
+
+  function applyGoalSlashLifecycle(sessionId, parsed) {
+    const id = String(sessionId || "").trim();
+    if (!id || !parsed || !parsed.action) return;
+    const now = Date.now();
+    const prev = getGoalRecord(id);
+    if (parsed.action === "status") return;
+    if (parsed.action === "clear") {
+      removeGoalRecord(id);
+      updateGoalBanner();
+      syncGoalTick();
+      return;
+    }
+    if (parsed.action === "pause") {
+      if (prev && (prev.status === "active" || prev.status === "paused")) {
+        setGoalRecord(id, { ...prev, status: "paused", updatedAt: now });
+      }
+      updateGoalBanner();
+      syncGoalTick();
+      return;
+    }
+    if (parsed.action === "resume") {
+      if (prev && (prev.status === "paused" || prev.status === "active")) {
+        setGoalRecord(id, {
+          ...prev,
+          status: "active",
+          updatedAt: now,
+        });
+      }
+      updateGoalBanner();
+      syncGoalTick();
+      return;
+    }
+    if (parsed.action === "start") {
+      const obj = String(parsed.objective || "").trim();
+      // Idempotent on ACP user echo: same active objective keeps startedAt.
+      if (
+        prev &&
+        prev.status === "active" &&
+        String(prev.objective || "") === obj &&
+        prev.startedAt
+      ) {
+        setGoalRecord(id, {
+          ...prev,
+          message: obj || prev.message || "",
+          updatedAt: now,
+        });
+      } else {
+        setGoalRecord(id, {
+          status: "active",
+          objective: obj,
+          message: obj,
+          startedAt: now,
+          updatedAt: now,
+        });
+      }
+      updateGoalBanner();
+      syncGoalTick();
+    }
+  }
+
+  function noteGoalFromUserText(sessionId, text) {
+    const parsed = parseGoalSlash(text);
+    if (!parsed) return;
+    applyGoalSlashLifecycle(sessionId, parsed);
+  }
+
+  function noteGoalFromTool(sessionId, update) {
+    const id = String(sessionId || "").trim();
+    if (!id || !update) return;
+    const title = toolLabelFromUpdate(update);
+    const raw = update.rawInput != null ? update.rawInput : update.raw_input;
+    const next = applyGoalToolInput(getGoalRecord(id), raw, title, Date.now());
+    if (!next) return;
+    if (next.status === "done") {
+      // Persist done briefly then hide via remove (or keep done and hide in banner)
+      setGoalRecord(id, next);
+      // Hide: remove after storing done so refresh won't re-show
+      removeGoalRecord(id);
+    } else {
+      setGoalRecord(id, next);
+    }
+    updateGoalBanner();
+    syncGoalTick();
+  }
+
+  function rehydrateGoalFromHistory(sessionId, messages) {
+    const id = String(sessionId || "").trim();
+    if (!id || !Array.isArray(messages)) return;
+    // Build synthetic state from history without clobbering a live startedAt in storage.
+    let synthetic = null;
+    const now = Date.now();
+    for (const m of messages) {
+      if (!m) continue;
+      if (m.role === "user") {
+        const parsed = parseGoalSlash(m.text || "");
+        if (!parsed) continue;
+        if (parsed.action === "status") continue;
+        if (parsed.action === "clear") {
+          synthetic = null;
+          continue;
+        }
+        if (parsed.action === "pause") {
+          if (synthetic && (synthetic.status === "active" || synthetic.status === "paused")) {
+            synthetic = { ...synthetic, status: "paused", updatedAt: now };
+          }
+          continue;
+        }
+        if (parsed.action === "resume") {
+          if (synthetic && (synthetic.status === "paused" || synthetic.status === "active")) {
+            synthetic = { ...synthetic, status: "active", updatedAt: now };
+          }
+          continue;
+        }
+        if (parsed.action === "start") {
+          const obj = String(parsed.objective || "").trim();
+          synthetic = {
+            status: "active",
+            objective: obj,
+            message: obj,
+            startedAt: now,
+            updatedAt: now,
+          };
+        }
+        continue;
+      }
+      if (m.role === "tool") {
+        const meta = m.meta || {};
+        const title = meta.label || meta.title || m.text || "";
+        const raw = meta.rawInput != null ? meta.rawInput : meta.raw_input;
+        const next = applyGoalToolInput(synthetic, raw, title, now);
+        if (!next) continue;
+        if (next.status === "done") {
+          synthetic = null;
+        } else {
+          // Keep startedAt across history tool progress within this pass
+          if (synthetic && synthetic.startedAt) next.startedAt = synthetic.startedAt;
+          synthetic = next;
+        }
+      }
+    }
+    const existing = getGoalRecord(id);
+    if (existing && (existing.status === "active" || existing.status === "paused")) {
+      if (synthetic && (synthetic.status === "active" || synthetic.status === "paused")) {
+        setGoalRecord(id, {
+          status: synthetic.status,
+          objective: synthetic.objective || existing.objective || "",
+          message: synthetic.message || existing.message || "",
+          startedAt: existing.startedAt || synthetic.startedAt || now,
+          updatedAt: now,
+        });
+      }
+      // else keep storage as-is (history may not include goal tools)
+    } else if (synthetic && (synthetic.status === "active" || synthetic.status === "paused")) {
+      setGoalRecord(id, {
+        status: synthetic.status,
+        objective: synthetic.objective || "",
+        message: synthetic.message || "",
+        startedAt: synthetic.startedAt || now,
+        updatedAt: now,
+      });
+    } else if (existing && existing.status === "done") {
+      removeGoalRecord(id);
+    }
+    updateGoalBanner();
+    syncGoalTick();
+  }
+
+  function updateGoalBanner() {
+    if (!els.goalBanner) return;
+    const sid = state.selectedId;
+    const rec = sid ? getGoalRecord(sid) : null;
+    const st = rec ? String(rec.status || "").toLowerCase() : "";
+    const show = !!(rec && (st === "active" || st === "paused"));
+    if (!show) {
+      els.goalBanner.classList.add("hidden");
+      els.goalBanner.dataset.status = "";
+      if (els.goalBannerText) els.goalBannerText.textContent = "";
+      _goalBannerTextCache = "";
+      return;
+    }
+    const elapsedS = elapsedSecondsFromWall(Date.now(), rec.startedAt);
+    const text = goalBannerText({
+      status: st,
+      elapsed_s: elapsedS,
+      message: rec.message || "",
+      objective: rec.objective || "",
+    });
+    els.goalBanner.classList.remove("hidden");
+    els.goalBanner.dataset.status = st;
+    if (text !== _goalBannerTextCache) {
+      _goalBannerTextCache = text;
+      if (els.goalBannerText) els.goalBannerText.textContent = text;
+    }
+  }
+
+  function tickGoalBanner() {
+    const sid = state.selectedId;
+    const rec = sid ? getGoalRecord(sid) : null;
+    const st = rec ? String(rec.status || "").toLowerCase() : "";
+    if (!rec || (st !== "active" && st !== "paused")) {
+      syncGoalTick();
+      return;
+    }
+    updateGoalBanner();
+  }
+
+  function anyTrackedGoalVisible() {
+    // Tick while selected session has active/paused goal
+    const sid = state.selectedId;
+    if (!sid) return false;
+    const rec = getGoalRecord(sid);
+    if (!rec) return false;
+    const st = String(rec.status || "").toLowerCase();
+    return st === "active" || st === "paused";
+  }
+
+  function syncGoalTick() {
+    if (anyTrackedGoalVisible()) {
+      if (!_goalTickTimer) {
+        _goalTickTimer = setInterval(tickGoalBanner, 1000);
+      }
+      updateGoalBanner();
+    } else {
+      if (_goalTickTimer) {
+        clearInterval(_goalTickTimer);
+        _goalTickTimer = null;
+      }
+      updateGoalBanner();
+    }
+  }
 
   function saveLastPrompt({ sessionId, text, cwd }) {
     const t = String(text || "").trim();
@@ -3060,8 +3482,12 @@
         state.historyFingerprint = null;
         setSessionMode("none");
         clearTopbarSessionMeta();
+        clearSelectedSession();
         showEmptyMain(true);
+        updateGoalBanner();
+        syncGoalTick();
       }
+      removeGoalRecord(id);
       renderSessions();
       toast("Session deleted", "");
     } catch (err) {
@@ -4859,6 +5285,9 @@
       } else {
         processUserMessageChunk(update);
       }
+      // Lifecycle from /goal slash in user text (full message preferred).
+      const userText = extractText(update.content);
+      if (userText) noteGoalFromUserText(targetId, userText);
       return;
     }
 
@@ -4866,6 +5295,7 @@
 
     const after = () => {
       if (kind === "tool_call" || kind === "tool_call_update") {
+        noteGoalFromTool(targetId, update);
         const v = state.sessionViews.get(targetId);
         if (v && v.streamBuffers) {
           v.lastToolTitle = v.streamBuffers.lastToolTitle || "";
@@ -5000,6 +5430,7 @@
 
     state.selectedId = viewId;
     state.selectedMeta = session;
+    saveSelectedSession(viewId);
     // Reset live prompt target until attach reports (or same-id hub session).
     state.livePromptSessionId = isHubCreatedSession(viewId) ? viewId : null;
     if (!(state.turnRunning && viewId === liveKeep)) {
@@ -5047,6 +5478,8 @@
     refreshUsage();
     restoreComposerDraft(viewId);
     subscribeActiveChildrenOfSelected();
+    updateGoalBanner();
+    syncGoalTick();
 
     // Restore live/cached pane without wiping the in-flight stream / replaying history.
     const reusePane = hasCachedContent;
@@ -5062,9 +5495,11 @@
         if (state.selectedId !== viewId) {
           return { ok: false, reason: "cancelled", viewId };
         }
-        applyHistoryMessages(data.messages || [], {
+        const histMsgs = data.messages || [];
+        applyHistoryMessages(histMsgs, {
           jump: !!state.stickToBottom,
         });
+        rehydrateGoalFromHistory(viewId, histMsgs);
       } catch (err) {
         if (state.selectedId !== viewId) {
           return { ok: false, reason: "cancelled", viewId };
@@ -5079,6 +5514,8 @@
     }
     // Transcript visible: pin sticky user for section under view / live turn.
     scheduleStickyUserFromScroll();
+    updateGoalBanner();
+    syncGoalTick();
 
     // Attach-on-open: ensure live hub session for cwd (no foreign session/load).
     // While a turn is running on another session, attach takes the ACP lock and
@@ -5455,21 +5892,8 @@
           startStallWatch({ fromServer: true });
         }
       }
-      if (j.contextBudget && typeof j.contextBudget === "object") {
-        state.contextBudget = {
-          level: j.contextBudget.level || "ok",
-          updatesBytes:
-            j.contextBudget.updatesBytes != null
-              ? Number(j.contextBudget.updatesBytes)
-              : null,
-          message: j.contextBudget.message || "",
-        };
-      } else {
-        state.contextBudget = null;
-      }
       state.hubReachable = j.ok === true;
       updateCapacityBanner();
-      updateContextBudgetBanner();
       return j;
     } catch (_) {
       return null;
@@ -5898,23 +6322,10 @@
           updateTurnStrip();
         }
       }
-      if (msg.contextBudget && typeof msg.contextBudget === "object") {
-        state.contextBudget = {
-          level: msg.contextBudget.level || "ok",
-          updatesBytes:
-            msg.contextBudget.updatesBytes != null
-              ? Number(msg.contextBudget.updatesBytes)
-              : null,
-          message: msg.contextBudget.message || "",
-        };
-      } else {
-        state.contextBudget = null;
-      }
       updateVersionBadge();
       updateStatusPill();
       scheduleSessionPills();
       updateCapacityBanner();
-      updateContextBudgetBanner();
       setComposerEnabled(composerConnected());
       forceComposerUnlocked();
       return;
@@ -5944,7 +6355,9 @@
       if (msg.sessionId === state.selectedId) {
         // Never wipe a live stream with a disk dump mid-turn.
         if (turnRunningOnSelected()) return;
-        applyHistoryMessages(msg.messages || [], { jump: false });
+        const histMsgs = msg.messages || [];
+        applyHistoryMessages(histMsgs, { jump: false });
+        rehydrateGoalFromHistory(msg.sessionId, histMsgs);
       } else if (msg.sessionId) {
         hydrateSessionPane(msg.sessionId, msg.messages || []);
       }
@@ -8011,6 +8424,8 @@
       text,
       cwd,
     });
+    // Goal lifecycle from outbound /goal (before agent update_goal tools).
+    noteGoalFromUserText(sid, text);
     clearComposerDraft(state.selectedId);
     if (sid && sid !== state.selectedId) clearComposerDraft(sid);
     els.input.value = "";
@@ -9223,7 +9638,9 @@
       const data = await res.json();
       if (sessionId !== state.selectedId) return;
       if (turnRunningOnSelected()) return;
-      applyHistoryMessages(data.messages || []);
+      const histMsgs = data.messages || [];
+      applyHistoryMessages(histMsgs);
+      rehydrateGoalFromHistory(sessionId, histMsgs);
     } catch (_) {
       // keep current transcript on transient failures
     }
@@ -9657,6 +10074,11 @@
     bindMetaPopoverEvents();
     setupViewport();
     loadComposerDrafts();
+    try {
+      sessionGoals = loadSessionGoals();
+    } catch (_) {
+      sessionGoals = new Map();
+    }
     updateStatusPill();
     updateVersionBadge();
     updateSessionBanner();
@@ -9717,6 +10139,18 @@
         state.sessions = data.items || [];
         renderSessions();
         subscribeActiveChildrenOfSelected();
+        // Restore last selected chat across refresh (desktop + mobile).
+        const savedId = loadSelectedSessionId();
+        if (savedId && Array.isArray(state.sessions)) {
+          const row = state.sessions.find((s) => s && s.sessionId === savedId);
+          if (row) {
+            try {
+              await openSession(row);
+            } catch (_) {
+              // Leave empty-main; connectWs still runs below.
+            }
+          }
+        }
       }
     } catch (_) {}
 

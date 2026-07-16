@@ -10,6 +10,8 @@ This file is the **public narrative**. Session chat context is not required to u
 ## [Unreleased]
 
 ### Added
+- **Session restore on refresh** — last selected chat id stored in `localStorage` (`grh.selectedSession.v1`); bootstrap re-opens that session when it still appears in `/api/sessions` (desktop + mobile).
+- **Goal banner with persistent elapsed** — slim `#goal-banner` above the transcript for CLI `/goal` mode (`active` / `paused`); wall-clock elapsed survives turns and refresh via `grh.sessionGoals.v1` + live `update_goal` / slash lifecycle.
 - **ACP structured trace** — ring buffer + daily `logs/acp-trace-YYYYMMDD.jsonl`; `GET /api/admin/acp-trace?n=100`; last 5 on `/health` as `acpTraceRecent` (connect/send/recv/probe/heal/compact/quality, no secrets or full prompts).
 - **ACP WebSocket ping probe** — after 45s idle silence (no pending RPC), hub pings the agent WS; probe fail forces unhealthy so heal reconnects (no auto-KillAgent).
 - **Files media Share/Save** — video preview (mp4/mov/webm/m4v), Web Share API from Files, higher raw serve limit (150 MB), optional `?download=1` Content-Disposition (file-first; ADR 006/010).
@@ -19,11 +21,13 @@ This file is the **public narrative**. Session chat context is not required to u
 - **ACP quality** — `acpQuality` (`ok`/`stale`/`zombie`/`down`); chat-ready requires quality ok; zombie send-fail disconnect (ADR 013).
 - **Restart agent from pill** — when hung/down, click status pill → confirm → `POST /api/admin/restart-agent` (KillAgent-style serve recycle; hub stays up) (ADR 014).
 - **Turn telemetry / capacity** — `liveTurns` age/silence/ttfb; capacity banner while work runs.
-- **Soft context budget** — advisory when session `updates.jsonl` / tokens exceed soft thresholds (no hard gate).
 - **Open-tool wait cues** — strip prefers running over quiet while tools open; local `waiting · Ns` heartbeat.
 - **Live terminal_out** — hub terminal/* pump streams deltas to UI tool rows.
 - **Tool-row site Preview** — when a tool summary/path ends in `.html`/`.htm`, a compact **Preview** control opens the existing in-hub site preview (file-first; ADR 010).
 - **Sticky active user prompt** — scroll-linked You: pin; one-line collapsed by default; click expands; higher contrast sticky bar.
+
+### Removed
+- **Heavy-session soft context banner** — dropped `#context-budget-banner` / `contextBudget` status field (journal-size false positives after compact). Context UX matches the CLI usage bar only; `updates.jsonl` size still scales no-output stall thresholds internally.
 
 ### Fixed
 - **Orphan agent turn after hub force-clear** — stall watchdog, admin reset-turn, and no-output recovery now call `session/cancel` (via `notify_agent_cancel`) so the agent releases the old prompt; UI unlock no longer leaves the next message blocked forever.

@@ -461,22 +461,19 @@ def test_server_status_exposes_turn_telemetry_and_capacity() -> None:
     assert "first_update_at" in acp
 
 
-def test_server_status_exposes_context_budget() -> None:
-    """status/health expose soft contextBudget for primary loadedSessionId."""
+def test_server_status_no_context_budget_banner() -> None:
+    """status/health no longer expose contextBudget; journal size still used for stalls."""
     src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
     policy = (ROOT / "hub" / "session_policy.py").read_text(encoding="utf-8")
-    assert "def context_budget_level" in policy
+    assert "def context_budget_level" not in policy
+    assert "CONTEXT_SOFT_MESSAGE" not in policy
+    assert "CONTEXT_SOFT_TOKENS" not in policy
     assert "CONTEXT_SOFT_UPDATES_BYTES" in policy
-    assert "CONTEXT_SOFT_TOKENS" in policy
-    assert "CONTEXT_SOFT_MESSAGE" in policy
-    assert "def _context_budget_payload" in src
-    assert "context_budget_level" in src
-    assert "contextBudget" in src
-    assert "updatesBytes" in src
+    assert "no_output_seconds_for_session" in policy
+    assert "def _context_budget_payload" not in src
+    assert "contextBudget" not in src
+    assert "context_budget_level" not in src
+    # Internal stall scaling still measures updates.jsonl size
+    assert "def _session_updates_bytes" in src
     assert "updates.jsonl" in src
-    # Soft only: no hard gate / session-new auto / KillAgent from this path
-    budget_fn = src[src.find("def _context_budget_payload") :]
-    budget_fn = budget_fn[:1800]
-    assert "session/new" not in budget_fn
-    assert "KillAgent" not in budget_fn
-    assert "hard" not in budget_fn.lower() or "skip if hard" in budget_fn.lower()
+    assert "no_output_seconds_for_session" in src

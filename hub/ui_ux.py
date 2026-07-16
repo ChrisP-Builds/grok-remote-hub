@@ -225,3 +225,173 @@ def pick_turn_age_seconds(
         if only is not None:
             return only
     return None
+
+
+# ---------------------------------------------------------------------------
+# Goal mode helpers (CLI /goal + update_goal tool; mirrored in static/app.js)
+# ---------------------------------------------------------------------------
+
+
+def parse_goal_slash(text: str | None) -> dict | None:
+    """Parse a user `/goal …` slash command.
+
+    Returns ``None`` if the text is not a ``/goal`` command.
+    Otherwise ``{"action": "start"|"status"|"pause"|"resume"|"clear", "objective"?: str}``.
+    Bare ``/goal`` is treated as ``status`` (no lifecycle change).
+    """
+    if text is None:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    # Whole-message /goal (optional rest). Case-insensitive command name.
+    lower = s.lower()
+    if lower == "/goal":
+        return {"action": "status"}
+    if not lower.startswith("/goal"):
+        return None
+    # Require space or end after /goal so "/goalie" is not a match
+    if len(s) > 5 and s[5] not in " \t\n\r":
+        return None
+    rest = s[5:].strip()
+    if not rest:
+        return {"action": "status"}
+    # Whole-rest match for lifecycle keywords (multi-word = start objective).
+    rest_lower = rest.lower()
+    if rest_lower == "status":
+        return {"action": "status"}
+    if rest_lower == "pause":
+        return {"action": "pause"}
+    if rest_lower == "resume":
+        return {"action": "resume"}
+    if rest_lower == "clear":
+        return {"action": "clear"}
+    return {"action": "start", "objective": rest}
+
+
+def format_goal_elapsed(seconds: float | int | None) -> str:
+    """Compact wall-clock elapsed for goal banner: ``45s``, ``3m 12s``, ``1h 05m``."""
+    try:
+        s = int(seconds)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        s = 0
+    if s < 0:
+        s = 0
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        m, sec = divmod(s, 60)
+        return f"{m}m {sec:02d}s"
+    h, rem = divmod(s, 3600)
+    m = rem // 60
+    return f"{h}h {m:02d}m"
+
+
+def goal_banner_text(
+    *,
+    status: str = "active",
+    elapsed_s: float | int | None = 0,
+    message: str = "",
+    objective: str = "",
+) -> str:
+    """Slim goal banner label, e.g. ``Goal · 14m 32s · Reading PR0 brief…``."""
+    elapsed = format_goal_elapsed(elapsed_s)
+    detail = (message or objective or "").strip()
+    if len(detail) > 72:
+        detail = detail[:71] + "…"
+    st = str(status or "").strip().lower()
+    parts: list[str] = ["Goal"]
+    if st == "paused":
+        parts.append("paused")
+    parts.append(elapsed)
+    if detail:
+        parts.append(detail)
+    return " · ".join(parts)
+
+
+def apply_goal_tool_input(
+    record: dict | None,
+    raw_input: object,
+    title: str | None,
+    now_ms: float,
+) -> dict | None:
+    """Fold an ``update_goal`` / ``Goal: …`` tool event into a goal record.
+
+    Returns a new record dict, or ``None`` when the event is not goal-related.
+    Record shape: ``{status, objective, message, startedAt, updatedAt}``.
+    """
+    title_s = str(title or "").strip()
+    raw: dict = raw_input if isinstance(raw_input, dict) else {}
+    variant = raw.get("variant")
+    is_goal = (
+        title_s.lower() == "update_goal"
+        or title_s.lower().startswith("goal:")
+        or str(variant or "") == "UpdateGoal"
+    )
+    if not is_goal:
+        return None
+
+    msg = ""
+    if raw.get("message") is not None:
+        msg = str(raw.get("message") or "").strip()
+    if not msg and title_s.lower().startswith("goal:"):
+        msg = title_s[5:].strip()
+
+    completed = raw.get("completed")
+    blocked = raw.get("blocked_reason")
+
+    rec = dict(record) if isinstance(record, dict) else {}
+    prev_status = str(rec.get("status") or "").strip().lower()
+    prev_started = rec.get("startedAt")
+    try:
+        prev_started_f = float(prev_started) if prev_started is not None else None
+    except (TypeError, ValueError):
+        prev_started_f = None
+
+    def _base(
+        *,
+        status: str,
+        started: float,
+        message: str,
+        objective: str,
+    ) -> dict:
+        return {
+            "status": status,
+            "objective": objective,
+            "message": message,
+            "startedAt": started,
+            "updatedAt": float(now_ms),
+        }
+
+    objective = str(rec.get("objective") or "").strip()
+    if completed is True:
+        return _base(
+            status="done",
+            started=prev_started_f if prev_started_f is not None else float(now_ms),
+            message=msg or str(rec.get("message") or ""),
+            objective=objective,
+        )
+
+    # First progress when none/done → new cycle
+    if prev_status not in ("active", "paused"):
+        seed_msg = msg or objective
+        return _base(
+            status="active",
+            started=float(now_ms),
+            message=seed_msg,
+            objective=objective or msg,
+        )
+
+    # Progress while running: keep startedAt; blocked_reason updates message only
+    if blocked:
+        blocked_s = str(blocked).strip()
+        new_msg = msg or blocked_s or str(rec.get("message") or "")
+    else:
+        new_msg = msg or str(rec.get("message") or "")
+
+    return _base(
+        status="active",
+        started=prev_started_f if prev_started_f is not None else float(now_ms),
+        message=new_msg,
+        objective=objective,
+    )

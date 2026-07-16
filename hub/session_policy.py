@@ -29,13 +29,8 @@ STUCK_TURN_SECONDS = 1800.0
 CLIENT_STALL_WARN_SECONDS = 120.0
 CLIENT_STALL_UNLOCK_SECONDS = 0  # 0 = disabled auto-unlock
 
-# Soft context budget (same-id continuity). Soft banner only; never hard-block Send.
+# Soft history size for no-output stall scaling (not UI banner).
 CONTEXT_SOFT_UPDATES_BYTES = 6_000_000  # ~6MB updates.jsonl
-CONTEXT_SOFT_TOKENS = 80_000  # if totalTokens known
-CONTEXT_SOFT_MESSAGE = (
-    "Heavy session — responses may be slow. Prefer compact/continue same thread; "
-    "use New only to fork."
-)
 
 
 def no_output_seconds_for_session(
@@ -59,29 +54,6 @@ def no_output_seconds_for_session(
     if size > int(soft_updates_bytes):
         return float(soft_seconds)
     return float(base_seconds)
-
-
-def context_budget_level(
-    *,
-    updates_bytes: int | None = None,
-    total_tokens: int | None = None,
-    soft_updates_bytes: int = CONTEXT_SOFT_UPDATES_BYTES,
-    soft_tokens: int = CONTEXT_SOFT_TOKENS,
-) -> str:
-    """Return 'ok' | 'soft'. soft if either signal exceeds soft threshold when provided."""
-    if updates_bytes is not None:
-        try:
-            if int(updates_bytes) > int(soft_updates_bytes):
-                return "soft"
-        except (TypeError, ValueError):
-            pass
-    if total_tokens is not None:
-        try:
-            if int(total_tokens) > int(soft_tokens):
-                return "soft"
-        except (TypeError, ValueError):
-            pass
-    return "ok"
 
 
 def turn_telemetry(
