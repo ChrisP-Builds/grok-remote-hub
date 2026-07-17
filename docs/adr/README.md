@@ -39,3 +39,5 @@ a new ADR.
 | 012 | Durable Hub plan-mode approval via plan_mode.json | Accepted | 2026-07-14 |
 | 013 | ACP quality beyond process-up and connected boolean | Accepted | 2026-07-14 |
 | 014 | In-hub agent restart from hung status pill | Accepted | 2026-07-14 |
+| 015 | CLI-aligned turn ownership (cancel frees agent; wake re-sync) | Accepted | 2026-07-16 |
+| 016 | Quiet-period session/load suppress before re-prompt | Accepted | 2026-07-17 |
