@@ -63,14 +63,14 @@ The stock Grok CLI TUI is excellent on the desktop, but it is a **single local p
 ## Features
 
 - **Session rail** — Working / Subagent / All, search, pin, rename, delete
-- **Live stream** — multi-browser WebSocket fan-out; mid-turn switch keeps continuity
+- **Live stream** — multi-browser WebSocket fan-out; mid-turn switch keeps continuity; turn stop/clear cancels agent (CLI-aligned); wake re-syncs stuck turns
 - **Agent status** — pill and `/health` distinguish process up vs ACP connected **and** ACP quality (`ok`/`stale`/`zombie`); auto-reconnect when process is up; after heal exhaustion, **click the hung pill** to restart the agent serve (hub stays up)
 - **Plan mode (Hub)** — View plan appears **inline** when awaiting/Active; Approve writes `plan_mode.json` (not stock TUI `exit_plan_mode`)
 - **History** — hydrate from `updates.jsonl` when you open a session
 - **Composer** — multi-line input, slash palette, prompt queue while a turn runs
 - **Files** — sandboxed tree for the session cwd (edit, markdown + Mermaid, images)
 - **Site preview** — double-click or **Preview** on `.html` / `.htm` in the Files tree, or **Preview** on a tool row when an HTML path is present; same-origin Python serve (relative CSS/JS work on Tailscale/phone); Close stops the preview
-- **Usage** — session context + weekly plan bars (from local Grok login)
+- **Usage** — session context bar from session `signals.json` (not compact-op toast metrics) + weekly plan bar (local Grok login); large sessions can match CLI first-token cost after `session/prompt`
 - **Ops scripts** — detached start / stop / restart, firewall helper, logon task
 - **Terminal follower** — `follow.ps1` tails the same session in a desktop terminal
 - **Browser Preview Hub** — optional standalone Node companion for static sites / SPAs (iframe chrome, device presets) outside the hub UI; see [tools/preview-hub/README.md](tools/preview-hub/README.md). Prefer in-hub Preview for files under a session cwd.
