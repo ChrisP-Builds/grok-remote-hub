@@ -9,6 +9,12 @@ This file is the **public narrative**. Session chat context is not required to u
 
 ## [Unreleased]
 
+---
+
+## [0.4.0] — 2026-07-19
+
+ACP reliability, honest compact, and hub control plane. Remote hub is now a full control plane: chat-ready ACP health, CLI-aligned turn ownership, honest context compact, and session UX that survives refresh, restart, and heavy history.
+
 ### Changed
 - **New session folder picker** — Projects | Browse segmented tabs; browse mode uses breadcrumbs, folder rows with open chevron, sticky **Use this folder** CTA, loading/empty states; Projects list prioritizes search, shows Recent (localStorage `grh.recentProjects.v1`), and clearer empty copy; entry choice remembers list vs browse for Back.
 - **Skip redundant session/load when already warm** — hub tracks session ids successfully `session/new` or `session/load`'d in this process; repeat loads skip the agent RPC (cleared on ACP disconnect). Does not remove model prefill cost of large history on first real prompt.
@@ -60,7 +66,7 @@ This file is the **public narrative**. Session chat context is not required to u
 - **Multi-table messages** — every GFM table in a message body renders as HTML, not only the first.
 - **Short GFM table separators** — agent-written tables with 1–2 dashes per separator cell (e.g. `|--|---|`) now render as tables instead of plain text.
 - **Orphan agent turn after hub force-clear** — stall watchdog, admin reset-turn, and no-output recovery now call `session/cancel` (via `notify_agent_cancel`) so the agent releases the old prompt; UI unlock no longer leaves the next message blocked forever.
-- **Heavy-session no-output false kill** — never suppress ACP activity mid-turn; release load-suppress before re-prompt. (First-byte wait no longer scales by journal size; no-output heal now forces reload — see Unreleased.)
+- **Heavy-session no-output false kill** — never suppress ACP activity mid-turn; release load-suppress before re-prompt. (First-byte wait no longer scales by journal size; no-output heal now forces reload — see above.)
 - **Turn elapsed/silence timers seed from server age** — strip `running · Ns` and tool `waiting · Ns` survive hard-refresh/reconnect (no more client-only `Date.now()` reset to 0s).
 - **session/load historical replay no longer streamed live** — drops agent history flood during load (stops UI tool strobe); history still via REST/WS.
 - **Stale ACP heal no longer kills mid-prompt** — heal skips `stale` while a turn is active (stall watchdog owns silent prompts); `ACP_STALE_SECONDS` raised to 90s so quality does not flip before the 60s no-output policy.

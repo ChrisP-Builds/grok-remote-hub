@@ -780,7 +780,7 @@ class AcpClient:
                         "fs": {"readTextFile": True, "writeTextFile": True},
                         "terminal": True,
                     },
-                    "clientInfo": {"name": "grok-remote-hub", "version": "0.3.2"},
+                    "clientInfo": {"name": "grok-remote-hub", "version": "0.4.0"},
                 },
                 timeout=30.0,
             )

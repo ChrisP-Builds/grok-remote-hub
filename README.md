@@ -253,7 +253,7 @@ See **[CHANGELOG.md](CHANGELOG.md)** (public release history), **[CONTRIBUTING.m
 
 ---
 
-## Known limits (v0.3)
+## Known limits (v0.4)
 
 - **Multi-project concurrent live turns** supported (default max 3 different project cwds; configure `max_concurrent_turns` under `[hub]`). Same-project follow-ups still queue. Sole ACP connection; multi-process agent pool is a future scale-out if needed.
 - Cancel is best-effort (depends on agent support)

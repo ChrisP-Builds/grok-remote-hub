@@ -19,7 +19,7 @@ STATIC = ROOT / "static"
 
 def test_hub_version_exported() -> None:
     assert HUB_VERSION == hub.__version__
-    assert hub.__version__ == "0.3.2"
+    assert hub.__version__ == "0.4.0"
 
 
 def test_parse_version_first_line() -> None:
@@ -54,7 +54,7 @@ def test_structural_compat_ok_when_healthy(tmp_path: Path) -> None:
     assert result["ok"] is True
     assert result["level"] == "structural"
     assert result["productTag"] == "remote-stream"
-    assert result["hubVersion"] == "0.3.2"
+    assert result["hubVersion"] == "0.4.0"
     assert result["cliVersion"] == "grok 0.2.93 (test)"
     assert result["checks"]["agentUp"] is True
     assert result["checks"]["acpConnected"] is True
