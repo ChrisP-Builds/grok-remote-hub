@@ -5,11 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 
 from hub.ui_format import (
+    find_simple_markdown_tables,
     format_plan_summary,
     format_term_prefix,
     format_tool_line,
     parse_simple_markdown_table,
     should_show_tool_line,
+    split_text_with_markdown_tables,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +70,8 @@ def test_js_term_line_structure() -> None:
     assert "formatTermPrefix" in js
     assert "formatToolLine" in js
     assert "parseSimpleMarkdownTable" in js
+    assert "findSimpleMarkdownTables" in js
+    assert "splitTextWithMarkdownTables" in js
     assert "finalizeAssistantTables" in js
     assert "bodyEl._rawText = raw" in js
     assert "shouldShowToolLine" in js
@@ -105,13 +109,19 @@ def test_js_mobile_table_raw_text_contracts() -> None:
     # setTermBodyContent always stores raw before parse/render
     set_idx = js.find("function setTermBodyContent")
     assert set_idx >= 0
-    set_fn = js[set_idx : set_idx + 400]
+    set_fn = js[set_idx : set_idx + 900]
     assert "bodyEl._rawText = raw" in set_fn
+    # Multi-table path: must segment full body, not dump a single after= as pure text
+    assert "splitTextWithMarkdownTables" in set_fn
+    assert "buildTermTableEl" in set_fn
+    # Must not use first-table-only after-segment path
+    assert "const after = lines.slice(tableEnd)" not in set_fn
+    assert "parseSimpleMarkdownTable(raw)" not in set_fn
 
     # appendToBody accumulates from _rawText via mergeStreamText (cumulative-safe)
     app_idx = js.find("function appendToBody")
     assert app_idx >= 0
-    app_fn = js[app_idx : app_idx + 700]
+    app_fn = js[app_idx : app_idx + 1100]
     assert "body._rawText" in app_fn
     assert "const prev = body._rawText != null" in app_fn
     assert "mergeStreamText(prev, text)" in app_fn
@@ -161,12 +171,25 @@ def test_css_tool_plan_expand() -> None:
 
 
 def test_format_term_prefix() -> None:
-    assert format_term_prefix("user") == "You:"
-    assert format_term_prefix("assistant") == "Grok:"
+    # Trailing space keeps "You: /compact" readable next to body text.
+    assert format_term_prefix("user") == "You: "
+    assert format_term_prefix("assistant") == "Grok: "
     assert format_term_prefix("tool") == "·"
     assert format_term_prefix("thought") == "·"
     assert format_term_prefix("plan") == "·"
     assert format_term_prefix("system") == "·"
+
+
+def test_js_format_term_prefix_trailing_space() -> None:
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    idx = js.find("function formatTermPrefix")
+    assert idx >= 0
+    chunk = js[idx : idx + 400]
+    assert 'return "You: "' in chunk or "return 'You: '" in chunk
+    assert 'return "Grok: "' in chunk or "return 'Grok: '" in chunk
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    # Readable gap between prefix and body (≥1ch).
+    assert "margin-right: 1ch" in css
 
 
 def test_format_tool_line() -> None:
@@ -232,12 +255,85 @@ def test_parse_simple_markdown_table() -> None:
     assert parse_simple_markdown_table(strict) is not None
 
 
+def test_split_text_with_markdown_tables_multi() -> None:
+    """Two tables with prose between → two table segments + text segments."""
+    sample = (
+        "Already have:\n"
+        "\n"
+        "| Capability | Notes |\n"
+        "| --- | --- |\n"
+        "| A | one |\n"
+        "| B | two |\n"
+        "\n"
+        "Don't have:\n"
+        "\n"
+        "| Gap | Why |\n"
+        "| --- | --- |\n"
+        "| X | missing |\n"
+        "| Y | planned |\n"
+        "\n"
+        "Done.\n"
+    )
+    parts = split_text_with_markdown_tables(sample)
+    kinds = [k for k, _ in parts]
+    assert kinds.count("table") == 2
+    assert "text" in kinds
+    tables = [v for k, v in parts if k == "table"]
+    assert tables[0][0] == ["Capability", "Notes"]
+    assert tables[0][1] == ["A", "one"]
+    assert tables[1][0] == ["Gap", "Why"]
+    assert tables[1][1] == ["X", "missing"]
+    # Prose around tables is preserved as text segments
+    text_blobs = "\n".join(v for k, v in parts if k == "text")
+    assert "Already have" in text_blobs
+    assert "Don't have" in text_blobs or "Don" in text_blobs
+    assert "Done." in text_blobs
+
+    found = find_simple_markdown_tables(sample)
+    assert len(found) == 2
+    assert found[0]["rows"][0][0] == "Capability"
+    assert found[1]["rows"][0][0] == "Gap"
+    # First-table API still returns only the first
+    first = parse_simple_markdown_table(sample)
+    assert first is not None
+    assert first[0] == ["Capability", "Notes"]
+
+
+def test_split_dual_capability_gap_shape() -> None:
+    """Exact dual-table UX shape (Capability + Gap) yields 2 table segments."""
+    dual = (
+        "Here's the scoreboard.\n"
+        "\n"
+        "**Already have**\n"
+        "\n"
+        "| Capability | In hub? |\n"
+        "|---|---|\n"
+        "| Multi-session | yes |\n"
+        "| Mobile tables | partial |\n"
+        "\n"
+        "**Don't have**\n"
+        "\n"
+        "| Gap | Blocker |\n"
+        "|---|---|\n"
+        "| Full GFM | scope |\n"
+        "| Nested lists | later |\n"
+    )
+    parts = split_text_with_markdown_tables(dual)
+    table_parts = [v for k, v in parts if k == "table"]
+    assert len(table_parts) == 2
+    assert table_parts[0][0] == ["Capability", "In hub?"]
+    assert table_parts[1][0] == ["Gap", "Blocker"]
+    assert len(table_parts[0]) == 3  # header + 2 body
+    assert len(table_parts[1]) == 3
+
+
 def test_js_table_sep_accepts_short_dashes() -> None:
     """Contract: JS table parsers use -{1,} not only -{3,}."""
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     assert r"-{1,}" in js
-    # Ensure we did not leave only the old strict form as the sep rule
-    assert js.count(r"-{1,}") >= 4  # sepRe + looseSepRe × parse + setTermBodyContent
+    # Shared sep helpers (strict + loose); both use -{1,}
+    assert js.count(r"-{1,}") >= 2
+    assert "_TABLE_SEP_RE" in js or "findSimpleMarkdownTables" in js
 
 
 def test_format_plan_summary() -> None:

@@ -10,6 +10,9 @@ from hub.status_view import (
     ACP_PROBE_SILENCE_S,
     ACP_STALE_SECONDS,
     ACP_ZOMBIE_SEND_FAILURES,
+    LOAD_SUPPRESS_MAX_S,
+    LOAD_SUPPRESS_QUIET_S,
+    load_suppress_should_release,
     map_acp_quality,
     map_agent_status,
     should_attempt_acp_heal,
@@ -316,8 +319,8 @@ def test_suppress_tool_call_during_load() -> None:
     )
 
 
-def test_does_not_suppress_when_sid_has_active_turn() -> None:
-    """Live re-prompt must receive note_activity even if load suppress still set."""
+def test_suppress_when_loading_even_with_active_turn() -> None:
+    """Loading wins: residual load-replay stays suppressed during re-prompt arming."""
     loading = {"sess-a"}
     active = frozenset({"sess-a"})
     assert (
@@ -328,7 +331,7 @@ def test_does_not_suppress_when_sid_has_active_turn() -> None:
             update_kind="tool_call",
             active_turn_session_ids=active,
         )
-        is False
+        is True
     )
     assert (
         should_suppress_session_load_fanout(
@@ -336,6 +339,32 @@ def test_does_not_suppress_when_sid_has_active_turn() -> None:
             session_id="sess-a",
             method="_x.ai/session/update",
             update_kind="agent_thought_chunk",
+            active_turn_session_ids=active,
+        )
+        is True
+    )
+
+
+def test_no_suppress_active_turn_when_not_loading() -> None:
+    """Live stream ok when session is not loading, even with active turn set."""
+    active = frozenset({"sess-a"})
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids=set(),
+            session_id="sess-a",
+            method="session/update",
+            update_kind="tool_call",
+            active_turn_session_ids=active,
+        )
+        is False
+    )
+    # Other session loading must not suppress this session's live updates.
+    assert (
+        should_suppress_session_load_fanout(
+            loading_session_ids={"sess-b"},
+            session_id="sess-a",
+            method="session/update",
+            update_kind="agent_message_chunk",
             active_turn_session_ids=active,
         )
         is False
@@ -462,7 +491,7 @@ def test_server_status_exposes_turn_telemetry_and_capacity() -> None:
 
 
 def test_server_status_no_context_budget_banner() -> None:
-    """status/health no longer expose contextBudget; journal size still used for stalls."""
+    """status/health no longer expose contextBudget; first-byte uses no_output_seconds_for_session."""
     src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
     policy = (ROOT / "hub" / "session_policy.py").read_text(encoding="utf-8")
     assert "def context_budget_level" not in policy
@@ -473,7 +502,143 @@ def test_server_status_no_context_budget_banner() -> None:
     assert "def _context_budget_payload" not in src
     assert "contextBudget" not in src
     assert "context_budget_level" not in src
-    # Internal stall scaling still measures updates.jsonl size
     assert "def _session_updates_bytes" in src
     assert "updates.jsonl" in src
     assert "no_output_seconds_for_session" in src
+    assert "NO_OUTPUT_RETRY_SECONDS" in src
+
+
+def test_load_suppress_should_release_matrix() -> None:
+    quiet = LOAD_SUPPRESS_QUIET_S
+    max_s = LOAD_SUPPRESS_MAX_S
+    # Quiet elapsed, under max → release
+    assert (
+        load_suppress_should_release(
+            quiet_elapsed_s=quiet,
+            quiet_s=quiet,
+            held_s=1.0,
+            max_s=max_s,
+        )
+        is True
+    )
+    # Quiet not yet, under max → hold
+    assert (
+        load_suppress_should_release(
+            quiet_elapsed_s=0.5,
+            quiet_s=quiet,
+            held_s=1.0,
+            max_s=max_s,
+        )
+        is False
+    )
+    # Past max even if still noisy → release
+    assert (
+        load_suppress_should_release(
+            quiet_elapsed_s=0.0,
+            quiet_s=quiet,
+            held_s=max_s,
+            max_s=max_s,
+        )
+        is True
+    )
+    assert (
+        load_suppress_should_release(
+            quiet_elapsed_s=0.1,
+            quiet_s=quiet,
+            held_s=max_s + 1.0,
+            max_s=max_s,
+        )
+        is True
+    )
+    # Exactly at quiet boundary
+    assert (
+        load_suppress_should_release(
+            quiet_elapsed_s=1.5,
+            quiet_s=1.5,
+            held_s=0.0,
+            max_s=20.0,
+        )
+        is True
+    )
+    # Just under quiet and max
+    assert (
+        load_suppress_should_release(
+            quiet_elapsed_s=1.49,
+            quiet_s=1.5,
+            held_s=19.9,
+            max_s=20.0,
+        )
+        is False
+    )
+
+
+def test_acp_client_load_suppress_quiet_period_structural() -> None:
+    """session_load uses quiet rearm, not fixed-only call_later(0.3)."""
+    acp = (ROOT / "hub" / "acp_client.py").read_text(encoding="utf-8")
+    assert "LOAD_SUPPRESS_QUIET_S" in acp
+    assert "LOAD_SUPPRESS_MAX_S" in acp
+    assert "_rearm_load_suppress_release" in acp
+    assert "_load_suppress_deadline" in acp
+    assert "call_later(0.3" not in acp
+    # finally arms quiet timer
+    assert "LOAD_SUPPRESS_QUIET_S, _delayed_release" in acp or (
+        "LOAD_SUPPRESS_QUIET_S" in acp and "call_later" in acp
+    )
+    # suppress branch rearms
+    assert "self._rearm_load_suppress_release(key)" in acp
+    # release clears deadline
+    assert "_load_suppress_deadline.pop" in acp
+
+
+def test_wait_load_suppress_settled_returns_after_release() -> None:
+    """wait_load_suppress_settled exits when release drops sid from loading set."""
+    import asyncio
+    from hub.acp_client import AcpClient
+    from hub.config import Config
+
+    client = AcpClient(Config(), secret="test-wait-load-suppress")
+    sid = "wait-load-sid"
+
+    async def run() -> None:
+        client._loading_sessions.add(sid)
+        # Release after a short delay (simulates quiet timer).
+        async def release_soon() -> None:
+            await asyncio.sleep(0.08)
+            client.release_load_suppress(sid)
+
+        task = asyncio.create_task(release_soon())
+        await client.wait_load_suppress_settled(sid, timeout=2.0)
+        await task
+        assert sid not in client._loading_sessions
+
+    asyncio.run(run())
+
+
+def test_wait_load_suppress_settled_timeout_force_releases() -> None:
+    """On timeout, wait_load_suppress_settled force-releases loading sid."""
+    import asyncio
+    from hub.acp_client import AcpClient
+    from hub.config import Config
+
+    client = AcpClient(Config(), secret="test-wait-load-timeout")
+    sid = "wait-load-timeout-sid"
+
+    async def run() -> None:
+        client._loading_sessions.add(sid)
+        await client.wait_load_suppress_settled(sid, timeout=0.12)
+        assert sid not in client._loading_sessions
+
+    asyncio.run(run())
+
+
+def test_wait_load_suppress_settled_noop_when_not_loading() -> None:
+    import asyncio
+    from hub.acp_client import AcpClient
+    from hub.config import Config
+
+    client = AcpClient(Config(), secret="test-wait-load-noop")
+
+    async def run() -> None:
+        await client.wait_load_suppress_settled("no-such", timeout=1.0)
+
+    asyncio.run(run())

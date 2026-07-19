@@ -8,6 +8,7 @@ from hub.session_policy import (
     CLIENT_STALL_UNLOCK_SECONDS,
     CLIENT_STALL_WARN_SECONDS,
     CONTEXT_SOFT_UPDATES_BYTES,
+    HOT_PATH_MAX_HUB_PRE_PROMPT_S,
     MAX_TURN_SECONDS,
     MID_TURN_STALL_SECONDS,
     NO_OUTPUT_HEAVY_SECONDS,
@@ -16,9 +17,13 @@ from hub.session_policy import (
     NO_OUTPUT_SECONDS,
     NO_OUTPUT_SOFT_SECONDS,
     STUCK_TURN_SECONDS,
+    apply_turn_activity,
+    counts_toward_agent_ttfb,
     cwd_key,
+    ensure_action_blocks_prompt,
     entry_requires_resume_choice,
     is_hub_resume_candidate,
+    is_live_hot_path,
     is_no_output_error_message,
     is_turn_stuck_for_new_prompt,
     load_hub_session_ids,
@@ -31,9 +36,15 @@ from hub.session_policy import (
     save_remote_sessions,
     sessions_matching_cwd,
     should_auto_retry_no_output,
+    should_clear_turn_on_wake,
     should_force_clear_turn,
+    should_skip_session_load,
+    split_prompt_latency,
     turn_telemetry,
 )
+
+ROOT = Path(__file__).resolve().parents[1]
+STATIC = ROOT / "static"
 
 
 def test_tui_aligned_timeout_constants() -> None:
@@ -41,7 +52,7 @@ def test_tui_aligned_timeout_constants() -> None:
     assert NO_OUTPUT_SOFT_SECONDS == 180.0
     assert NO_OUTPUT_HEAVY_SECONDS == 300.0
     assert NO_OUTPUT_HEAVY_UPDATES_BYTES == 12_000_000
-    assert NO_OUTPUT_RETRY_SECONDS == 300.0
+    assert NO_OUTPUT_RETRY_SECONDS == 90.0
     assert MID_TURN_STALL_SECONDS == 600.0
     assert MAX_TURN_SECONDS == 1800.0
     assert STUCK_TURN_SECONDS == 1800.0
@@ -55,13 +66,13 @@ def test_no_output_seconds_for_session_none_is_base() -> None:
 
 
 def test_no_output_seconds_for_session_soft() -> None:
+    # First-byte never scales by history size (CLI-like 60s).
     assert (
         no_output_seconds_for_session(
             updates_bytes=CONTEXT_SOFT_UPDATES_BYTES + 1
         )
-        == 180.0
+        == 60.0
     )
-    # At soft boundary (not greater) stays base
     assert (
         no_output_seconds_for_session(updates_bytes=CONTEXT_SOFT_UPDATES_BYTES)
         == 60.0
@@ -73,18 +84,14 @@ def test_no_output_seconds_for_session_heavy() -> None:
         no_output_seconds_for_session(
             updates_bytes=NO_OUTPUT_HEAVY_UPDATES_BYTES + 1
         )
-        == 300.0
+        == 60.0
     )
-    # Soft but not heavy
-    assert (
-        no_output_seconds_for_session(updates_bytes=7_000_000) == 180.0
-    )
-    # At heavy boundary (not greater) stays soft
+    assert no_output_seconds_for_session(updates_bytes=7_000_000) == 60.0
     assert (
         no_output_seconds_for_session(
             updates_bytes=NO_OUTPUT_HEAVY_UPDATES_BYTES
         )
-        == 180.0
+        == 60.0
     )
 
 
@@ -866,8 +873,8 @@ def test_client_stall_never_auto_unlocks() -> None:
     assert CLIENT_STALL_UNLOCK_SECONDS == 0
 
 
-def test_context_soft_updates_bytes_used_for_no_output_scaling() -> None:
-    """CONTEXT_SOFT_UPDATES_BYTES remains for internal stall scaling, not UI banner."""
+def test_context_soft_updates_bytes_not_used_for_first_byte() -> None:
+    """First-byte silence always base; soft/heavy history size ignored."""
     assert CONTEXT_SOFT_UPDATES_BYTES == 6_000_000
     assert no_output_seconds_for_session(updates_bytes=0) == NO_OUTPUT_SECONDS
     assert (
@@ -876,9 +883,446 @@ def test_context_soft_updates_bytes_used_for_no_output_scaling() -> None:
     )
     assert (
         no_output_seconds_for_session(updates_bytes=CONTEXT_SOFT_UPDATES_BYTES + 1)
-        == NO_OUTPUT_SOFT_SECONDS
+        == NO_OUTPUT_SECONDS
     )
     assert (
         no_output_seconds_for_session(updates_bytes=NO_OUTPUT_HEAVY_UPDATES_BYTES + 1)
-        == NO_OUTPUT_HEAVY_SECONDS
+        == NO_OUTPUT_SECONDS
     )
+
+
+def test_should_clear_turn_on_wake_not_running() -> None:
+    assert (
+        should_clear_turn_on_wake(
+            turn_running=False,
+            silence_seconds=999.0,
+            acp_quality="zombie",
+        )
+        is False
+    )
+
+
+def test_should_clear_turn_on_wake_bad_quality() -> None:
+    for q in ("stale", "zombie", "down", "STALE", "Zombie"):
+        assert (
+            should_clear_turn_on_wake(
+                turn_running=True,
+                silence_seconds=None,
+                acp_quality=q,
+            )
+            is True
+        ), q
+
+
+def test_should_clear_turn_on_wake_silence_threshold() -> None:
+    assert (
+        should_clear_turn_on_wake(
+            turn_running=True,
+            silence_seconds=120.0,
+            acp_quality="ok",
+        )
+        is True
+    )
+    assert (
+        should_clear_turn_on_wake(
+            turn_running=True,
+            silence_seconds=119.9,
+            acp_quality="ok",
+        )
+        is False
+    )
+    assert (
+        should_clear_turn_on_wake(
+            turn_running=True,
+            silence_seconds=60.0,
+            acp_quality="ok",
+            silence_threshold_s=60.0,
+        )
+        is True
+    )
+
+
+def test_should_clear_turn_on_wake_open_tools_protects() -> None:
+    """Healthy quality + open tools: silence alone must not clear mid-tool work."""
+    assert (
+        should_clear_turn_on_wake(
+            turn_running=True,
+            silence_seconds=300.0,
+            acp_quality="ok",
+            has_open_tools=True,
+        )
+        is False
+    )
+    assert (
+        should_clear_turn_on_wake(
+            turn_running=True,
+            silence_seconds=300.0,
+            acp_quality=None,
+            has_open_tools=True,
+        )
+        is False
+    )
+    # Bad quality still clears even with open tools
+    assert (
+        should_clear_turn_on_wake(
+            turn_running=True,
+            silence_seconds=300.0,
+            acp_quality="zombie",
+            has_open_tools=True,
+        )
+        is True
+    )
+    # No open tools: silence still clears
+    assert (
+        should_clear_turn_on_wake(
+            turn_running=True,
+            silence_seconds=120.0,
+            acp_quality="ok",
+            has_open_tools=False,
+        )
+        is True
+    )
+
+
+def test_should_clear_turn_on_wake_healthy_keep() -> None:
+    assert (
+        should_clear_turn_on_wake(
+            turn_running=True,
+            silence_seconds=None,
+            acp_quality="ok",
+        )
+        is False
+    )
+    assert (
+        should_clear_turn_on_wake(
+            turn_running=True,
+            silence_seconds=10.0,
+            acp_quality=None,
+        )
+        is False
+    )
+    assert (
+        should_clear_turn_on_wake(
+            turn_running=True,
+            silence_seconds=None,
+            acp_quality=None,
+        )
+        is False
+    )
+
+
+def test_app_js_reconcile_turn_after_wake_wired() -> None:
+    """Structural: wake reconcile exists and visibility/pageshow/online wire it."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "function reconcileTurnAfterWake" in js
+    assert "function shouldClearTurnOnWake" in js
+    assert "hasOpenTools" in js
+    assert "visibilitychange" in js
+    assert "pageshow" in js
+    assert "scheduleWakeReconcile" in js
+    assert "handleWakeReconcile" in js
+    assert "reconcileTurnAfterWake" in js
+    # visibility handler debounces into wake reconcile (not only connectWs)
+    vis_idx = js.find('document.addEventListener("visibilitychange"')
+    assert vis_idx >= 0
+    vis_chunk = js[vis_idx : vis_idx + 900]
+    assert "scheduleWakeReconcile" in vis_chunk
+    assert 'addEventListener("online"' in js or "addEventListener('online'" in js
+    assert 'addEventListener("pageshow"' in js or "addEventListener('pageshow'" in js
+
+
+def test_is_live_hot_path_reuse_only() -> None:
+    assert is_live_hot_path(ensure_action="reuse", acp_connected=True) is True
+    assert is_live_hot_path(ensure_action="REUSE", acp_connected=True) is True
+    assert is_live_hot_path(ensure_action="reuse", acp_connected=False) is False
+    assert is_live_hot_path(ensure_action="load", acp_connected=True) is False
+    assert is_live_hot_path(ensure_action="new", acp_connected=True) is False
+    assert is_live_hot_path(ensure_action="", acp_connected=True) is False
+    assert HOT_PATH_MAX_HUB_PRE_PROMPT_S == 5.0
+    assert HOT_PATH_MAX_HUB_PRE_PROMPT_S < NO_OUTPUT_SECONDS
+
+
+def test_ensure_action_blocks_prompt() -> None:
+    assert ensure_action_blocks_prompt("load") is True
+    assert ensure_action_blocks_prompt("new") is True
+    assert ensure_action_blocks_prompt("LOAD") is True
+    assert ensure_action_blocks_prompt("reuse") is False
+    assert ensure_action_blocks_prompt("") is False
+    assert ensure_action_blocks_prompt("hub_session") is False
+
+
+def test_counts_toward_agent_ttfb() -> None:
+    assert counts_toward_agent_ttfb(None) is True
+    assert counts_toward_agent_ttfb("") is True
+    assert counts_toward_agent_ttfb("   ") is True
+    assert counts_toward_agent_ttfb("user_message_chunk") is False
+    assert counts_toward_agent_ttfb("USER_MESSAGE_CHUNK") is False
+    assert counts_toward_agent_ttfb("available_commands_update") is False
+    assert counts_toward_agent_ttfb("user_other") is False
+    assert counts_toward_agent_ttfb("agent_thought_chunk") is True
+    assert counts_toward_agent_ttfb("agent_message_chunk") is True
+    assert counts_toward_agent_ttfb("tool_call") is True
+    assert counts_toward_agent_ttfb("tool_call_update") is True
+
+
+def test_apply_turn_activity_user_echo_not_ttfb() -> None:
+    meta: dict = {
+        "started_at": 100.0,
+        "last_activity": 100.0,
+        "saw_update": False,
+        "first_update_at": None,
+    }
+    assert apply_turn_activity(meta, now=101.0, update_kind="user_message_chunk") is False
+    assert meta["saw_update"] is True
+    assert meta["last_activity"] == 101.0
+    assert meta["first_update_at"] is None
+
+    assert apply_turn_activity(meta, now=102.5, update_kind="agent_thought_chunk") is True
+    assert meta["first_update_at"] == 102.5
+    assert apply_turn_activity(meta, now=110.0, update_kind="tool_call") is False
+    assert meta["first_update_at"] == 102.5
+    assert meta["last_activity"] == 110.0
+
+
+def test_apply_turn_activity_none_kind_is_agent() -> None:
+    meta: dict = {
+        "started_at": 1.0,
+        "last_activity": 1.0,
+        "saw_update": False,
+        "first_update_at": None,
+    }
+    assert apply_turn_activity(meta, now=3.0, update_kind=None) is True
+    assert meta["first_update_at"] == 3.0
+
+
+def test_split_prompt_latency() -> None:
+    both_none = split_prompt_latency(
+        ensure_seconds=None, prompt_send_seconds=None, agent_first_seconds=None
+    )
+    assert both_none["hubSeconds"] is None
+    assert both_none["agentSeconds"] is None
+    assert both_none["totalSeconds"] is None
+
+    hub_only = split_prompt_latency(
+        ensure_seconds=0.001, prompt_send_seconds=None, agent_first_seconds=None
+    )
+    assert hub_only["hubSeconds"] == 0.001
+    assert hub_only["agentSeconds"] is None
+    assert hub_only["totalSeconds"] is None
+
+    send_only = split_prompt_latency(
+        ensure_seconds=None, prompt_send_seconds=0.002, agent_first_seconds=30.0
+    )
+    assert send_only["hubSeconds"] == 0.002
+    assert send_only["agentSeconds"] == 30.0
+    assert send_only["totalSeconds"] == 30.002
+
+    full = split_prompt_latency(
+        ensure_seconds=0.001, prompt_send_seconds=0.001, agent_first_seconds=29.5
+    )
+    assert full["hubSeconds"] == 0.002
+    assert full["agentSeconds"] == 29.5
+    assert full["totalSeconds"] == 29.502
+
+
+def test_resolve_ensure_process_live_is_reuse() -> None:
+    """Alias clarity: view in created_set => action reuse (hot path)."""
+    created = {"hub-live-1"}
+    target, action, reason = resolve_ensure_action(
+        "hub-live-1",
+        r"D:\Projects\Demo",
+        created,
+        {},
+    )
+    assert target == "hub-live-1"
+    assert action == "reuse"
+    assert reason == "hub_session"
+    assert ensure_action_blocks_prompt(action) is False
+    assert is_live_hot_path(ensure_action=action, acp_connected=True) is True
+
+
+def _slice_method(src: str, name: str) -> str:
+    for prefix in (f"async def {name}(", f"def {name}("):
+        start = src.find(prefix)
+        if start >= 0:
+            break
+    else:
+        raise AssertionError(f"method {name} not found")
+    line_start = src.rfind("\n", 0, start) + 1
+    indent = 0
+    while line_start + indent < len(src) and src[line_start + indent] in " \t":
+        indent += 1
+    pos = start + len(prefix)
+    while pos < len(src):
+        nl = src.find("\n", pos)
+        if nl < 0:
+            return src[start:]
+        next_line = nl + 1
+        if next_line >= len(src):
+            return src[start:]
+        if src[next_line] == "\n":
+            pos = next_line
+            continue
+        j = next_line
+        while j < len(src) and src[j] in " \t":
+            j += 1
+        if j >= len(src):
+            return src[start:]
+        line_indent = j - next_line
+        if line_indent <= indent and (
+            src.startswith("def ", j)
+            or src.startswith("async def ", j)
+            or src.startswith("class ", j)
+        ):
+            return src[start:next_line]
+        pos = next_line
+    return src[start:]
+
+
+def test_should_skip_session_load_warm() -> None:
+    """Already-warm session ids skip agent session/load in this process."""
+    warm: set[str] = set()
+    assert should_skip_session_load(warm, "abc") is False
+    assert should_skip_session_load(warm, "") is False
+    warm.add("sid-1")
+    assert should_skip_session_load(warm, "sid-1") is True
+    assert should_skip_session_load(warm, "sid-2") is False
+    assert should_skip_session_load(frozenset({"x"}), "x") is True
+
+
+def test_session_load_second_call_skips_request() -> None:
+    """Mock: first session_load hits request; second warm skip does not."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from hub.acp_client import AcpClient
+    from hub.config import Config
+
+    client = AcpClient(Config(), secret="test-secret-warm-load")
+    client.request = AsyncMock(return_value={"ok": True})  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        r1 = await client.session_load("sess-warm-1", r"D:\proj")
+        assert r1 == {"ok": True}
+        assert client.request.await_count == 1
+        assert "sess-warm-1" in client._warm_sessions
+        r2 = await client.session_load("sess-warm-1", r"D:\proj")
+        assert r2 == {"skipped": True, "sessionId": "sess-warm-1"}
+        assert client.request.await_count == 1
+        assert client.loaded_session_id == "sess-warm-1"
+
+    asyncio.run(_run())
+
+
+def test_session_load_concurrent_single_flight() -> None:
+    """Concurrent session_load same sid: only one agent request (single-flight)."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from hub.acp_client import AcpClient
+    from hub.config import Config
+
+    client = AcpClient(Config(), secret="test-secret-inflight-load")
+    call_count = 0
+
+    async def _slow_request(*_a, **_k):
+        nonlocal call_count
+        call_count += 1
+        await asyncio.sleep(0.05)
+        return {"ok": True, "sessionId": "sess-concurrent-1"}
+
+    client.request = AsyncMock(side_effect=_slow_request)  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        r1, r2 = await asyncio.gather(
+            client.session_load("sess-concurrent-1", r"D:\proj"),
+            client.session_load("sess-concurrent-1", r"D:\proj"),
+        )
+        assert r1 == {"ok": True, "sessionId": "sess-concurrent-1"}
+        assert r2 == {"ok": True, "sessionId": "sess-concurrent-1"}
+        assert call_count == 1
+        assert client.request.await_count == 1
+        assert "sess-concurrent-1" in client._warm_sessions
+        assert "sess-concurrent-1" not in client._load_inflight
+
+    asyncio.run(_run())
+
+
+def test_session_load_warm_skip_structural() -> None:
+    """session_load skips request when warm; warm set cleared on ACP disconnect."""
+    src = (ROOT / "hub" / "acp_client.py").read_text(encoding="utf-8")
+    body = _slice_method(src, "session_load")
+    assert "should_skip_session_load" in body
+    assert "session/load skip already warm" in body
+    assert '"skipped": True' in body or "'skipped': True" in body
+    assert "_warm_sessions" in body
+    # session_new marks warm
+    new_body = _slice_method(src, "session_new")
+    assert "_warm_sessions.add" in new_body
+    # single-flight concurrent join
+    assert "_load_inflight" in body
+    # disconnect path clears warm with loaded_session_id
+    assert "_warm_sessions.clear()" in src
+    assert "self.loaded_session_id = None" in src
+    assert "_load_inflight.clear()" in src
+
+
+def test_session_prompt_hot_path_no_warmup() -> None:
+    """session_prompt waits load suppress settle then release before active turn."""
+    src = (ROOT / "hub" / "acp_client.py").read_text(encoding="utf-8")
+    body = _slice_method(src, "session_prompt")
+    assert "asyncio.sleep(" not in body
+    assert "wait_until_up(" not in body
+    assert "wait_load_suppress_settled" in body
+    assert "release_load_suppress" in body
+    settle = body.find("wait_load_suppress_settled")
+    rel = body.find("release_load_suppress")
+    reg = body.find("_register_active_turn")
+    req = body.find('"session/prompt"')
+    assert settle >= 0 and rel >= 0 and reg >= 0 and req >= 0
+    # settle before release before register before prompt send
+    assert settle < rel < reg < req
+    assert "prompt_send" in body
+    assert "pre_send_ms" in body or "preSendMs" in body
+
+
+
+def test_execute_prompt_hot_path_structural() -> None:
+    """_execute_prompt: timing log, no wait_until_up, allow_load=False."""
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    body = _slice_method(src, "_execute_prompt")
+    assert "wait_until_up(" not in body
+    assert "prompt path timing" in body
+    assert "ensure_ms" in body
+    assert "allow_load=False" in body
+
+
+def test_ensure_reuse_skips_load_new_wait() -> None:
+    """_ensure_hub_agent_session: logs action; no wait_until_up on ensure path."""
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    body = _slice_method(src, "_ensure_hub_agent_session")
+    assert "ensure action=%s" in body
+    assert "wait_until_up(" not in body
+    assert "resolve_ensure_action" in body
+    assert 'action == "reuse"' in body
+
+
+
+def test_forget_warm_session() -> None:
+    """forget_warm_session drops warm set and clears loaded_session_id for sid."""
+    from hub.acp_client import AcpClient
+    from hub.config import Config
+
+    client = AcpClient(Config(), secret="test-secret-forget-warm")
+    client._warm_sessions.add("sess-a")
+    client._warm_sessions.add("sess-b")
+    client.loaded_session_id = "sess-a"
+    client.forget_warm_session("sess-a")
+    assert "sess-a" not in client._warm_sessions
+    assert "sess-b" in client._warm_sessions
+    assert client.loaded_session_id is None
+    client.loaded_session_id = "sess-b"
+    client.forget_warm_session("sess-a")  # other sid: loaded unchanged
+    assert client.loaded_session_id == "sess-b"
+    client.forget_warm_session("")
+    assert "sess-b" in client._warm_sessions

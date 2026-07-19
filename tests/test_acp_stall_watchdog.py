@@ -136,3 +136,39 @@ def test_stall_watchdog_status_shape_after_clear_matches_health_idle() -> None:
                     pass
 
     asyncio.run(run())
+
+
+def test_note_activity_agent_ttfb_excludes_user_chunk() -> None:
+    """AcpClient.note_activity freezes first_update_at only for agent kinds."""
+    client = _client()
+    sid = "ttfb-user-echo"
+    client._register_active_turn(sid)
+    meta = client.active_turns[sid]
+    assert meta["first_update_at"] is None
+    assert meta["saw_update"] is False
+
+    client.note_activity(sid, update_kind="user_message_chunk")
+    assert meta["saw_update"] is True
+    assert meta["first_update_at"] is None
+
+    client.note_activity(sid, update_kind="available_commands_update")
+    assert meta["first_update_at"] is None
+
+    client.note_activity(sid, update_kind="agent_thought_chunk")
+    first = meta["first_update_at"]
+    assert first is not None
+
+    time.sleep(0.02)
+    client.note_activity(sid, update_kind="agent_message_chunk")
+    assert meta["first_update_at"] == first
+
+
+def test_note_activity_none_kind_counts_as_agent() -> None:
+    """Tool RPC path (no kind) freezes agent TTFB."""
+    client = _client()
+    sid = "ttfb-tool-rpc"
+    client._register_active_turn(sid)
+    client.note_activity(sid)
+    assert client.active_turns[sid]["first_update_at"] is not None
+    assert client.active_turns[sid]["saw_update"] is True
+

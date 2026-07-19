@@ -20,6 +20,10 @@ ACP_PROBE_SILENCE_S = 45.0  # no recv for this long → consider probe
 ACP_PROBE_INTERVAL_S = 30.0  # min time between probes
 ACP_PROBE_TIMEOUT_S = 5.0
 
+# session/load replay suppress: hold until quiet period or max wall time.
+LOAD_SUPPRESS_QUIET_S = 1.5
+LOAD_SUPPRESS_MAX_S = 20.0
+
 
 def map_acp_quality(
     *,
@@ -207,7 +211,12 @@ def should_suppress_session_load_fanout(
 
     Drop session/update (+ x.ai session updates/notifications) for the loading
     session so the UI does not strobe. Allow available_commands_update through.
-    Live turns always receive activity/fanout (never suppress mid-prompt).
+
+    While a session is in loading_session_ids, always suppress (even if that
+    session is also in active_turn_session_ids). Residual history flush must not
+    note_activity or fanout as live stream after heal re-registers a turn.
+    Active-turn bypass applies only when the session is not loading.
+
     When session_id is missing, suppress only if no active turn exists (ambiguous
     frames during pure load); if any turn is live, do not suppress solely for load.
     """
@@ -217,14 +226,26 @@ def should_suppress_session_load_fanout(
         return False
     if update_kind == "available_commands_update":
         return False
-    # Live prompt must receive note_activity + fanout (post-load re-prompt path).
-    if session_id and session_id in active_turn_session_ids:
-        return False
+    # Loading wins over active-turn: residual load-replay stays suppressed.
     if session_id and session_id in loading_session_ids:
         return True
+    # Not loading this sid: live turns receive activity/fanout.
+    if session_id and session_id in active_turn_session_ids:
+        return False
     if not session_id:
         # Ambiguous frame during load: suppress only when no live turn is running.
         if active_turn_session_ids:
             return False
         return True
     return False
+
+
+def load_suppress_should_release(
+    *,
+    quiet_elapsed_s: float,
+    quiet_s: float,
+    held_s: float,
+    max_s: float,
+) -> bool:
+    """True when load-replay suppress may release (quiet period or max hold)."""
+    return held_s >= max_s or quiet_elapsed_s >= quiet_s

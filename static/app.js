@@ -7,8 +7,9 @@
   /* Terminal format helpers (mirror hub/ui_format.py) */
   function formatTermPrefix(role) {
     const r = String(role || "").trim().toLowerCase();
-    if (r === "user") return "You:";
-    if (r === "assistant") return "Grok:";
+    // Trailing space so "You: /compact" stays readable (margin alone can look glued).
+    if (r === "user") return "You: ";
+    if (r === "assistant") return "Grok: ";
     // thought / tool / plan / system: status lives in thought-summary-label (or body)
     return "·";
   }
@@ -28,6 +29,263 @@
 
   function shouldShowToolLine() {
     return true;
+  }
+
+  /* ANSI SGR parser + safe DOM render (mirror hub/ui_format.py) */
+  const _ANSI_FG = {
+    30: "black",
+    31: "red",
+    32: "green",
+    33: "yellow",
+    34: "blue",
+    35: "magenta",
+    36: "cyan",
+    37: "white",
+    90: "bright-black",
+    91: "bright-red",
+    92: "bright-green",
+    93: "bright-yellow",
+    94: "bright-blue",
+    95: "bright-magenta",
+    96: "bright-cyan",
+    97: "bright-white",
+  };
+  const _ANSI_BG = {
+    40: "black",
+    41: "red",
+    42: "green",
+    43: "yellow",
+    44: "blue",
+    45: "magenta",
+    46: "cyan",
+    47: "white",
+    100: "bright-black",
+    101: "bright-red",
+    102: "bright-green",
+    103: "bright-yellow",
+    104: "bright-blue",
+    105: "bright-magenta",
+    106: "bright-cyan",
+    107: "bright-white",
+  };
+
+  function _isEscAt(s, i) {
+    if (i >= s.length) return { ok: false, len: 0 };
+    const c = s.charAt(i);
+    if (c === "\x1b") return { ok: true, len: 1 };
+    if (c === "\x9b") return { ok: true, len: 1 };
+    if (c === "\\" && i + 1 < s.length) {
+      const rest = s.slice(i + 1);
+      if (rest.startsWith("x1b") || rest.startsWith("x1B")) return { ok: true, len: 4 };
+      if (rest.startsWith("033")) return { ok: true, len: 4 };
+      if (rest.startsWith("e") || rest.startsWith("E")) return { ok: true, len: 2 };
+    }
+    return { ok: false, len: 0 };
+  }
+
+  function _parseSgrParams(body) {
+    if (!body || !String(body).trim()) return [0];
+    const params = [];
+    for (const part of String(body).split(";")) {
+      const t = part.trim();
+      if (t === "") {
+        params.push(0);
+        continue;
+      }
+      let digits = "";
+      for (let k = 0; k < t.length; k++) {
+        const ch = t.charAt(k);
+        if (ch >= "0" && ch <= "9") digits += ch;
+        else break;
+      }
+      params.push(digits ? parseInt(digits, 10) || 0 : 0);
+    }
+    return params.length ? params : [0];
+  }
+
+  function _applySgr(params, style) {
+    let list = params && params.length ? params : [0];
+    let i = 0;
+    while (i < list.length) {
+      const p = list[i];
+      if (p === 0) {
+        style.fg = null;
+        style.bg = null;
+        style.bold = false;
+        style.dim = false;
+      } else if (p === 1) {
+        style.bold = true;
+        style.dim = false;
+      } else if (p === 2) {
+        style.dim = true;
+        style.bold = false;
+      } else if (p === 22) {
+        style.bold = false;
+        style.dim = false;
+      } else if (p === 39) {
+        style.fg = null;
+      } else if (p === 49) {
+        style.bg = null;
+      } else if (_ANSI_FG[p]) {
+        style.fg = _ANSI_FG[p];
+      } else if (_ANSI_BG[p]) {
+        style.bg = _ANSI_BG[p];
+      } else if (p === 38 || p === 48) {
+        if (i + 1 < list.length) {
+          const mode = list[i + 1];
+          if (mode === 5 && i + 2 < list.length) i += 2;
+          else if (mode === 2 && i + 4 < list.length) i += 4;
+          else i += 1;
+        }
+      }
+      i += 1;
+    }
+  }
+
+  function _flushAnsiSeg(buf, style, out) {
+    if (!buf.length) return;
+    const text = buf.join("");
+    buf.length = 0;
+    if (!text) return;
+    const seg = {
+      text,
+      fg: style.fg,
+      bg: style.bg,
+      bold: !!style.bold,
+      dim: !!style.dim,
+    };
+    const last = out[out.length - 1];
+    if (
+      last &&
+      last.fg === seg.fg &&
+      last.bg === seg.bg &&
+      last.bold === seg.bold &&
+      last.dim === seg.dim
+    ) {
+      last.text += text;
+    } else {
+      out.push(seg);
+    }
+  }
+
+  /**
+   * Parse text with ANSI/SGR into styled segments (mirror hub.ui_format.parse_ansi_segments).
+   * @returns {{text:string, fg:string|null, bg:string|null, bold:boolean, dim:boolean}[]}
+   */
+  function parseAnsiSegments(text) {
+    const s = text == null ? "" : String(text);
+    if (!s) return [];
+    const style = { fg: null, bg: null, bold: false, dim: false };
+    const out = [];
+    const buf = [];
+    let i = 0;
+    const n = s.length;
+
+    while (i < n) {
+      const esc = _isEscAt(s, i);
+      if (esc.ok && esc.len === 1 && s.charAt(i) === "\x9b") {
+        _flushAnsiSeg(buf, style, out);
+        let j = i + 1;
+        while (j < n) {
+          const code = s.charCodeAt(j);
+          if (code >= 0x40 && code <= 0x7e) break;
+          j++;
+        }
+        if (j >= n) break;
+        const final = s.charAt(j);
+        const body = s.slice(i + 1, j);
+        if (final === "m") _applySgr(_parseSgrParams(body), style);
+        i = j + 1;
+        continue;
+      }
+
+      if (esc.ok) {
+        _flushAnsiSeg(buf, style, out);
+        const after = i + esc.len;
+        if (after >= n) break;
+        const kind = s.charAt(after);
+
+        if (kind === "]") {
+          let j = after + 1;
+          let done = false;
+          while (j < n) {
+            if (s.charAt(j) === "\x07") {
+              j += 1;
+              done = true;
+              break;
+            }
+            if (s.charAt(j) === "\x1b" && j + 1 < n && s.charAt(j + 1) === "\\") {
+              j += 2;
+              done = true;
+              break;
+            }
+            j++;
+          }
+          if (!done) break;
+          i = j;
+          continue;
+        }
+
+        if (kind === "[") {
+          let j = after + 1;
+          while (j < n) {
+            const code = s.charCodeAt(j);
+            if (code >= 0x40 && code <= 0x7e) break;
+            j++;
+          }
+          if (j >= n) break;
+          const final = s.charAt(j);
+          const body = s.slice(after + 1, j);
+          if (final === "m") _applySgr(_parseSgrParams(body), style);
+          i = j + 1;
+          continue;
+        }
+
+        i = after < n ? after + 1 : after;
+        continue;
+      }
+
+      buf.push(s.charAt(i));
+      i += 1;
+    }
+
+    _flushAnsiSeg(buf, style, out);
+    return out;
+  }
+
+  function stripAnsi(text) {
+    return parseAnsiSegments(text)
+      .map((seg) => seg.text)
+      .join("");
+  }
+
+  /**
+   * Safe DOM render of ANSI text into el (textContent only; no unescaped HTML).
+   * Clears el, appends TextNode or span.ansi with classes per segment.
+   */
+  function renderAnsiInto(el, text) {
+    if (!el) return;
+    const raw = text == null ? "" : String(text);
+    while (el.firstChild) el.removeChild(el.firstChild);
+    if (!raw) return;
+    const segs = parseAnsiSegments(raw);
+    for (const seg of segs) {
+      if (!seg.text) continue;
+      const hasStyle = seg.fg || seg.bg || seg.bold || seg.dim;
+      if (!hasStyle) {
+        el.appendChild(document.createTextNode(seg.text));
+        continue;
+      }
+      const span = document.createElement("span");
+      const classes = ["ansi"];
+      if (seg.bold) classes.push("ansi-bold");
+      if (seg.dim) classes.push("ansi-dim");
+      if (seg.fg) classes.push("ansi-fg-" + seg.fg);
+      if (seg.bg) classes.push("ansi-bg-" + seg.bg);
+      span.className = classes.join(" ");
+      span.textContent = seg.text;
+      el.appendChild(span);
+    }
   }
 
   /* UX helpers (mirror hub/ui_ux.py) */
@@ -303,6 +561,53 @@
     return null;
   }
 
+  /** Silence wall for wake/reconnect dead-turn clear (mirrors CLIENT_STALL_WARN). */
+  const WAKE_CLEAR_SILENCE_SECONDS = 120;
+
+  /**
+   * Pure: true when wake/resume should cancel+clear like CLI interrupt of a dead turn.
+   * Mirror of hub.session_policy.should_clear_turn_on_wake.
+   * @param {{ turnRunning?: boolean, silenceSeconds?: number|null, acpQuality?: string|null, silenceThresholdS?: number, hasOpenTools?: boolean }} opts
+   */
+  function shouldClearTurnOnWake(opts) {
+    const o = opts || {};
+    if (!o.turnRunning) return false;
+    const q = String(o.acpQuality || "")
+      .trim()
+      .toLowerCase();
+    if (q === "stale" || q === "zombie" || q === "down") return true;
+    const thr =
+      o.silenceThresholdS != null && Number.isFinite(Number(o.silenceThresholdS))
+        ? Number(o.silenceThresholdS)
+        : WAKE_CLEAR_SILENCE_SECONDS;
+    if (o.silenceSeconds != null && Number.isFinite(Number(o.silenceSeconds))) {
+      if (Number(o.silenceSeconds) >= thr) {
+        // Healthy mid-tool/plan: silence alone must not cancel (ADR-015 amendment).
+        if (o.hasOpenTools && (q === "" || q === "ok")) return false;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Open tools/plans in selected (or given) pane — wake clear gate. */
+  function paneHasOpenTools(pane) {
+    const residual = countResidualInPane(pane);
+    return (
+      residual.tool_pending + residual.tool_running > 0 ||
+      residual.plan_pending + residual.plan_running > 0
+    );
+  }
+
+  function selectedHasOpenTools() {
+    const pane =
+      (state.activePane && !state.activePane.hidden && state.activePane) ||
+      (state.selectedId && state.sessionViews.get(state.selectedId)
+        ? state.sessionViews.get(state.selectedId).pane
+        : null);
+    return paneHasOpenTools(pane);
+  }
+
   const BUILTIN_SLASH = [
     { name: "new", description: "Start a new session" },
     { name: "compact", description: "Compact conversation history" },
@@ -385,35 +690,51 @@
     return "prompt";
   }
 
-  function parseSimpleMarkdownTable(text) {
-    if (!text || !String(text).includes("|")) return null;
+  // 1+ dashes per cell (more permissive than strict GFM) for agent-written tables
+  const _TABLE_SEP_RE = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/;
+  const _TABLE_SEP_LOOSE_RE = /^\|?:?-{1,}:?(\|:?-{1,}:?)+\|?$/;
+
+  function _splitTableRow(line) {
+    let s = String(line).trim();
+    if (s.startsWith("|")) s = s.slice(1);
+    if (s.endsWith("|")) s = s.slice(0, -1);
+    return s.split("|").map((c) => c.trim());
+  }
+
+  function _isTableSeparator(line) {
+    if (_TABLE_SEP_RE.test(line)) return true;
+    const loose = String(line).trim().replace(/\s+/g, "");
+    return _TABLE_SEP_LOOSE_RE.test(loose);
+  }
+
+  function findSimpleMarkdownTables(text) {
+    if (!text || !String(text).includes("|")) return [];
     const lines = String(text).split(/\r?\n/);
-    // 1+ dashes per cell (more permissive than strict GFM) for agent-written tables
-    const sepRe = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/;
-    const looseSepRe = /^\|?:?-{1,}:?(\|:?-{1,}:?)+\|?$/;
-
-    function splitRow(line) {
-      let s = line.trim();
-      if (s.startsWith("|")) s = s.slice(1);
-      if (s.endsWith("|")) s = s.slice(0, -1);
-      return s.split("|").map((c) => c.trim());
-    }
-
-    for (let i = 0; i < lines.length - 1; i++) {
+    const tables = [];
+    let i = 0;
+    while (i < lines.length - 1) {
       const header = lines[i];
       const sep = lines[i + 1];
-      if ((header.match(/\|/g) || []).length < 1) continue;
-      const sepOk = sepRe.test(sep) || looseSepRe.test(sep.trim().replace(/\s+/g, ""));
-      if (!sepOk) continue;
-      const cellsHeader = splitRow(header);
-      if (cellsHeader.length < 2) continue;
+      if ((header.match(/\|/g) || []).length < 1) {
+        i += 1;
+        continue;
+      }
+      if (!_isTableSeparator(sep)) {
+        i += 1;
+        continue;
+      }
+      const cellsHeader = _splitTableRow(header);
+      if (cellsHeader.length < 2) {
+        i += 1;
+        continue;
+      }
       const rows = [cellsHeader];
       let j = i + 2;
       while (j < lines.length) {
         const row = lines[j];
         if (!row.trim()) break;
         if ((row.match(/\|/g) || []).length < 1) break;
-        let cells = splitRow(row);
+        let cells = _splitTableRow(row);
         if (cells.length < cellsHeader.length) {
           cells = cells.concat(Array(cellsHeader.length - cells.length).fill(""));
         } else if (cells.length > cellsHeader.length) {
@@ -422,9 +743,76 @@
         rows.push(cells);
         j += 1;
       }
-      return rows;
+      if (rows.length >= 1) {
+        tables.push({ start: i, end: j, rows });
+        i = j; // continue after this table
+      } else {
+        i += 1;
+      }
     }
-    return null;
+    return tables;
+  }
+
+  function splitTextWithMarkdownTables(text) {
+    const s = text == null ? "" : String(text);
+    const tables = findSimpleMarkdownTables(s);
+    if (!tables.length) return [{ kind: "text", value: s }];
+    const lines = s.split(/\r?\n/);
+    const parts = [];
+    let cursor = 0;
+    for (const t of tables) {
+      if (t.start > cursor) {
+        parts.push({ kind: "text", value: lines.slice(cursor, t.start).join("\n") });
+      }
+      parts.push({ kind: "table", value: t.rows });
+      cursor = t.end;
+    }
+    if (cursor < lines.length) {
+      parts.push({ kind: "text", value: lines.slice(cursor).join("\n") });
+    }
+    return parts.length ? parts : [{ kind: "text", value: s }];
+  }
+
+  /** First-table helper (back-compat); multi-table use find/split. */
+  function parseSimpleMarkdownTable(text) {
+    const found = findSimpleMarkdownTables(text);
+    if (!found.length) return null;
+    return found[0].rows;
+  }
+
+  function buildTermTableEl(rows) {
+    const wrap = document.createElement("div");
+    wrap.className = "term-table-wrap";
+    const tbl = document.createElement("table");
+    tbl.className = "term-table";
+    if (!rows || !rows.length) {
+      wrap.appendChild(tbl);
+      return wrap;
+    }
+    const thead = document.createElement("thead");
+    const hr = document.createElement("tr");
+    for (const cell of rows[0]) {
+      const th = document.createElement("th");
+      th.textContent = cell;
+      hr.appendChild(th);
+    }
+    thead.appendChild(hr);
+    tbl.appendChild(thead);
+    if (rows.length > 1) {
+      const tbody = document.createElement("tbody");
+      for (let r = 1; r < rows.length; r++) {
+        const tr = document.createElement("tr");
+        for (const cell of rows[r]) {
+          const td = document.createElement("td");
+          td.textContent = cell;
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+      tbl.appendChild(tbody);
+    }
+    wrap.appendChild(tbl);
+    return wrap;
   }
 
   function formatPlanSummary(entries) {
@@ -498,6 +886,10 @@
     attachSwitched: false, // true when live id != viewed foreign history id
     /** Hub-owned session id for prompts when viewing a different history id */
     livePromptSessionId: null,
+    /** Session id currently POSTing /attach (cold load into agent). */
+    attachingSessionId: null,
+    /** Session ids that already saw the large-session first-reply hint this page. */
+    largeSessionHintShown: new Set(),
     sessions: [],
     filter: "",
     sessionKindFilter: "working", // working | subagent | all
@@ -560,6 +952,8 @@
     projects: [],
     /** New-session modal: "list" | "browse" | "entry" */
     projectModalMode: "list",
+    /** Mode to restore when leaving entry choice: "list" | "browse" */
+    projectEntryReturnMode: "list",
     entryChoiceCwd: null,
     reloadingSession: false,
     /** Current folder browser payload from /api/projects/browse */
@@ -650,6 +1044,9 @@
     turnStripCursor: $("#turn-strip-cursor"),
     capacityBanner: $("#capacity-banner"),
     capacityBannerText: $("#capacity-banner-text"),
+    latencyHintBanner: $("#latency-hint-banner"),
+    latencyHintBannerText: $("#latency-hint-banner-text"),
+    btnLatencyHintDismiss: $("#btn-latency-hint-dismiss"),
     form: $("#composer-form"),
     input: $("#composer-input"),
     composerFileInput: $("#composer-file-input"),
@@ -677,19 +1074,25 @@
     sitePreviewScaleShell: $("#site-preview-scale-shell"),
     sitePreviewScale: $("#site-preview-scale"),
     btnSitePreviewOpen: $("#btn-site-preview-open"),
+    projectModeTabs: $("#project-mode-tabs"),
+    tabProjects: $("#tab-projects"),
+    tabBrowse: $("#tab-browse"),
     projectListView: $("#project-list-view"),
     projectList: $("#project-list"),
     projectSearch: $("#project-search"),
     projectEmpty: $("#project-empty"),
+    projectRecents: $("#project-recents"),
+    projectRecentsList: $("#project-recents-list"),
     projectNewName: $("#project-new-name"),
     btnCreateProject: $("#btn-create-project"),
-    btnBrowseFolders: $("#btn-browse-folders"),
     projectBrowser: $("#project-browser"),
+    projectBrowserCrumbs: $("#project-browser-crumbs"),
+    projectBrowserStatus: $("#project-browser-status"),
+    projectBrowserEmpty: $("#project-browser-empty"),
     projectBrowserPath: $("#project-browser-path"),
     projectBrowserList: $("#project-browser-list"),
-    btnBrowseUp: $("#btn-browse-up"),
     btnBrowseStart: $("#btn-browse-start"),
-    btnBrowseBack: $("#btn-browse-back"),
+    btnBrowseStartLabel: $("#btn-browse-start-label"),
     projectEntryChoice: $("#project-entry-choice"),
     projectEntryPriors: $("#project-entry-priors"),
     projectEntryCwd: $("#project-entry-cwd"),
@@ -1592,6 +1995,82 @@
     }
   }
 
+  const LARGE_SESSION_TOKENS = 100000;
+  const LARGE_SESSION_PCT = 50;
+  const LATENCY_HINT_LOADING = "Loading session into agent…";
+  const LATENCY_HINT_LARGE =
+    "Large session — first reply may take longer (same as CLI with this history). Prefer /compact or New for quick chat.";
+
+  function isLargeSessionUsage(usage) {
+    if (!usage) return false;
+    const used = Number(usage.contextTokensUsed);
+    if (Number.isFinite(used) && used >= LARGE_SESSION_TOKENS) return true;
+    const pct = Number(usage.contextPercent);
+    if (Number.isFinite(pct) && pct >= LARGE_SESSION_PCT) return true;
+    return false;
+  }
+
+  function updateLatencyHintBanner() {
+    if (!els.latencyHintBanner || !els.latencyHintBannerText) return;
+    const sid = state.selectedId;
+    const loading =
+      !!sid &&
+      !!state.attachingSessionId &&
+      state.attachingSessionId === sid;
+    if (loading) {
+      els.latencyHintBanner.classList.remove("hidden");
+      els.latencyHintBanner.dataset.kind = "loading";
+      els.latencyHintBannerText.textContent = LATENCY_HINT_LOADING;
+      if (els.btnLatencyHintDismiss) {
+        els.btnLatencyHintDismiss.classList.add("hidden");
+      }
+      return;
+    }
+    const showLarge =
+      !!sid &&
+      state.largeSessionHintShown instanceof Set &&
+      state.largeSessionHintShown.has(sid) &&
+      state._latencyLargeVisible === sid;
+    if (showLarge) {
+      els.latencyHintBanner.classList.remove("hidden");
+      els.latencyHintBanner.dataset.kind = "large";
+      els.latencyHintBannerText.textContent = LATENCY_HINT_LARGE;
+      if (els.btnLatencyHintDismiss) {
+        els.btnLatencyHintDismiss.classList.remove("hidden");
+      }
+      return;
+    }
+    els.latencyHintBanner.classList.add("hidden");
+    els.latencyHintBanner.dataset.kind = "";
+    els.latencyHintBannerText.textContent = "";
+    if (els.btnLatencyHintDismiss) {
+      els.btnLatencyHintDismiss.classList.add("hidden");
+    }
+  }
+
+  /** One-time soft hint when selected session has large context (does not block Send). */
+  function maybeShowLargeSessionHint(sessionId) {
+    const sid = sessionId || state.selectedId;
+    if (!sid || sid !== state.selectedId) return;
+    if (!(state.largeSessionHintShown instanceof Set)) {
+      state.largeSessionHintShown = new Set();
+    }
+    if (state.largeSessionHintShown.has(sid)) {
+      // Already shown/dismissed for this page open of sid.
+      updateLatencyHintBanner();
+      return;
+    }
+    if (!isLargeSessionUsage(state.usage)) return;
+    state.largeSessionHintShown.add(sid);
+    state._latencyLargeVisible = sid;
+    updateLatencyHintBanner();
+  }
+
+  function dismissLargeSessionHint() {
+    state._latencyLargeVisible = null;
+    updateLatencyHintBanner();
+  }
+
   /** Session id used for prompts (may differ from selected when attach remapped). */
   function promptSessionId() {
     if (
@@ -1998,8 +2477,8 @@
   }
 
   function formatActivityLine(title, summary) {
-    const t = String(title || "").trim();
-    const s = String(summary || "").trim();
+    const t = stripAnsi(String(title || "")).trim();
+    const s = stripAnsi(String(summary || "")).trim();
     if (t && s && !t.includes(s) && s !== t) {
       const line = t + " · " + s;
       return line.length > 100 ? line.slice(0, 99) + "…" : line;
@@ -2434,6 +2913,11 @@
     if (!state.selectedId) {
       els.composerHint.textContent =
         "Remote agent stream. Load a session to chat; desktop TUI stays separate.";
+    } else if (
+      state.attachingSessionId &&
+      state.attachingSessionId === state.selectedId
+    ) {
+      els.composerHint.textContent = "Loading session into agent…";
     } else if (turnRunningOnSelected()) {
       const q = state.promptQueueLength || 0;
       const st = sessionLiveStatus(state.selectedId);
@@ -2720,28 +3204,45 @@
   const SESSION_GOALS_KEY = "grh.sessionGoals.v1";
   const SESSION_GOALS_CAP = 40;
 
-  function saveSelectedSession(sessionId) {
+  function saveSelectedSession(sessionId, meta) {
     try {
       const id = String(sessionId || "").trim();
       if (!id) {
         localStorage.removeItem(SELECTED_SESSION_KEY);
         return;
       }
+      const m = meta || state.selectedMeta || {};
       localStorage.setItem(
         SELECTED_SESSION_KEY,
-        JSON.stringify({ sessionId: id, at: Date.now() })
+        JSON.stringify({
+          sessionId: id,
+          at: Date.now(),
+          cwd: String((m && m.cwd) || ""),
+          title: String((m && m.title) || ""),
+        })
       );
     } catch (_) {}
   }
 
   function loadSelectedSessionId() {
+    const meta = loadSelectedSessionMeta();
+    return meta ? meta.sessionId : null;
+  }
+
+  /** @returns {{ sessionId: string, cwd: string, title: string }|null} */
+  function loadSelectedSessionMeta() {
     try {
       const raw = localStorage.getItem(SELECTED_SESSION_KEY);
       if (!raw) return null;
       const j = JSON.parse(raw);
       if (!j || typeof j !== "object") return null;
       const id = String(j.sessionId || "").trim();
-      return id || null;
+      if (!id) return null;
+      return {
+        sessionId: id,
+        cwd: String(j.cwd || ""),
+        title: String(j.title || ""),
+      };
     } catch (_) {
       return null;
     }
@@ -3097,6 +3598,85 @@
     markLastPromptPending(false);
   }
 
+  /** Keep lastPrompt.pending after no-output / silent-agent force-clear. */
+  function isNoOutputKeepPending(msg) {
+    return /no output|still not responding|produced no output/i.test(
+      String(msg || "")
+    );
+  }
+
+  /**
+   * After history reload: if last prompt was never on disk, re-paint the user bubble.
+   * Clears pending when history already ends with the same user text.
+   */
+  function restorePendingUserPromptIfMissing() {
+    const lp = loadLastPrompt();
+    if (!lp || !lp.pending || !lp.text) return;
+    const want = String(lp.text).trim();
+    if (!want) return;
+    const sid = state.selectedId;
+    if (
+      !sid ||
+      (lp.sessionId &&
+        lp.sessionId !== sid &&
+        lp.sessionId !== state.livePromptSessionId)
+    ) {
+      return;
+    }
+    const root = transcriptRoot();
+    if (!root) return;
+    const users = root.querySelectorAll(".term-line.user .term-body, .msg-user .term-body");
+    const scan = Math.min(users.length, 8);
+    for (let i = users.length - 1; i >= users.length - scan && i >= 0; i--) {
+      const body = users[i];
+      const raw =
+        (body && body._rawText != null && String(body._rawText).trim()) ||
+        (body && String(body.textContent || "").trim()) ||
+        "";
+      if (raw === want) {
+        clearLastPromptPending();
+        return;
+      }
+    }
+    const el = appendMessage({ role: "user", text: want }, { stream: true });
+    const body = el && el.querySelector(".term-body");
+    if (body) body._rawText = want;
+    try {
+      activateUserPrompt(el, { scrollToTop: false });
+    } catch (_) {}
+  }
+
+  /**
+   * One-tap Resend when agent produced no output (prompt may not be on disk).
+   */
+  function offerNoOutputResend(lastPrompt, meta = {}) {
+    const stripMsg =
+      (meta && meta.message) ||
+      "Agent produced no output. Prompt may not be on disk. Resend.";
+    const entry = {
+      at: new Date().toISOString(),
+      message: stripMsg,
+      sessionId: (lastPrompt && lastPrompt.sessionId) || null,
+      source: (meta && meta.source) || "turn",
+      level: "danger",
+      resend: true,
+    };
+    if (!state.errorLog) state.errorLog = [];
+    state.errorLog.unshift(entry);
+    if (state.errorLog.length > 40) state.errorLog.length = 40;
+    try {
+      console.error("[hub]", stripMsg, meta || {});
+    } catch (_) {}
+    toast(stripMsg, "danger", 30000, {
+      actionLabel: "Resend",
+      onAction: () => {
+        resendLastPrompt();
+        dismissErrorStrip();
+      },
+    });
+    updateErrorStrip(entry);
+  }
+
   /**
    * One-tap Resend after hub process restart interrupted a live turn.
    * Toast (with action) + durable error strip Resend button.
@@ -3177,6 +3757,8 @@
   function setTurnRunning(running, sessionId, opts) {
     if (!running && opts && opts.all) {
       clearStaleLiveTurns({ clearQuestions: !!opts.clearQuestions });
+      // Disk may have the final assistant reply after a zombie/false-running clear.
+      scheduleForceHistoryRefresh();
       return;
     }
     state.turnRunning = !!running;
@@ -3222,15 +3804,18 @@
         state.turnStartedAt = null;
         state.lastTermLineAt = null;
         clearActiveUserPrompt();
-        // Best-effort: clear Resend pending once the client is fully idle.
-        try {
-          const lp = loadLastPrompt();
-          if (lp && lp.pending) {
-            if (!lp.sessionId || lp.sessionId === clearId || lp.sessionId === state.selectedId) {
-              clearLastPromptPending();
+        // Clear Resend pending on successful idle only.
+        // Failed no-output keeps pending so Resend / restore after refresh works.
+        if (!(opts && opts.keepPending)) {
+          try {
+            const lp = loadLastPrompt();
+            if (lp && lp.pending) {
+              if (!lp.sessionId || lp.sessionId === clearId || lp.sessionId === state.selectedId) {
+                clearLastPromptPending();
+              }
             }
-          }
-        } catch (_) {}
+          } catch (_) {}
+        }
         // Server reported no lives: force remaining working flags idle
         if (opts && opts.forceIdleFlags && state.sessionFlags) {
           for (const k of Object.keys(state.sessionFlags)) {
@@ -3265,6 +3850,10 @@
         idleRoot = transcriptRoot();
       }
       if (idleRoot) finalizeAssistantTables(idleRoot);
+      // Catch final disk message when turn finished while phone was reconnecting.
+      if (state.selectedId && (!idleSid || idleSid === state.selectedId)) {
+        scheduleForceHistoryRefresh();
+      }
     }
   }
 
@@ -3794,12 +4383,12 @@
         raw = raw.slice(raw.length - TERM_OUT_MAX_CHARS);
       }
       detail._rawText = raw;
-      detail.textContent = raw;
+      renderAnsiInto(detail, raw);
       detail.hidden = false;
       row.dataset.hasDetail = "1";
       // Keep open while streaming (CLI-like live output).
       if (!row.open) row.open = true;
-      const tail = raw.trim().slice(-60);
+      const tail = stripAnsi(raw).trim().slice(-60);
       state.streamBuffers.lastActivityLine = formatActivityLine("terminal", tail);
       noteTermLineActivity();
       scheduleTurnStrip();
@@ -4117,6 +4706,19 @@
       updateJumpLatestUiOnly();
       return;
     }
+    // Rate-limit non-forced sticky scrolls (~10/s) to avoid load-replay thrash.
+    if (!force) {
+      const now = performance.now();
+      if (
+        state._lastStickyScrollAt != null &&
+        now - state._lastStickyScrollAt < 90
+      ) {
+        return;
+      }
+      state._lastStickyScrollAt = now;
+    } else {
+      state._lastStickyScrollAt = performance.now();
+    }
     scrollTranscriptToBottom();
   }
 
@@ -4256,77 +4858,32 @@
     const raw = text == null ? "" : String(text);
     // Always keep markdown source; after a table render, textContent has no pipes.
     bodyEl._rawText = raw;
-    const table = parseSimpleMarkdownTable(raw);
-    if (!table || table.length < 1) {
+    const parts = splitTextWithMarkdownTables(raw);
+    const hasTable = parts.some((p) => p.kind === "table" && p.value && p.value.length >= 1);
+    if (!hasTable) {
       bodyEl.textContent = raw;
       return;
     }
 
-    // Split surrounding text and table block for mixed content
+    // Render every text + table segment (not only the first table).
     bodyEl.innerHTML = "";
-    const lines = raw.split(/\r?\n/);
-    let tableStart = -1;
-    // 1+ dashes per cell (more permissive than strict GFM) for agent-written tables
-    const sepRe = /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/;
-    const looseSepRe = /^\|?:?-{1,}:?(\|:?-{1,}:?)+\|?$/;
-    for (let i = 0; i < lines.length - 1; i++) {
-      if ((lines[i].match(/\|/g) || []).length < 1) continue;
-      if (sepRe.test(lines[i + 1]) || looseSepRe.test(lines[i + 1].trim().replace(/\s+/g, ""))) {
-        tableStart = i;
-        break;
-      }
-    }
-    if (tableStart < 0) {
-      bodyEl.textContent = raw;
-      return;
-    }
-
-    const before = lines.slice(0, tableStart).join("\n");
-    let tableEnd = tableStart + 2;
-    while (tableEnd < lines.length && lines[tableEnd].trim() && (lines[tableEnd].match(/\|/g) || []).length >= 1) {
-      tableEnd += 1;
-    }
-    const after = lines.slice(tableEnd).join("\n");
-
-    if (before.trim()) {
-      const pre = document.createElement("span");
-      pre.textContent = before + (before.endsWith("\n") ? "" : "\n");
-      bodyEl.appendChild(pre);
-    }
-
-    const wrap = document.createElement("div");
-    wrap.className = "term-table-wrap";
-    const tbl = document.createElement("table");
-    tbl.className = "term-table";
-    const thead = document.createElement("thead");
-    const hr = document.createElement("tr");
-    for (const cell of table[0]) {
-      const th = document.createElement("th");
-      th.textContent = cell;
-      hr.appendChild(th);
-    }
-    thead.appendChild(hr);
-    tbl.appendChild(thead);
-    if (table.length > 1) {
-      const tbody = document.createElement("tbody");
-      for (let r = 1; r < table.length; r++) {
-        const tr = document.createElement("tr");
-        for (const cell of table[r]) {
-          const td = document.createElement("td");
-          td.textContent = cell;
-          tr.appendChild(td);
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (part.kind === "table") {
+        if (part.value && part.value.length >= 1) {
+          bodyEl.appendChild(buildTermTableEl(part.value));
         }
-        tbody.appendChild(tr);
+        continue;
       }
-      tbl.appendChild(tbody);
-    }
-    wrap.appendChild(tbl);
-    bodyEl.appendChild(wrap);
-
-    if (after.trim()) {
-      const post = document.createElement("span");
-      post.textContent = (after.startsWith("\n") ? "" : "\n") + after;
-      bodyEl.appendChild(post);
+      let chunk = part.value == null ? "" : String(part.value);
+      if (!chunk.trim()) continue;
+      const prevIsTable = i > 0 && parts[i - 1].kind === "table";
+      const nextIsTable = i + 1 < parts.length && parts[i + 1].kind === "table";
+      if (prevIsTable && !chunk.startsWith("\n")) chunk = "\n" + chunk;
+      if (nextIsTable && !chunk.endsWith("\n")) chunk = chunk + "\n";
+      const span = document.createElement("span");
+      span.textContent = chunk;
+      bodyEl.appendChild(span);
     }
   }
 
@@ -4453,11 +5010,13 @@
     if (!detail) return;
     const full = String(text || "").trim();
     if (full) {
-      detail.textContent = full;
+      detail._rawText = full;
+      renderAnsiInto(detail, full);
       detail.hidden = false;
       row.dataset.hasDetail = "1";
     } else {
-      detail.textContent = "";
+      detail._rawText = "";
+      while (detail.firstChild) detail.removeChild(detail.firstChild);
       detail.hidden = true;
       delete row.dataset.hasDetail;
     }
@@ -4492,8 +5051,9 @@
 
     const oneLiner = document.createElement("span");
     oneLiner.className = "tool-one-liner muted";
-    const hideOne = toolOneLinerRedundant(displayTitle, snip);
-    oneLiner.textContent = snip && !hideOne ? truncate(snip, 80) : "";
+    const plainSnip = stripAnsi(snip);
+    const hideOne = toolOneLinerRedundant(displayTitle, plainSnip);
+    oneLiner.textContent = plainSnip && !hideOne ? truncate(plainSnip, 80) : "";
     oneLiner.hidden = hideOne;
 
     sum.append(prefix, name, pill, oneLiner);
@@ -4540,9 +5100,10 @@
         row._toolSummary = full;
         const nameText = String(row._toolTitle || "").trim();
         const oneLiner = row.querySelector(".tool-one-liner");
+        const plainFull = stripAnsi(full);
         if (oneLiner) {
-          const hideOne = toolOneLinerRedundant(nameText, full);
-          oneLiner.textContent = !hideOne ? truncate(full, 80) : "";
+          const hideOne = toolOneLinerRedundant(nameText, plainFull);
+          oneLiner.textContent = !hideOne ? truncate(plainFull, 80) : "";
           oneLiner.hidden = hideOne;
         }
         setToolDetailBody(row, full);
@@ -4550,10 +5111,11 @@
     } else if (title) {
       // Title-only update: re-evaluate one-liner redundancy against stored summary.
       const full = String(row._toolSummary || "").trim();
+      const plainFull = stripAnsi(full);
       const oneLiner = row.querySelector(".tool-one-liner");
       if (oneLiner) {
-        const hideOne = toolOneLinerRedundant(title, full);
-        oneLiner.textContent = full && !hideOne ? truncate(full, 80) : "";
+        const hideOne = toolOneLinerRedundant(title, plainFull);
+        oneLiner.textContent = plainFull && !hideOne ? truncate(plainFull, 80) : "";
         oneLiner.hidden = hideOne;
       }
     }
@@ -4671,26 +5233,38 @@
 
   function historyFingerprint(messages) {
     if (!messages || !messages.length) return "empty";
-    const last = messages.slice(-3);
-    return last
+    const n = messages.length;
+    const lastMsg = messages[n - 1];
+    const lastFullLen = String((lastMsg && lastMsg.text) || "").length;
+    const tail = messages.slice(-3)
       .map((m) => {
         const text = String((m && m.text) || "");
         return `${(m && m.role) || ""}:${text.length}:${text.slice(-48)}`;
       })
       .join("|");
+    // Include count + last full length so tail-only growth still invalidates.
+    return `${n}:${lastFullLen}:${tail}`;
+  }
+
+  /** True when last history message is an empty/whitespace assistant (incomplete). */
+  function lastHistoryAssistantIncomplete(messages) {
+    if (!messages || !messages.length) return false;
+    const last = messages[messages.length - 1];
+    if (!last || last.role !== "assistant") return false;
+    return !String(last.text || "").trim();
   }
 
   function applyHistoryMessages(messages, opts = {}) {
-    // Live stream owns the transcript while a turn is running on this session
+    // Live stream owns mid-turn unless force; fingerprint still skips noop rebuilds.
     if (state.turnRunning && !opts.force && turnRunningOnSelected()) return false;
     const list = messages || [];
     const fp = historyFingerprint(list);
     const sessionId = state.selectedId;
     if (
-      !opts.force &&
       fp === state.historyFingerprint &&
       state.historyLoadedFor === sessionId
     ) {
+      restorePendingUserPromptIfMissing();
       return false;
     }
     const wasNearBottom = state.stickToBottom || distanceFromBottom() < 120;
@@ -4711,6 +5285,7 @@
       endHistoryBatch({ jump: shouldJump });
       scheduleStickyUserFromScroll();
     }
+    restorePendingUserPromptIfMissing();
     return true;
   }
 
@@ -4736,15 +5311,14 @@
       state.streamBuffers.terminals = new Map();
       state.streamBuffers.lastToolTitle = "";
       state.streamBuffers.lastActivityLine = "";
-      // Do not force stick-to-bottom during reconnect if user scrolled up.
-      if (!state._reconnectScrollFreeze) {
+      // Never force stickToBottom on rebuild (wake/visibility thrash).
+      // Jump is decided by wasNearBottom in applyHistoryMessages / endHistoryBatch.
+      if (opts.stickToBottom === true) {
         state.stickToBottom = true;
-      } else if (state.stickToBottom !== false) {
-        // Keep existing stick preference (only default true when already true).
       }
     } finally {
       endHistoryBatch({
-        jump: !opts.skipScroll && !state._reconnectScrollFreeze,
+        jump: !opts.skipScroll && !state._reconnectScrollFreeze && !!state.stickToBottom,
       });
     }
   }
@@ -4780,7 +5354,7 @@
   }
 
   // Merge live stream chunks: cumulative snapshots replace, pure deltas append.
-  // Mirrors hub/history.py _merge_messages text rules.
+  // Overlap-aware for mixed/redundant deliveries (P1 stream fidelity).
   function mergeStreamText(prev, chunk) {
     const p = prev == null ? "" : String(prev);
     const c = chunk == null ? "" : String(chunk);
@@ -4788,6 +5362,19 @@
     if (!p) return c;
     if (p === c || p.startsWith(c)) return p;
     if (c.startsWith(p)) return c;
+    // Redundant suffix / re-delivered delta already at end of prev.
+    if (p.endsWith(c)) return p;
+    const cTrim = c.trimStart();
+    if (cTrim && p.endsWith(cTrim)) return p;
+    // Strip-equal (e.g. "I" + " I"): keep existing prev.
+    if (cTrim && p.trimEnd() === cTrim) return p;
+    // Longest overlap: suffix of prev equals prefix of chunk.
+    const maxO = Math.min(256, p.length, c.length);
+    for (let o = maxO; o >= 1; o--) {
+      if (p.slice(-o) === c.slice(0, o)) {
+        return p + c.slice(o);
+      }
+    }
     return p + c;
   }
 
@@ -4796,6 +5383,16 @@
     noteTermLineActivity();
     const body = el.querySelector(".term-body");
     if (!body) return;
+    // Dedupe identical chunk redelivery within 50ms (double WS / resume).
+    const now = Date.now();
+    if (
+      body._lastChunk === text &&
+      now - (body._lastChunkAt || 0) < 50
+    ) {
+      return;
+    }
+    body._lastChunk = text;
+    body._lastChunkAt = now;
     // Always accumulate from _rawText (source of truth). After a table render,
     // body.textContent is cell text without pipes — never re-parse from it.
     const prev = body._rawText != null ? String(body._rawText) : String(body.textContent || "");
@@ -5057,34 +5654,46 @@
   }
 
   function handleCompactNotification(sessionId, update, kind) {
-    // Typed WS `compact` carries user-facing feedback. This path is a fallback
-    // when only the raw session_notification arrives (older hub, disk tail).
-    // Apply usage only; skip system lines if we recently handled the same event.
+    // Raw auto_compact_* from ACP must NOT invent user-facing success from agent
+    // tokens. Typed WS `type:compact` is signals-grounded (hub). This path only:
+    // - shows started
+    // - shows failed/cancelled with agent error when present
+    // - on completed: refresh usage bar only (no green "Context compacted X→Y")
     const stateName = compactStateFromKind(kind);
     if (!stateName) return;
     const t = compactTokensFromUpdate(update);
-    const key =
-      String(sessionId || "") +
-      ":" +
-      stateName +
-      ":" +
-      String(t.before) +
-      ":" +
-      String(t.after);
-    if (state._lastCompactKey === key) {
-      if (stateName === "completed" && t.after != null && Number.isFinite(Number(t.after))) {
-        applyUsagePatch(sessionId, { contextTokensUsed: Number(t.after) });
-      }
+    if (stateName === "started") {
+      handleCompactEvent({
+        sessionId: sessionId,
+        state: "started",
+        tokensBefore: null,
+        tokensAfter: null,
+        summaryPreview: null,
+        error: null,
+        message: "",
+        reduced: false,
+        ungrounded: true,
+      });
       return;
     }
-    handleCompactEvent({
-      sessionId: sessionId,
-      state: stateName,
-      tokensBefore: t.before,
-      tokensAfter: t.after,
-      summaryPreview: t.summary,
-      error: t.error,
-    });
+    if (stateName === "failed" || stateName === "cancelled") {
+      handleCompactEvent({
+        sessionId: sessionId,
+        state: stateName,
+        tokensBefore: t.before,
+        tokensAfter: t.after,
+        summaryPreview: t.summary,
+        error: t.error,
+        message: t.error ? String(t.error) : "",
+        reduced: false,
+        ungrounded: true,
+      });
+      return;
+    }
+    // completed: never claim shrink from raw agent tokens; refresh bar only.
+    if (!sessionId || sessionId === state.selectedId || shouldApplyAcpToSession(sessionId)) {
+      refreshUsage();
+    }
   }
 
   function applyUsagePatch(sessionId, patch) {
@@ -5118,6 +5727,7 @@
     if (prev.plan && !next.plan) next.plan = prev.plan;
     state.usage = next;
     updateUsageBar(next);
+    maybeShowLargeSessionHint(sessionId || state.selectedId);
   }
 
   function handleUsageEvent(msg) {
@@ -5129,15 +5739,78 @@
     });
   }
 
+  // Rate-limit compact system lines (load-replay can flood auto_compact_*).
+  const COMPACT_FEEDBACK_COOLDOWN_MS = 4000;
+  // Same terminal text (or both "did not free") shown once per session per window.
+  const COMPACT_TERMINAL_MSG_DEDUPE_MS = 12000;
+
+  function compactClaimsReduction(before, after) {
+    return before != null && after != null && Number(after) < Number(before);
+  }
+
+  function allowCompactSystemLine(sid, phase, opts) {
+    // phase: "started" | "terminal" — at most one of each per session per cooldown.
+    // Grounded failed / "did not free context" force-bypass cooldown, but message-
+    // level terminal dedupe still suppresses identical late duplicates.
+    const force =
+      opts &&
+      (opts.force === true ||
+        opts.state === "failed" ||
+        (typeof opts.message === "string" &&
+          /did not free context/i.test(opts.message)));
+    if (!state._compactLineAt) state._compactLineAt = Object.create(null);
+    const key = String(sid || "") + ":" + phase;
+    const now = Date.now();
+    const last = state._compactLineAt[key] || 0;
+    const msgText =
+      phase === "terminal" && opts && typeof opts.message === "string"
+        ? opts.message.trim()
+        : "";
+    // Message-level terminal dedupe wins over force (hub + late auto_compact).
+    if (phase === "terminal" && msgText) {
+      if (!state._lastCompactTerminal) state._lastCompactTerminal = Object.create(null);
+      const termKey = String(sid || "");
+      const prev = state._lastCompactTerminal[termKey];
+      if (prev && now - prev.at < COMPACT_TERMINAL_MSG_DEDUPE_MS) {
+        if (prev.text === msgText) return false;
+        if (
+          /did not free context/i.test(prev.text) &&
+          /did not free context/i.test(msgText)
+        ) {
+          return false;
+        }
+      }
+    }
+    if (!force && now - last < COMPACT_FEEDBACK_COOLDOWN_MS) return false;
+    state._compactLineAt[key] = now;
+    if (phase === "terminal" && msgText) {
+      if (!state._lastCompactTerminal) state._lastCompactTerminal = Object.create(null);
+      state._lastCompactTerminal[String(sid || "")] = { text: msgText, at: now };
+    }
+    return true;
+  }
+
   function handleCompactEvent(msg) {
     const sid = msg.sessionId || null;
     const st = String(msg.state || "");
     const before = sanitizeCompactToken(msg.tokensBefore);
     const after = sanitizeCompactToken(msg.tokensAfter);
-    const dedupeKey =
-      String(sid || "") + ":" + st + ":" + String(before) + ":" + String(after);
+    // Terminal outcomes (failed / completed / cancelled) share one dedupe slot so
+    // token-null vs filled or failed vs completed-still-full do not double-paint.
+    const isTerminal = st === "completed" || st === "failed" || st === "cancelled";
+    const msgHint =
+      (typeof msg.message === "string" && msg.message.trim()) ||
+      (typeof msg.error === "string" && msg.error.trim()) ||
+      "";
+    const dedupeKey = isTerminal
+      ? String(sid || "") + ":terminal:" + (msgHint || String(after ?? ""))
+      : String(sid || "") + ":" + st + ":" + String(before) + ":" + String(after);
     // Prefer one "Compacting…" line; ignore duplicate started for same session.
     if (st === "started" && state._lastCompactKey === dedupeKey) {
+      return;
+    }
+    // Full-event dedupe (replay spam / dual emit with same terminal text).
+    if (state._lastCompactKey === dedupeKey && st !== "started") {
       return;
     }
     state._lastCompactKey = dedupeKey;
@@ -5159,7 +5832,7 @@
     };
 
     if (st === "started") {
-      if (applyToSelected) {
+      if (applyToSelected && allowCompactSystemLine(sid, "started")) {
         reportInfo("Compacting conversation…", {
           sessionId: sid,
           source: "compact",
@@ -5170,53 +5843,110 @@
     }
 
     if (st === "completed") {
-      const beforeOk = before != null;
-      const afterOk = after != null;
+      // Only explicit hub reduced=true claims shrink. Never invent from agent
+      // tokens alone (msg.reduced undefined + before>after was a false green).
+      const reduced = msg.reduced === true;
       let text;
-      if (beforeOk && afterOk && Number(before) === Number(after)) {
-        text =
-          "Context compact ran (no change: already minimal or nothing to free)";
-      } else if (beforeOk && afterOk) {
+      // Hub message is authority (signals-grounded via resolve_compact_outcome).
+      if (typeof msg.message === "string" && msg.message.trim()) {
+        text = msg.message.trim();
+      } else if (before != null && after != null && reduced) {
         text =
           "Context compacted: " +
           formatTokenCompact(before) +
           " → " +
-          formatTokenCompact(after) +
-          " tokens";
-      } else if (afterOk) {
-        text = "Context compacted → " + formatTokenCompact(after) + " tokens";
+          formatTokenCompact(after);
       } else {
-        // Invalid/absurd tokens: no fake counts in the UI.
-        text = "Context compact finished";
+        // No-change fallback; never claim empty when bar may still be full.
+        const used =
+          after != null
+            ? after
+            : state.usage && state.usage.contextTokensUsed != null
+              ? Number(state.usage.contextTokensUsed)
+              : null;
+        const win =
+          msg.windowTokens != null
+            ? sanitizeCompactToken(msg.windowTokens)
+            : state.usage && state.usage.contextWindowTokens != null
+              ? Number(state.usage.contextWindowTokens)
+              : null;
+        if (used != null && win != null && win > 0) {
+          const pct = Math.round((Number(used) / Number(win)) * 100);
+          text =
+            "Compact did not free context — session still " +
+            formatTokenCompact(used) +
+            " / " +
+            formatTokenCompact(win) +
+            " (" +
+            pct +
+            "%).";
+        } else if (used != null) {
+          text =
+            "Compact did not free context — session still ~" +
+            formatTokenCompact(used) +
+            " tokens.";
+        } else {
+          text = "Compact finished. Check context bar for current usage.";
+        }
       }
-      if (applyToSelected) {
-        reportInfo(text, { sessionId: sid, source: "compact" });
+      const stillFull =
+        msg.feedback === "no_change_still_full" ||
+        /did not free context/i.test(text);
+      if (
+        applyToSelected &&
+        allowCompactSystemLine(sid, "terminal", {
+          force: stillFull,
+          state: stillFull ? "failed" : st,
+          message: text,
+        })
+      ) {
+        // Still-full / no free context is a failure for the user, not success green.
+        if (stillFull) {
+          reportError(text, { sessionId: sid, source: "compact" });
+        } else {
+          reportInfo(text, { sessionId: sid, source: "compact" });
+        }
         appendSys(text);
       }
-      if (afterOk) {
-        applyUsagePatch(sid, { contextTokensUsed: Number(after) });
-      }
-      // Re-read signals (lag possible); one immediate + one delayed retry.
+      // Never applyUsagePatch from compact after alone — bar truth is signals.
+      // Always re-read signals; delayed once for agent write lag.
       if (!sid || sid === state.selectedId || applyToSelected) {
         refreshUsage();
         setTimeout(() => {
           if (!state.selectedId) return;
-          if (sid && sid !== state.selectedId && sid !== state.livePromptSessionId) {
+          if (
+            sid &&
+            sid !== state.selectedId &&
+            sid !== state.livePromptSessionId
+          ) {
             return;
           }
           refreshUsage();
-        }, 1500);
+        }, 1000);
       }
       return;
     }
 
     if (st === "failed" || st === "cancelled") {
+      // Prefer hub message (signals-grounded) over generic error.
       const err =
+        (typeof msg.message === "string" && msg.message.trim()) ||
         msg.error ||
         (st === "cancelled" ? "Context compact cancelled" : "Context compact failed");
-      if (applyToSelected) {
+      if (
+        applyToSelected &&
+        allowCompactSystemLine(sid, "terminal", {
+          force: true,
+          state: st,
+          message: String(err),
+        })
+      ) {
         reportError(String(err), { sessionId: sid, source: "compact" });
         appendSys(String(err));
+      }
+      // Refresh CTX bar after failed compact (usage may still have moved).
+      if (!sid || sid === state.selectedId || applyToSelected) {
+        refreshUsage();
       }
       return;
     }
@@ -5352,6 +6082,9 @@
   async function attachSessionLive(viewId, cwd, opts = {}) {
     const showFailToast = opts.showFailToast !== false;
     const focusOnFail = !!opts.focusOnFail;
+    state.attachingSessionId = viewId;
+    updateLatencyHintBanner();
+    setComposerEnabled(composerConnected());
     try {
       const res = await fetch(
         apiUrl(`/api/sessions/${encodeURIComponent(viewId)}/attach`),
@@ -5396,6 +6129,12 @@
       subscribeSessionIds(viewId);
       if (focusOnFail && els.input) els.input.focus();
       return null;
+    } finally {
+      if (state.attachingSessionId === viewId) {
+        state.attachingSessionId = null;
+      }
+      updateLatencyHintBanner();
+      setComposerEnabled(composerConnected());
     }
   }
 
@@ -5433,6 +6172,11 @@
     state.selectedId = viewId;
     state.selectedMeta = session;
     saveSelectedSession(viewId);
+    // Clear large-session banner when switching chats (re-show once per id if still large).
+    if (state._latencyLargeVisible && state._latencyLargeVisible !== viewId) {
+      state._latencyLargeVisible = null;
+    }
+    updateLatencyHintBanner();
     // Reset live prompt target until attach reports (or same-id hub session).
     state.livePromptSessionId = isHubCreatedSession(viewId) ? viewId : null;
     if (!(state.turnRunning && viewId === liveKeep)) {
@@ -5691,6 +6435,15 @@
         clearLiveClientStateAfterProcessRestart("bootId changed");
         state._hubProcessRestarted = true;
         state._resumeAfterReconnect = true;
+        // One hard reload so phone/desktop never mix old JS with new Python.
+        try {
+          const key = "grh.bootReload." + bootId;
+          if (!sessionStorage.getItem(key)) {
+            sessionStorage.setItem(key, "1");
+            location.reload();
+            return;
+          }
+        } catch (_) {}
       }
       state.bootId = bootId;
     }
@@ -6044,6 +6797,11 @@
           state._reconnectScrollFreeze = false;
           state._suppressStickyScroll = false;
           state._resumeAfterReconnect = false;
+          // Always force-refresh selected history after freeze lifts so completed
+          // disk messages appear even if the live stream was incomplete / zombie.
+          if (state.selectedId) {
+            refreshHistory(state.selectedId, { force: true });
+          }
         });
       });
       if (interruptedByRestart) {
@@ -6064,6 +6822,46 @@
     } catch (_) {
       // individual hydrates already swallow fetch errors
     }
+    // CLI-aligned: re-sync turn ownership before force history (dead/silent turns).
+    // reconcileTurnAfterWake clears zombies; silence >= 30 / quality bad → idle first
+    // so force history can paint the final disk message.
+    try {
+      const silence =
+        health &&
+        health.turnSilenceSeconds != null &&
+        Number.isFinite(Number(health.turnSilenceSeconds))
+          ? Number(health.turnSilenceSeconds)
+          : null;
+      const quality =
+        (health && health.acpQuality) ||
+        (state.status && state.status.acpQuality) ||
+        null;
+      const serverRunningNow = !!(
+        health &&
+        (health.turnRunning ||
+          (Array.isArray(health.liveTurns) && health.liveTurns.length))
+      );
+      // Explicit pre-check documents silence>=30 catch-up (also covered inside reconcile).
+      if (
+        serverRunningNow &&
+        (shouldClearTurnOnWake({
+          turnRunning: true,
+          silenceSeconds: silence,
+          acpQuality: quality,
+          silenceThresholdS: WAKE_CLEAR_SILENCE_SECONDS,
+          hasOpenTools: selectedHasOpenTools(),
+        }) ||
+          (silence != null && silence >= 30))
+      ) {
+        await reconcileTurnAfterWake(
+          opts.wasReconnect ? "ws-reconnect" : "ws-open"
+        );
+      } else {
+        await reconcileTurnAfterWake(
+          opts.wasReconnect ? "ws-reconnect" : "ws-open"
+        );
+      }
+    } catch (_) {}
     finish();
   }
 
@@ -6459,14 +7257,29 @@
         const anyLeft = (state.liveTurns || []).length > 0;
         const recoverable =
           !!msg.error && isRecoverableTurnClear(msg.error);
+        const keepPending =
+          !!msg.error && isNoOutputKeepPending(msg.error);
         if (recoverable) {
           // Force this session fully idle after stall/max-duration clear.
-          setTurnRunning(false, sid, { forceIdleFlags: !anyLeft });
+          setTurnRunning(false, sid, {
+            forceIdleFlags: !anyLeft,
+            keepPending,
+          });
           if (anyLeft) {
             state.turnRunning = true;
             if (!state.liveTurnSessionId && state.liveTurns.length) {
               state.liveTurnSessionId =
                 state.liveTurns[state.liveTurns.length - 1].sessionId;
+            }
+          }
+          if (keepPending) {
+            const lp = loadLastPrompt();
+            if (lp && lp.pending && lp.text && String(lp.text).trim()) {
+              offerNoOutputResend(lp, {
+                reason: "no-output",
+                message: msg.error,
+                source: "turn",
+              });
             }
           }
         } else if (anyLeft) {
@@ -6498,7 +7311,10 @@
         }
         if (msg.error) {
           if (recoverable) {
-            reportInfo(msg.error, { sessionId: sid, source: "turn" });
+            // Resend offer already toasted for no-output; avoid double toast.
+            if (!keepPending) {
+              reportInfo(msg.error, { sessionId: sid, source: "turn" });
+            }
             // Once: also land the notice in the session transcript.
             const noteKey = `${sid || "_"}:${msg.error}`;
             if (!state._turnClearNotes) state._turnClearNotes = {};
@@ -8706,15 +9522,16 @@
     els.projectSearch.value = "";
     if (els.projectNewName) els.projectNewName.value = "";
     state.entryChoiceCwd = null;
+    state.projectEntryReturnMode = "list";
     setProjectModalMode("list");
     await refreshProjects();
-    if (els.projectNewName) els.projectNewName.focus();
-    else els.projectSearch.focus();
+    if (els.projectSearch) els.projectSearch.focus();
   }
 
   function closeNewModal() {
     els.modalNew.classList.add("hidden");
     state.entryChoiceCwd = null;
+    state.projectEntryReturnMode = "list";
     setProjectModalMode("list");
   }
 
@@ -8724,13 +9541,25 @@
     if (els.projectListView) els.projectListView.classList.toggle("hidden", m !== "list");
     if (els.projectBrowser) els.projectBrowser.classList.toggle("hidden", m !== "browse");
     if (els.projectEntryChoice) els.projectEntryChoice.classList.toggle("hidden", m !== "entry");
+    if (els.projectModeTabs) els.projectModeTabs.classList.toggle("hidden", m === "entry");
+    if (els.tabProjects) {
+      els.tabProjects.classList.toggle("is-active", m === "list");
+      els.tabProjects.setAttribute("aria-selected", m === "list" ? "true" : "false");
+    }
+    if (els.tabBrowse) {
+      els.tabBrowse.classList.toggle("is-active", m === "browse");
+      els.tabBrowse.setAttribute("aria-selected", m === "browse" ? "true" : "false");
+    }
     if (els.modalNewTitle) {
       els.modalNewTitle.textContent =
         m === "entry" ? "Resume or start new" : "New session";
     }
     if (els.modalNewHelp) {
       els.modalNewHelp.classList.toggle("hidden", m === "entry");
-      if (m !== "entry") {
+      if (m === "browse") {
+        els.modalNewHelp.textContent =
+          "Open a folder, or use the current folder as your project.";
+      } else if (m === "list") {
         els.modalNewHelp.textContent = "Pick a project working directory.";
       }
     }
@@ -8778,12 +9607,18 @@
       await createSession(path);
       return;
     }
+    state.projectEntryReturnMode =
+      state.projectModalMode === "browse" ? "browse" : "list";
     showEntryChoice(path, priors);
   }
 
   function showEntryChoice(cwd, priors) {
     state.entryChoiceCwd = String(cwd || "");
     setProjectModalMode("entry");
+    if (els.projectEntryChoiceHelp) {
+      els.projectEntryChoiceHelp.textContent =
+        "Continue a previous session or start fresh in this folder.";
+    }
     if (els.projectEntryCwd) {
       els.projectEntryCwd.textContent = state.entryChoiceCwd;
       els.projectEntryCwd.title = state.entryChoiceCwd;
@@ -8811,6 +9646,7 @@
       resumeBtn.className = "btn btn-sm btn-accent";
       resumeBtn.textContent = "Resume";
       resumeBtn.addEventListener("click", async () => {
+        rememberRecentProject(state.entryChoiceCwd, pathBasename(state.entryChoiceCwd));
         closeNewModal();
         await openSession(row);
       });
@@ -8832,6 +9668,129 @@
       return res.ok;
     } catch (_) {
       return false;
+    }
+  }
+
+  /**
+   * After sleep/wake, network online, or WS reconnect: re-sync turn ownership
+   * with server (CLI-aligned). Server is sole authority for turnRunning.
+   * - idle server → clear stale client mid-turn UI
+   * - running + stale/zombie/down quality or silence >= 120s → cancel+reset
+   * - healthy running → re-seed timers from health; keep running
+   * @param {string} [reason]
+   */
+  async function reconcileTurnAfterWake(reason) {
+    if (state._reconcileWakeInFlight) {
+      state._reconcileWakePending = reason || "queued";
+      return;
+    }
+    state._reconcileWakeInFlight = true;
+    try {
+      let health = null;
+      try {
+        const r = await fetch("/health", { method: "GET", cache: "no-store" });
+        if (r.ok) health = await r.json();
+      } catch (_) {
+        health = null;
+      }
+      if (!health) {
+        setComposerEnabled(composerConnected());
+        updateTurnStrip();
+        return;
+      }
+
+      if (health.acpQuality != null && state.status) {
+        state.status.acpQuality = health.acpQuality;
+      }
+      if (health.agent != null && state.status) {
+        state.status.agent = health.agent;
+      }
+      if (health.acpConnected != null && state.status) {
+        state.status.acpConnected = health.acpConnected === true;
+      }
+
+      const liveTurns = Array.isArray(health.liveTurns) ? health.liveTurns : [];
+      const serverRunning = !!health.turnRunning || liveTurns.length > 0;
+      const silence =
+        health.turnSilenceSeconds != null &&
+        Number.isFinite(Number(health.turnSilenceSeconds))
+          ? Number(health.turnSilenceSeconds)
+          : null;
+      const quality =
+        health.acpQuality ||
+        (state.status && state.status.acpQuality) ||
+        null;
+
+      if (!serverRunning) {
+        // Server idle: never leave client Send/strip locked as running.
+        const clientStale =
+          state.turnRunning ||
+          !!(state.liveTurns && state.liveTurns.length) ||
+          !!state.liveTurnSessionId ||
+          !!state.turnStartedAt;
+        if (clientStale) {
+          clearStaleLiveTurns({ clearQuestions: false });
+        } else {
+          setTurnRunning(false, null, { forceIdleFlags: true });
+        }
+      } else if (
+        shouldClearTurnOnWake({
+          turnRunning: true,
+          silenceSeconds: silence,
+          acpQuality: quality,
+          silenceThresholdS: WAKE_CLEAR_SILENCE_SECONDS,
+          hasOpenTools: selectedHasOpenTools(),
+        })
+      ) {
+        const sid =
+          health.turnSessionId ||
+          state.livePromptSessionId ||
+          state.liveTurnSessionId ||
+          (liveTurns[0] && liveTurns[0].sessionId) ||
+          state.selectedId;
+        if (sid) {
+          await stopTurnForSession(sid);
+        }
+        clearStaleLiveTurns({ clearQuestions: false });
+        toast("Turn cleared after reconnect (CLI-style interrupt).", "");
+      } else {
+        // Healthy running turn: re-seed clocks; unlock only if not running.
+        if (Array.isArray(health.liveTurns)) state.liveTurns = health.liveTurns;
+        if (health.turnRunning != null) {
+          state.turnRunning = !!health.turnRunning || liveTurns.length > 0;
+          if (state.status) state.status.turnRunning = state.turnRunning;
+        } else if (liveTurns.length) {
+          state.turnRunning = true;
+          if (state.status) state.status.turnRunning = true;
+        }
+        if (health.turnSessionId) {
+          state.liveTurnSessionId = health.turnSessionId;
+          if (state.status) state.status.turnSessionId = health.turnSessionId;
+        }
+        if (health.turnSilenceSeconds != null) {
+          state.turnSilenceSeconds = health.turnSilenceSeconds;
+        }
+        if (health.turnAgeSeconds != null) {
+          state.turnAgeSeconds = health.turnAgeSeconds;
+        }
+        applyServerTurnTimers(health);
+        if (state.turnRunning && !state.stallTimer) {
+          startStallWatch({ fromServer: true });
+        }
+      }
+
+      setComposerEnabled(composerConnected());
+      forceComposerUnlocked();
+      updateTurnStrip();
+    } finally {
+      state._reconcileWakeInFlight = false;
+      if (state._reconcileWakePending) {
+        const pending = state._reconcileWakePending;
+        state._reconcileWakePending = null;
+        reconcileTurnAfterWake(
+          typeof pending === "string" ? pending : "queued"
+        );
+      }
     }
   }
 
@@ -8924,6 +9883,66 @@
     }
   }
 
+  const RECENT_PROJECTS_KEY = "grh.recentProjects.v1";
+  const RECENT_PROJECTS_MAX = 5;
+
+  function pathBasename(p) {
+    const s = String(p || "").replace(/[\\/]+$/, "");
+    if (!s) return "";
+    const parts = s.split(/[\\/]/);
+    return parts[parts.length - 1] || s;
+  }
+
+  function loadRecentProjects() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(RECENT_PROJECTS_KEY) || "[]");
+      if (!Array.isArray(raw)) return [];
+      return raw
+        .map((row) => ({
+          path: String((row && row.path) || "").trim(),
+          name: String((row && row.name) || "").trim(),
+          at: Number((row && row.at) || 0) || 0,
+        }))
+        .filter((row) => row.path)
+        .slice(0, RECENT_PROJECTS_MAX);
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function rememberRecentProject(cwd, name) {
+    const path = String(cwd || "").trim();
+    if (!path) return;
+    const label = String(name || "").trim() || pathBasename(path) || path;
+    try {
+      const prev = loadRecentProjects().filter(
+        (row) => cwdKeyClient(row.path) !== cwdKeyClient(path)
+      );
+      const next = [{ path, name: label, at: Date.now() }, ...prev].slice(
+        0,
+        RECENT_PROJECTS_MAX
+      );
+      localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(next));
+    } catch (_) {}
+  }
+
+  function appendProjectRow(host, p) {
+    if (!host || !p || !p.path) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "project-row";
+    btn.setAttribute("role", "listitem");
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = p.name || pathBasename(p.path) || p.path;
+    const path = document.createElement("span");
+    path.className = "path";
+    path.textContent = p.path;
+    btn.append(name, path);
+    btn.addEventListener("click", () => onProjectChosen(p.path));
+    host.appendChild(btn);
+  }
+
   async function refreshProjects() {
     try {
       const res = await fetch(apiUrl("/api/projects"));
@@ -8936,45 +9955,173 @@
   }
 
   function renderProjects() {
-    const q = els.projectSearch.value.trim().toLowerCase();
+    const q = (els.projectSearch && els.projectSearch.value
+      ? els.projectSearch.value
+      : ""
+    )
+      .trim()
+      .toLowerCase();
     const items = state.projects.filter(
-      (p) => !q || (p.name || "").toLowerCase().includes(q) || (p.path || "").toLowerCase().includes(q)
+      (p) =>
+        !q ||
+        (p.name || "").toLowerCase().includes(q) ||
+        (p.path || "").toLowerCase().includes(q)
     );
-    els.projectList.innerHTML = "";
-    els.projectEmpty.classList.toggle("hidden", items.length > 0);
-    for (const p of items) {
+    if (els.projectList) els.projectList.innerHTML = "";
+    const recents = loadRecentProjects().filter(
+      (r) =>
+        !q ||
+        (r.name || "").toLowerCase().includes(q) ||
+        (r.path || "").toLowerCase().includes(q)
+    );
+    if (els.projectRecents && els.projectRecentsList) {
+      els.projectRecentsList.innerHTML = "";
+      const showRecents = recents.length > 0;
+      els.projectRecents.classList.toggle("hidden", !showRecents);
+      if (showRecents) {
+        for (const r of recents) appendProjectRow(els.projectRecentsList, r);
+      }
+    }
+    if (els.projectEmpty) {
+      const hasAny = items.length > 0 || recents.length > 0;
+      els.projectEmpty.classList.toggle("hidden", hasAny);
+      if (!hasAny) {
+        els.projectEmpty.textContent = q
+          ? "No matching projects. Try Browse or clear the filter."
+          : "No projects under the configured root. Switch to Browse or create a folder.";
+      }
+    }
+    if (!els.projectList) return;
+    for (const p of items) appendProjectRow(els.projectList, p);
+  }
+
+  function setBrowseLoading(loading) {
+    if (!els.projectBrowserStatus) return;
+    if (loading) {
+      els.projectBrowserStatus.textContent = "Loading…";
+      els.projectBrowserStatus.classList.remove("danger");
+      els.projectBrowserStatus.classList.remove("hidden");
+    } else if (!els.projectBrowserStatus.classList.contains("danger")) {
+      // Keep error status visible after a failed browse load.
+      els.projectBrowserStatus.classList.add("hidden");
+    }
+  }
+
+  function updateBrowseUseCta(data) {
+    const abs = (data && data.absolute) || "";
+    const rel = (data && data.path) || "";
+    const base = rel ? pathBasename(rel) : pathBasename(abs);
+    const rootName = pathBasename((data && data.projectsRoot) || "") || "Projects";
+    const labelEl = els.btnBrowseStartLabel || els.btnBrowseStart;
+    if (labelEl) {
+      if (base && base !== rootName && rel) {
+        labelEl.textContent = `Use “${base}”`;
+      } else {
+        labelEl.textContent = "Use this folder";
+      }
+    }
+    if (els.projectBrowserPath) {
+      els.projectBrowserPath.textContent = abs || "";
+      els.projectBrowserPath.title = abs || "";
+    }
+    if (els.btnBrowseStart) els.btnBrowseStart.disabled = !abs;
+  }
+
+  function renderProjectCrumbs(data) {
+    if (!els.projectBrowserCrumbs) return;
+    els.projectBrowserCrumbs.innerHTML = "";
+    if (!data) return;
+    const rootLabel = pathBasename(data.projectsRoot || "") || "Projects";
+    const parts = String(data.path || "")
+      .replace(/\\/g, "/")
+      .split("/")
+      .filter(Boolean);
+
+    function addCrumb(label, pathArg, isCurrent) {
+      if (els.projectBrowserCrumbs.childNodes.length) {
+        const sep = document.createElement("span");
+        sep.className = "project-browser-crumb-sep";
+        sep.setAttribute("aria-hidden", "true");
+        sep.textContent = "›";
+        els.projectBrowserCrumbs.appendChild(sep);
+      }
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "project-row";
-      btn.setAttribute("role", "listitem");
-      const name = document.createElement("span");
-      name.className = "name";
-      name.textContent = p.name;
-      const path = document.createElement("span");
-      path.className = "path";
-      path.textContent = p.path;
-      btn.append(name, path);
-      btn.addEventListener("click", () => onProjectChosen(p.path));
-      els.projectList.appendChild(btn);
+      btn.className =
+        "project-browser-crumb" + (isCurrent ? " is-current" : "");
+      btn.textContent = label;
+      btn.title = label;
+      if (isCurrent) {
+        btn.disabled = true;
+        btn.setAttribute("aria-current", "page");
+      } else {
+        btn.addEventListener("click", () => {
+          loadProjectBrowse(pathArg);
+        });
+      }
+      els.projectBrowserCrumbs.appendChild(btn);
     }
+
+    addCrumb(rootLabel, "", parts.length === 0);
+    let accum = "";
+    parts.forEach((part, i) => {
+      accum = accum ? accum + "/" + part : part;
+      addCrumb(part, accum, i === parts.length - 1);
+    });
+  }
+
+  function setProjectBrowseError(message) {
+    if (els.projectBrowserStatus) {
+      els.projectBrowserStatus.textContent = message;
+      els.projectBrowserStatus.classList.add("danger");
+      els.projectBrowserStatus.classList.remove("hidden");
+    }
+    if (els.projectBrowserList) els.projectBrowserList.innerHTML = "";
+    if (els.projectBrowserEmpty) {
+      els.projectBrowserEmpty.textContent = "Could not load folders";
+      els.projectBrowserEmpty.classList.remove("hidden");
+    }
+    state.projectBrowse = null;
+    setProjectModalMode("browse");
   }
 
   async function loadProjectBrowse(rel) {
     const path = rel == null ? "" : String(rel);
+    setBrowseLoading(true);
+    if (els.projectBrowserEmpty) {
+      els.projectBrowserEmpty.textContent = "No subfolders";
+      els.projectBrowserEmpty.classList.add("hidden");
+    }
     try {
       const q = path ? `?path=${encodeURIComponent(path)}` : "";
       const res = await fetch(apiUrl(`/api/projects/browse${q}`));
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        toast(data.error || "Failed to browse folders", "danger");
+        const errMsg = data.error || "Failed to browse folders";
+        let statusText = errMsg;
+        if (res.status === 404) {
+          statusText =
+            errMsg + " — set hub.projects_root in config.toml";
+        }
+        toast(errMsg, "danger");
+        setProjectBrowseError(statusText);
         return null;
+      }
+      if (els.projectBrowserStatus) {
+        els.projectBrowserStatus.classList.remove("danger");
+      }
+      if (els.projectBrowserEmpty) {
+        els.projectBrowserEmpty.textContent = "No subfolders";
       }
       state.projectBrowse = data;
       renderProjectBrowse();
       return data;
     } catch (err) {
       toast("Failed to browse folders: " + err, "danger");
+      setProjectBrowseError("Failed to browse folders: " + err);
       return null;
+    } finally {
+      setBrowseLoading(false);
     }
   }
 
@@ -8982,35 +10129,41 @@
     const data = state.projectBrowse;
     if (!els.projectBrowserList) return;
     els.projectBrowserList.innerHTML = "";
+    renderProjectCrumbs(data);
+    updateBrowseUseCta(data);
     if (!data) {
-      if (els.projectBrowserPath) {
-        els.projectBrowserPath.textContent = "/";
-        els.projectBrowserPath.title = "";
-      }
-      if (els.btnBrowseUp) els.btnBrowseUp.disabled = true;
+      if (els.projectBrowserEmpty) els.projectBrowserEmpty.classList.add("hidden");
       return;
     }
-    const rel = data.path || "";
-    const label = rel ? `/${rel}` : "/";
-    if (els.projectBrowserPath) {
-      els.projectBrowserPath.textContent = label;
-      els.projectBrowserPath.title = data.absolute || label;
-    }
-    if (els.btnBrowseUp) {
-      els.btnBrowseUp.disabled = data.parent === null || data.parent === undefined;
-    }
     const entries = data.entries || [];
+    if (els.projectBrowserEmpty) {
+      els.projectBrowserEmpty.classList.toggle("hidden", entries.length > 0);
+    }
     for (const e of entries) {
       const btn = document.createElement("button");
       btn.type = "button";
-      btn.className = "project-row";
+      btn.className = "project-row browse-folder-row";
       btn.setAttribute("role", "listitem");
+      const icon = document.createElement("span");
+      icon.className = "browse-folder-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.textContent = "📁";
       const name = document.createElement("span");
       name.className = "name";
       name.textContent = e.name || e.path || "";
-      btn.append(name);
+      const chev = document.createElement("span");
+      chev.className = "browse-folder-chevron";
+      chev.setAttribute("aria-hidden", "true");
+      chev.textContent = "›";
+      btn.append(icon, name, chev);
       btn.addEventListener("click", () => {
         loadProjectBrowse(e.path || "");
+      });
+      btn.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          loadProjectBrowse(e.path || "");
+        }
       });
       els.projectBrowserList.appendChild(btn);
     }
@@ -9073,10 +10226,12 @@
         toast(data.error || "Failed to create session", "danger");
         return;
       }
+      const sessionCwd = data.cwd || cwd;
+      rememberRecentProject(sessionCwd, pathBasename(sessionCwd));
       const session = {
         sessionId: data.sessionId,
         title: "Untitled session",
-        cwd: data.cwd || cwd,
+        cwd: sessionCwd,
         updatedAt: new Date().toISOString(),
         modelId: "",
         path: "",
@@ -9137,6 +10292,12 @@
   }
 
   function bindEvents() {
+    if (els.btnLatencyHintDismiss) {
+      els.btnLatencyHintDismiss.addEventListener("click", (e) => {
+        e.preventDefault();
+        dismissLargeSessionHint();
+      });
+    }
     if (els.statusPill) {
       els.statusPill.addEventListener("click", (e) => {
         const st = els.statusPill.dataset.state;
@@ -9385,21 +10546,14 @@
         }
       });
     }
-    if (els.btnBrowseFolders) {
-      els.btnBrowseFolders.addEventListener("click", () => {
-        openProjectBrowser();
-      });
-    }
-    if (els.btnBrowseBack) {
-      els.btnBrowseBack.addEventListener("click", () => {
+    if (els.tabProjects) {
+      els.tabProjects.addEventListener("click", () => {
         closeProjectBrowser();
       });
     }
-    if (els.btnBrowseUp) {
-      els.btnBrowseUp.addEventListener("click", () => {
-        const data = state.projectBrowse;
-        if (!data || data.parent === null || data.parent === undefined) return;
-        loadProjectBrowse(data.parent);
+    if (els.tabBrowse) {
+      els.tabBrowse.addEventListener("click", () => {
+        openProjectBrowser();
       });
     }
     if (els.btnBrowseStart) {
@@ -9423,9 +10577,16 @@
       });
     }
     if (els.btnEntryBack) {
-      els.btnEntryBack.addEventListener("click", () => {
+      els.btnEntryBack.addEventListener("click", async () => {
         state.entryChoiceCwd = null;
-        setProjectModalMode("list");
+        const back = state.projectEntryReturnMode === "browse" ? "browse" : "list";
+        if (back === "browse") {
+          setProjectModalMode("browse");
+          if (!state.projectBrowse) await loadProjectBrowse("");
+          else renderProjectBrowse();
+        } else {
+          setProjectModalMode("list");
+        }
       });
     }
     els.form.addEventListener("submit", (e) => {
@@ -9622,26 +10783,114 @@
 
     document.addEventListener("visibilitychange", () => {
       if (document.visibilityState !== "visible") return;
-      if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-        connectWs();
-      } else if (state.selectedId) {
-        refreshHistory(state.selectedId);
-      }
+      scheduleWakeReconcile("visibility");
+    });
+
+    window.addEventListener("pageshow", (ev) => {
+      scheduleWakeReconcile(ev && ev.persisted ? "pageshow-bfcache" : "pageshow");
+    });
+
+    window.addEventListener("online", () => {
+      scheduleWakeReconcile("online");
     });
   }
 
-  async function refreshHistory(sessionId) {
+  /** Debounced wake path (visibility / pageshow / online) — 300ms coalesce. */
+  let _wakeDebounceTimer = null;
+  function scheduleWakeReconcile(reason) {
+    if (_wakeDebounceTimer) clearTimeout(_wakeDebounceTimer);
+    _wakeDebounceTimer = setTimeout(() => {
+      _wakeDebounceTimer = null;
+      handleWakeReconcile(reason || "wake");
+    }, 300);
+  }
+
+  /**
+   * After tab focus / bfcache restore / network online:
+   * reconnect WS only if not OPEN; then reconcile + history if needed.
+   * Uses reconnect scroll freeze so hydrate does not thrash stick/scroll.
+   */
+  async function handleWakeReconcile(reason) {
+    if (document.visibilityState === "hidden" && reason === "visibility") return;
+    // Only open a new socket when not already connected.
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      connectWs();
+      return;
+    }
+    // Soft ping: re-hello keeps subscription; does not rebuild UI alone.
+    try {
+      sendWs({ type: "hello" });
+    } catch (_) {}
+
+    const wasSticky = !!state.stickToBottom;
+    state._reconnectScrollFreeze = true;
+    try {
+      await reconcileTurnAfterWake(reason);
+      if (state.selectedId) {
+        await refreshHistory(state.selectedId, {
+          force: true,
+          visibilityOnly: true,
+          jump: wasSticky,
+        });
+      }
+    } finally {
+      state._reconnectScrollFreeze = false;
+    }
+  }
+
+  /**
+   * Debounced force history for selected session (idle / reconnect catch-up).
+   * Ensures final assistant messages on disk appear after zombie/false-running.
+   */
+  function scheduleForceHistoryRefresh() {
+    if (!state.selectedId) return;
+    if (state._idleHistoryForceTimer) {
+      clearTimeout(state._idleHistoryForceTimer);
+    }
+    state._idleHistoryForceTimer = setTimeout(() => {
+      state._idleHistoryForceTimer = null;
+      if (state.selectedId) {
+        refreshHistory(state.selectedId, { force: true });
+      }
+    }, 100);
+  }
+
+  /**
+   * Refresh selected-session history from disk.
+   * @param {string} sessionId
+   * @param {{ force?: boolean, jump?: boolean, visibilityOnly?: boolean, turnJustIdle?: boolean }} [opts]
+   *   force: bypass mid-turn guard (fingerprint still skips noop rebuilds)
+   *   visibilityOnly: skip apply when fingerprint unchanged and assistant complete
+   */
+  async function refreshHistory(sessionId, opts = {}) {
     if (!sessionId || sessionId !== state.selectedId) return;
     // Live stream owns the transcript while a turn is running on this session
-    if (turnRunningOnSelected()) return;
+    // unless force (reconnect / idle / visibility catch-up).
+    if (!opts.force && turnRunningOnSelected()) return;
     try {
       const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(sessionId)}/history`));
       if (!res.ok) return;
       const data = await res.json();
       if (sessionId !== state.selectedId) return;
-      if (turnRunningOnSelected()) return;
+      if (!opts.force && turnRunningOnSelected()) return;
       const histMsgs = data.messages || [];
-      applyHistoryMessages(histMsgs);
+      const fp = historyFingerprint(histMsgs);
+      const incomplete = lastHistoryAssistantIncomplete(histMsgs);
+      // Visibility thrash gate: only apply when fingerprint changes, turn just
+      // went idle, or last assistant on disk is incomplete.
+      if (
+        opts.visibilityOnly &&
+        fp === state.historyFingerprint &&
+        state.historyLoadedFor === sessionId &&
+        !incomplete &&
+        !opts.turnJustIdle
+      ) {
+        return;
+      }
+      applyHistoryMessages(histMsgs, {
+        force: !!opts.force,
+        jump: opts.jump,
+      });
       rehydrateGoalFromHistory(sessionId, histMsgs);
     } catch (_) {
       // keep current transcript on transient failures
@@ -10056,6 +11305,7 @@
       state.usage = data;
       // Always paint bar when context or plan signals exist (plan.error still shows popover).
       updateUsageBar(data);
+      maybeShowLargeSessionHint(id);
     } catch (_) {
       keepOrBlank();
     }
@@ -10142,7 +11392,9 @@
         renderSessions();
         subscribeActiveChildrenOfSelected();
         // Restore last selected chat across refresh (desktop + mobile).
-        const savedId = loadSelectedSessionId();
+        // If id is missing from top-N list, open by id when history exists (P1.11).
+        const saved = loadSelectedSessionMeta();
+        const savedId = saved && saved.sessionId;
         if (savedId && Array.isArray(state.sessions)) {
           const row = state.sessions.find((s) => s && s.sessionId === savedId);
           if (row) {
@@ -10150,6 +11402,23 @@
               await openSession(row);
             } catch (_) {
               // Leave empty-main; connectWs still runs below.
+            }
+          } else {
+            try {
+              const hRes = await fetch(
+                apiUrl(`/api/sessions/${encodeURIComponent(savedId)}/history`)
+              );
+              if (hRes.status === 404) {
+                clearSelectedSession();
+              } else if (hRes.ok) {
+                await openSession({
+                  sessionId: savedId,
+                  title: (saved && saved.title) || "Session",
+                  cwd: (saved && saved.cwd) || "",
+                });
+              }
+            } catch (_) {
+              // Keep pin for retry when agent/hub recovers.
             }
           }
         }
