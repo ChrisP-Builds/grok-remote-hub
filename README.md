@@ -5,11 +5,12 @@
 </p>
 
 <p align="center">
-  <strong>Always-on web UI for <a href="https://x.ai/">Grok Build</a></strong><br>
-  Resume sessions from phone or desktop · live multi-browser stream · history from disk
+  <strong>Always-on remote control plane for <a href="https://x.ai/">Grok Build</a></strong><br>
+  Resume sessions from phone or desktop · live multi-browser stream · ACP health · honest compact
 </p>
 
 <p align="center">
+  <a href="https://github.com/ChrisP-Builds/grok-remote-hub/releases/tag/v0.4.0"><img src="https://img.shields.io/badge/Release-v0.4.0-e6b84d?style=flat-square&labelColor=0a0c10" alt="v0.4.0"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-e6b84d?style=flat-square&labelColor=0a0c10" alt="MIT"></a>
   <a href="#requirements"><img src="https://img.shields.io/badge/Python-3.11%2B-5ec8e8?style=flat-square&labelColor=0a0c10" alt="Python 3.11+"></a>
   <a href="#requirements"><img src="https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&labelColor=0a0c10" alt="Windows"></a>
@@ -56,19 +57,21 @@ The stock Grok CLI TUI is excellent on the desktop, but it is a **single local p
 | Resume **saved sessions** and project history | Yes (`~/.grok/sessions`) |
 | Inject prompts into the **stock Grok TUI** | **No** (separate process) |
 
-**Hub = remote control of the agent stream**, not full TUI parity.
+**Hub = remote control plane for the agent stream** (health, turns, compact, plan, files), not full TUI parity.
 
 ---
 
 ## Features
 
-- **Session rail** — Working / Subagent / All, search, pin, rename, delete
+- **Session rail** — Working / Subagent / All, search, pin, rename, delete; restore last chat on refresh
+- **New session** — Projects | Browse folder picker with Recent, breadcrumbs, and **Use this folder**
 - **Live stream** — multi-browser WebSocket fan-out; mid-turn switch keeps continuity; turn stop/clear cancels agent (CLI-aligned); wake re-syncs stuck turns
 - **Agent status** — pill and `/health` distinguish process up vs ACP connected **and** ACP quality (`ok`/`stale`/`zombie`); auto-reconnect when process is up; after heal exhaustion, **click the hung pill** to restart the agent serve (hub stays up)
+- **Honest `/compact`** — same ACP compact path as the CLI remote; feedback grounded in session `signals.json` (not cheerful no-ops)
 - **Plan mode (Hub)** — View plan appears **inline** when awaiting/Active; Approve writes `plan_mode.json` (not stock TUI `exit_plan_mode`)
-- **History** — hydrate from `updates.jsonl` when you open a session
-- **Composer** — multi-line input, slash palette, prompt queue while a turn runs
-- **Files** — sandboxed tree for the session cwd (edit, markdown + Mermaid, images)
+- **History** — hydrate from `updates.jsonl` when you open a session; load quiet-period suppress avoids history flood thrash
+- **Composer** — multi-line input, slash palette, paperclip upload, prompt queue while a turn runs
+- **Files** — sandboxed tree for the session cwd (edit, markdown + Mermaid, images, video preview, Share/Save)
 - **Site preview** — double-click or **Preview** on `.html` / `.htm` in the Files tree, or **Preview** on a tool row when an HTML path is present; same-origin Python serve (relative CSS/JS work on Tailscale/phone); Close stops the preview
 - **Usage** — session context bar from session `signals.json` (not compact-op toast metrics) + weekly plan bar (local Grok login); large sessions can match CLI first-token cost after `session/prompt`
 - **Ops scripts** — detached start / stop / restart, firewall helper, logon task
@@ -95,7 +98,7 @@ Node 18+ (ES modules), stdlib only. Separate from the Python hub on `:8787`.
 - **Sole-writer prompts** — live turns use hub-owned `session/new`
 - **Dual browser, not dual TUI** — phone + desktop share this process; stock TUI is separate
 
-Design write-ups: **[docs/adr/](docs/adr/)** (ADR 001–014).
+Design write-ups: **[docs/adr/](docs/adr/)** (ADR 001–016).
 
 | Path | Live together? | Notes |
 |---|---|---|

@@ -263,14 +263,17 @@ Product “why” lives in `docs/adr/` (not only in chat):
 | 005–006 | Prompt queue; session cwd file browser |
 | 007–008 | Subagent kind; title/rename |
 | 009 | KeepAgent + continuity (view-first; no no-output fork) |
+| 010 | File-first site preview (not cloud artifacts) |
+| 011–014 | Agent vs ACP health; plan handshake; quality; in-hub restart |
+| 015–016 | CLI-aligned turn ownership; load quiet-period suppress |
 
 ---
 
 ## Reading this on GitHub
 
-1. **Releases** — tag `v0.3.0` at `a39c428` (or after in-hub site preview is committed) and paste the matching section above into the release notes.
+1. **Releases** — tag `vX.Y.Z` when shipping; paste the matching section above into the release notes (latest: [v0.4.0](https://github.com/ChrisP-Builds/grok-remote-hub/releases/tag/v0.4.0)).
 2. **Commits tab** — still the source of truth for diffs; this changelog is the human index.
-3. **Do not rewrite published history** on `main` without a coordinated force-push plan; prefer forward commits + changelog.
+3. **Do not rewrite published history** on `master` without a coordinated force-push plan; prefer forward commits + changelog.
 
 ### Not in git (by design)
 
