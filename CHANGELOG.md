@@ -9,7 +9,13 @@ This file is the **public narrative**. Session chat context is not required to u
 
 ## [Unreleased]
 
+### Changed
+- **New session folder picker** — Projects | Browse segmented tabs; browse mode uses breadcrumbs, folder rows with open chevron, sticky **Use this folder** CTA, loading/empty states; Projects list prioritizes search, shows Recent (localStorage `grh.recentProjects.v1`), and clearer empty copy; entry choice remembers list vs browse for Back.
+- **Skip redundant session/load when already warm** — hub tracks session ids successfully `session/new` or `session/load`'d in this process; repeat loads skip the agent RPC (cleared on ACP disconnect). Does not remove model prefill cost of large history on first real prompt.
+
 ### Added
+- **Cold-session latency hints** — slim banner/composer hint “Loading session into agent…” while attach is in flight; one-time soft note on large context sessions that first reply may take longer (same as CLI), suggesting `/compact` or New. Send is never blocked.
+- **ANSI SGR colors in terminal/tool detail** — live `terminal_out` and final tool detail render CSI SGR as colored spans (safe DOM); one-liners / activity strip use plain `strip_ansi`.
 - **Session restore on refresh** — last selected chat id stored in `localStorage` (`grh.selectedSession.v1`); bootstrap re-opens that session when it still appears in `/api/sessions` (desktop + mobile).
 - **Goal banner with persistent elapsed** — slim `#goal-banner` above the transcript for CLI `/goal` mode (`active` / `paused`); wall-clock elapsed survives turns and refresh via `grh.sessionGoals.v1` + live `update_goal` / slash lifecycle.
 - **ACP structured trace** — ring buffer + daily `logs/acp-trace-YYYYMMDD.jsonl`; `GET /api/admin/acp-trace?n=100`; last 5 on `/health` as `acpTraceRecent` (connect/send/recv/probe/heal/compact/quality, no secrets or full prompts).
@@ -27,12 +33,34 @@ This file is the **public narrative**. Session chat context is not required to u
 - **Sticky active user prompt** — scroll-linked You: pin; one-line collapsed by default; click expands; higher contrast sticky bar.
 
 ### Removed
-- **Heavy-session soft context banner** — dropped `#context-budget-banner` / `contextBudget` status field (journal-size false positives after compact). Context UX matches the CLI usage bar only; `updates.jsonl` size still scales no-output stall thresholds internally.
+- **Heavy-session soft context banner** — dropped `#context-budget-banner` / `contextBudget` status field (journal-size false positives after compact). Context UX matches the CLI usage bar only.
 
 ### Fixed
+- **Hub `/compact` = ACP `_x.ai/compact_conversation`** — same agent serve path as CLI remote (not session/prompt); no-shrink while session still full is `failed` with signals-grounded “did not free context” message (not cheerful success).
+- **Compact feedback grounded in session signals** — /compact and auto-compact toast/system text use signals.json used/window (never "already minimal" while the CTX bar is still full); hub resolves reduced vs still-full vs low and sends an authoritative `message`.
+- **No-output heal vs load-replay suppress** — heal no longer force-releases load suppress in `finally` (that cancelled the quiet period); `wait_load_suppress_settled` lets history flush finish; loading always suppresses residual fanout even if an active turn is registered; `session_prompt` settles then releases before `_register_active_turn`.
+- **Compact toast vs CTX bar honesty** — compact feedback reports compact-op X→Y only; CTX bar always comes from session signals (no applyUsagePatch from compact after, no flicker when signals stay high).
+- **No-output recovery forces session reload** — do not skip `session/load` when already warm/loaded (dead worker produced zero updates); forget warm, real load, reconnect+load on fail. UI restores pending user prompt after history reload/refresh and keeps Resend pending on no-output failures.
+- **session/load quiet-period suppress** — hold historical fanout until 1.5s silence (max 20s), rearm on each suppressed frame; fixed 0.3s release no longer lets multi-second history floods thrash the UI.
+- **Honest compact feedback** — claim "Context compacted" only when after < before; no-op / missing tokens say no change; hub marks `reduced`/`feedback`; UI rate-limits compact system lines (~4s) and does not patch usage upward from no-op compact.
+- **Sticky scroll rate limit** — cap non-forced `scrollIfSticky` to ~10/s (90ms min) so residual update bursts cannot thrash the transcript.
+- **Hard reload once after hub process restart** — when `bootId` changes with the page still open, clear live state then `location.reload()` once per bootId (`sessionStorage` `grh.bootReload.*`) so clients never mix cached JS with new Python.
+- **Stream merge overlap / double-print** — `mergeStreamText` absorbs redundant suffix and longest prefix/suffix overlap (mixed cumulative+delta); 50ms identical-chunk dedupe on append; pure matrix in `hub.ui_format.merge_stream_text`.
+- **Wake mid-tool not cleared on silence alone** — `should_clear_turn_on_wake` / JS mirror keep healthy open tools/plan when `acpQuality` is ok; stale/zombie/down still clear (ADR-015).
+- **Session restore-by-id** — bootstrap opens saved session via history when id is missing from top-N list; pin stores cwd+title; 404 clears pin.
+- **Visibility/reconnect thrash** — debounced wake (visibility + pageshow + online); reconnect only if WS not OPEN; force history skips apply when fingerprint unchanged; fingerprint includes message count + last full length; scroll freeze without forcing stickToBottom.
+- **Turn end always cancel-before-clear** — `AcpClient.end_turn` awaits agent cancel (bounded, prefers last-known method) then `force_clear_turn`; stall watchdog, reset-turn, no-output recovery, and stuck-before-prompt paths use it (no fire-and-forget cancel after unlock).
+- **Disable auto-restart-agent after no-output prefill timeouts** — failed no-output retry no longer calls `_restart_agent_process` solely because process is up; fat-session slow first token must not KillAgent other projects (operator restart still available).
+- **Redundant session/load on already-warm sessions** — attach/ensure no longer re-hits the agent for a session this process already loaded (avoids extra cold-path delay after the first load).
+- **Reconnect/visibility force-refresh history** — after wake, reconnect, or turn idle, force-refresh selected history so the last assistant message appears even if the client still thought a turn was running.
+- **Hub prompt-path timing + agent TTFB** — live process-reuse has no warmup waits; logs split hub ensure/send vs agent first update; TTFB excludes `user_message_chunk` / `available_commands_update`.
+- **First-byte no-output stays 60s (CLI-like)** — do not scale zero-activity wait by `updates.jsonl` size (was 180/300s on heavy sessions); auto-retry budget 90s; soft surface after failed retry (no auto KillAgent).
+- **Wake/reconnect turn re-sync (CLI-aligned, ADR 015)** — after visibility visible, `online`, or WS reconnect, re-fetch `/health` and clear dead turns (cancel + reset when `acpQuality` is stale/zombie/down or silence ≥120s); server is sole authority for idle; healthy turns re-seed timers.
+- **Browse projects root missing / wrong default** — default `projects_root` prefers first existing among `~/Projects`, `D:/Projects`, `~/Documents/Projects`; missing root is created when possible; Browse error path shows status (not a blank panel) with config.toml hint on 404.
+- **Multi-table messages** — every GFM table in a message body renders as HTML, not only the first.
 - **Short GFM table separators** — agent-written tables with 1–2 dashes per separator cell (e.g. `|--|---|`) now render as tables instead of plain text.
 - **Orphan agent turn after hub force-clear** — stall watchdog, admin reset-turn, and no-output recovery now call `session/cancel` (via `notify_agent_cancel`) so the agent releases the old prompt; UI unlock no longer leaves the next message blocked forever.
-- **Heavy-session no-output false kill** — scale stall threshold by `updates.jsonl` size (60s base / 180s soft / 300s heavy); never suppress ACP activity mid-turn; skip redundant `session/load` on no-output retry when already loaded; release load-suppress before re-prompt.
+- **Heavy-session no-output false kill** — never suppress ACP activity mid-turn; release load-suppress before re-prompt. (First-byte wait no longer scales by journal size; no-output heal now forces reload — see Unreleased.)
 - **Turn elapsed/silence timers seed from server age** — strip `running · Ns` and tool `waiting · Ns` survive hard-refresh/reconnect (no more client-only `Date.now()` reset to 0s).
 - **session/load historical replay no longer streamed live** — drops agent history flood during load (stops UI tool strobe); history still via REST/WS.
 - **Stale ACP heal no longer kills mid-prompt** — heal skips `stale` while a turn is active (stall watchdog owns silent prompts); `ACP_STALE_SECONDS` raised to 90s so quality does not flip before the 60s no-output policy.

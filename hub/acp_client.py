@@ -24,13 +24,17 @@ from hub.session_policy import (
     MID_TURN_STALL_SECONDS,
     NO_OUTPUT_SECONDS,
     STUCK_TURN_SECONDS,
+    apply_turn_activity,
     is_turn_stuck_for_new_prompt,
     should_force_clear_turn,
+    should_skip_session_load,
 )
 from hub.status_view import (
     ACP_PROBE_INTERVAL_S,
     ACP_PROBE_SILENCE_S,
     ACP_PROBE_TIMEOUT_S,
+    LOAD_SUPPRESS_MAX_S,
+    LOAD_SUPPRESS_QUIET_S,
     should_probe_acp_liveness,
     should_suppress_session_load_fanout,
 )
@@ -88,17 +92,27 @@ class AcpClient:
         self._stop = asyncio.Event()
         self.connected = False
         self.loaded_session_id: str | None = None
+        # session ids successfully session/new or session/load'd this process (ACP up).
+        self._warm_sessions: set[str] = set()
+        # Single-flight: sid -> Future while session/load is in progress.
+        self._load_inflight: dict[str, asyncio.Future] = {}
         # session/load: suppress historical session/update fanout (UI strobe).
         self._loading_sessions: set[str] = set()
         # Optional once-per-load suppress counts for trace (sid -> count).
         self._load_suppress_counts: dict[str, int] = {}
         # Delayed release handles for load suppress (sid -> Handle).
         self._load_release_handles: dict[str, asyncio.TimerHandle] = {}
+        # Quiet-period load suppress: max wall deadline (monotonic) per sid.
+        self._load_suppress_deadline: dict[str, float] = {}
         self.available_commands: list[dict[str, Any]] = []
         # session_id -> {started_at, last_activity, saw_update, first_update_at,
         #                cwd_key, prompt_req_id?}
         self.active_turns: dict[str, dict[str, Any]] = {}
         self._stall_watchdogs: dict[str, asyncio.Task] = {}
+        # Single-flight locks for end_turn (cancel-then-clear) per session.
+        self._end_turn_locks: dict[str, asyncio.Lock] = {}
+        # Last cancel RPC method that succeeded (tried first next time).
+        self._cancel_method: str | None = None
         # Last watchdog/admin force-clear (Hub may broadcast idle from these).
         self.last_force_clear_reason: str | None = None
         self.last_force_clear_session: str | None = None
@@ -533,19 +547,36 @@ class AcpClient:
     def _cancel_no_output_watchdog(self) -> None:
         self._cancel_all_stall_watchdogs()
 
-    def note_activity(self, session_id: str | None = None) -> None:
+    def note_activity(
+        self,
+        session_id: str | None = None,
+        *,
+        update_kind: str | None = None,
+    ) -> None:
         """Record ACP session/update activity for hang detection.
 
-        First activity freezes first_update_at (TTFB) when saw_update becomes true.
+        Always refreshes last_activity / saw_update (including user_message_chunk)
+        so stall detection sees the agent alive. Freezes first_update_at only for
+        kinds that count toward agent TTFB (not user echo / available_commands).
         """
         now = time.monotonic()
 
         def _touch(sid: str) -> None:
             meta = self.active_turns[sid]
-            meta["last_activity"] = now
-            if not meta.get("saw_update") and meta.get("first_update_at") is None:
-                meta["first_update_at"] = now
-            meta["saw_update"] = True
+            started = meta.get("started_at")
+            newly = apply_turn_activity(meta, now=now, update_kind=update_kind)
+            if newly:
+                ttfb = None
+                if started is not None:
+                    ttfb = float(now) - float(started)
+                    if ttfb < 0:
+                        ttfb = 0.0
+                self._trace(
+                    "first_agent_update",
+                    sessionId=session_id_slice(sid),
+                    kind=str(update_kind or "") or None,
+                    ttfbSeconds=ttfb,
+                )
 
         if session_id and session_id in self.active_turns:
             _touch(session_id)
@@ -701,11 +732,19 @@ class AcpClient:
             finally:
                 self._ws = None
                 self.loaded_session_id = None
+                self._warm_sessions.clear()
+                for _fut in self._load_inflight.values():
+                    if not _fut.done():
+                        _fut.set_exception(ConnectionError("ACP disconnected"))
+                self._load_inflight.clear()
+                # Cancel method may no longer apply after reconnect.
+                self._cancel_method = None
                 if (
                     self.active_turns
                     or self._pending
                     or self._pending_user_questions
                 ):
+                    # WS already dead: cancel RPC cannot work; unlock locally.
                     self.force_clear_turn("acp disconnected")
                 else:
                     self.active_turns.clear()
@@ -851,6 +890,8 @@ class AcpClient:
                 self._load_suppress_counts[key] = (
                     self._load_suppress_counts.get(key, 0) + 1
                 )
+                # Each suppressed frame resets the quiet-period release timer.
+                self._rearm_load_suppress_release(key)
             await self._track_update(msg)
             return
 
@@ -1115,7 +1156,7 @@ class AcpClient:
                 active_turn_session_ids=frozenset(self.active_turns.keys()),
             )
             if kind_n.startswith("auto_compact_") and not suppress_n:
-                self.note_activity(sid_str)
+                self.note_activity(sid_str, update_kind=kind_n or None)
             return
 
         if method not in ("session/update", "_x.ai/session/update"):
@@ -1136,7 +1177,7 @@ class AcpClient:
         )
         if suppress:
             return
-        self.note_activity(sid_str)
+        self.note_activity(sid_str, update_kind=str(kind) if kind else None)
         if kind in ("turn_completed", "task_completed", "prompt_complete"):
             if sid_str and sid_str in self.active_turns:
                 self.active_turns.pop(sid_str, None)
@@ -1247,6 +1288,18 @@ class AcpClient:
                 pending.cancel()
             raise
 
+    def forget_warm_session(self, session_id: str) -> None:
+        """Drop warm/loaded cache so next session/load is a real agent RPC.
+
+        Used by no-output heal: agent silence means warm skip is unsafe.
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        self._warm_sessions.discard(sid)
+        if self.loaded_session_id == sid:
+            self.loaded_session_id = None
+
     async def session_new(self, cwd: str) -> str:
         result = await self.request(
             "session/new",
@@ -1256,56 +1309,140 @@ class AcpClient:
         session_id = (result or {}).get("sessionId") or (result or {}).get("session_id")
         if not session_id:
             raise RuntimeError(f"session/new missing sessionId: {result!r}")
-        self.loaded_session_id = str(session_id)
-        return str(session_id)
+        sid = str(session_id)
+        self.loaded_session_id = sid
+        self._warm_sessions.add(sid)
+        return sid
 
     async def session_load(self, session_id: str, cwd: str) -> Any:
-        # Only block load of this session if it is mid-turn (not other projects).
-        if session_id in self.active_turns:
-            if self.is_turn_stuck(session_id=session_id):
-                self.force_clear_turn(
-                    "stuck turn before session/load", session_id=session_id
-                )
-            else:
-                raise RuntimeError("Turn in progress; cannot load this session")
         sid = str(session_id)
-        # Cancel any prior delayed release for this sid before re-arming.
-        self.release_load_suppress(sid)
-        self._loading_sessions.add(sid)
-        self._load_suppress_counts.setdefault(sid, 0)
+        # Already loaded in this process: skip agent session/load (not model prefill).
+        if should_skip_session_load(self._warm_sessions, sid):
+            log.info("session/load skip already warm sid=%s", sid[:8])
+            self.loaded_session_id = sid
+            return {"skipped": True, "sessionId": sid}
+        # Concurrent attach/ensure: join in-flight load for same sid (one RPC).
+        inflight = self._load_inflight.get(sid)
+        if inflight is not None and not inflight.done():
+            return await inflight
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._load_inflight[sid] = fut
         try:
-            result = await self.request(
-                "session/load",
-                {"sessionId": session_id, "cwd": cwd, "mcpServers": []},
-                timeout=60.0,
-                session_id=session_id,
-            )
-            self.loaded_session_id = session_id
+            # Only block load of this session if it is mid-turn (not other projects).
+            if session_id in self.active_turns:
+                if self.is_turn_stuck(session_id=session_id):
+                    await self.end_turn(session_id, "stuck turn before session/load")
+                else:
+                    raise RuntimeError("Turn in progress; cannot load this session")
+            # Cancel any prior delayed release for this sid before re-arming.
+            self.release_load_suppress(sid)
+            self._loading_sessions.add(sid)
+            self._load_suppress_counts.setdefault(sid, 0)
+            try:
+                result = await self.request(
+                    "session/load",
+                    {"sessionId": session_id, "cwd": cwd, "mcpServers": []},
+                    timeout=60.0,
+                    session_id=session_id,
+                )
+                self.loaded_session_id = session_id
+                self._warm_sessions.add(sid)
+            finally:
+                # Quiet-period release: agent may flush historical frames for many
+                # seconds after the RPC result. Keep sid in _loading_sessions; each
+                # suppressed frame rearms the quiet timer until silence or max hold.
+                now = time.monotonic()
+                self._load_suppress_deadline[sid] = now + LOAD_SUPPRESS_MAX_S
+                prev = self._load_release_handles.pop(sid, None)
+                if prev is not None:
+                    prev.cancel()
+
+                def _delayed_release(s: str = sid) -> None:
+                    self._load_release_handles.pop(s, None)
+                    self.release_load_suppress(s)
+
+                self._load_release_handles[sid] = loop.call_later(
+                    LOAD_SUPPRESS_QUIET_S, _delayed_release
+                )
+            if not fut.done():
+                fut.set_result(result)
             return result
+        except BaseException as exc:
+            if not fut.done():
+                fut.set_exception(exc)
+            raise
         finally:
-            # Delayed release: agent may flush trailing historical frames after
-            # the RPC result. Always schedule release (success or failure).
+            if self._load_inflight.get(sid) is fut:
+                self._load_inflight.pop(sid, None)
+
+    def _rearm_load_suppress_release(self, session_id: str) -> None:
+        """Reset quiet-period timer after a suppressed frame; release if past max."""
+        sid = str(session_id or "").strip()
+        if not sid or sid not in self._loading_sessions:
+            return
+        now = time.monotonic()
+        deadline = self._load_suppress_deadline.get(sid)
+        if deadline is not None and now >= deadline:
+            self.release_load_suppress(sid)
+            return
+        prev = self._load_release_handles.pop(sid, None)
+        if prev is not None:
+            prev.cancel()
+        remaining = (
+            (deadline - now) if deadline is not None else LOAD_SUPPRESS_MAX_S
+        )
+        delay = min(LOAD_SUPPRESS_QUIET_S, max(0.0, remaining))
+        if delay <= 0:
+            self.release_load_suppress(sid)
+            return
+        try:
             loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.release_load_suppress(sid)
+            return
 
-            def _delayed_release(s: str = sid) -> None:
-                self._load_release_handles.pop(s, None)
-                self.release_load_suppress(s)
+        def _delayed_release(s: str = sid) -> None:
+            self._load_release_handles.pop(s, None)
+            self.release_load_suppress(s)
 
-            # Replace any prior handle (should be none after release above).
-            prev = self._load_release_handles.pop(sid, None)
-            if prev is not None:
-                prev.cancel()
-            self._load_release_handles[sid] = loop.call_later(0.3, _delayed_release)
+        self._load_release_handles[sid] = loop.call_later(delay, _delayed_release)
+
+
+    async def wait_load_suppress_settled(
+        self, session_id: str, *, timeout: float | None = None
+    ) -> None:
+        """Wait until load-replay quiet suppress ends for session_id.
+
+        If sid is not in ``_loading_sessions``, return immediately. Otherwise
+        poll until it leaves or timeout (default ``LOAD_SUPPRESS_MAX_S``).
+        On timeout, force-release so callers never hang. Does not force-release
+        early on the success path (quiet timer expires naturally).
+        """
+        sid = str(session_id or "").strip()
+        if not sid or sid not in self._loading_sessions:
+            return
+        thr = LOAD_SUPPRESS_MAX_S if timeout is None else float(timeout)
+        deadline = time.monotonic() + max(0.0, thr)
+        while sid in self._loading_sessions:
+            if time.monotonic() >= deadline:
+                self.release_load_suppress(sid)
+                return
+            await asyncio.sleep(0.05)
 
     def release_load_suppress(self, session_id: str | None = None) -> None:
         """Immediately stop load-replay suppress so live prompts get activity.
 
-        Discards sid from ``_loading_sessions``, emits count trace if any, and
-        cancels a pending delayed release. Safe if already released.
-        When session_id is None, release all loading sessions.
+        Discards sid from ``_loading_sessions``, clears quiet/max deadline,
+        emits count trace if any, and cancels a pending delayed release.
+        Safe if already released. When session_id is None, release all.
         """
         if session_id is None:
-            sids = list(self._loading_sessions) or list(self._load_release_handles)
+            sids = (
+                list(self._loading_sessions)
+                or list(self._load_release_handles)
+                or list(self._load_suppress_deadline)
+            )
             for s in sids:
                 self.release_load_suppress(s)
             return
@@ -1315,6 +1452,7 @@ class AcpClient:
         handle = self._load_release_handles.pop(sid, None)
         if handle is not None:
             handle.cancel()
+        self._load_suppress_deadline.pop(sid, None)
         count = self._load_suppress_counts.pop(sid, 0)
         was_loading = sid in self._loading_sessions
         self._loading_sessions.discard(sid)
@@ -1359,17 +1497,9 @@ class AcpClient:
                     max_turn_seconds=MAX_TURN_SECONDS,
                 )
                 if reason:
-                    self.force_clear_turn(reason, session_id=session_id)
-                    # Best-effort: free agent so next prompt is not blocked
-                    # behind an orphan turn the hub already unlocked locally.
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.create_task(
-                            self.notify_agent_cancel(session_id),
-                            name=f"acp-cancel-after-clear-{session_id[:8]}",
-                        )
-                    except RuntimeError:
-                        pass
+                    # Cancel agent first (bounded), then local clear — never
+                    # unlock-only or fire-and-forget cancel after clear.
+                    await self.end_turn(session_id, reason)
                     return
         except asyncio.CancelledError:
             return
@@ -1393,10 +1523,13 @@ class AcpClient:
         session_id: str,
         context: str | None = None,
     ) -> Any:
-        """Request conversation compaction via verified agent RPC.
+        """Sole ACP compact entry for hub/CLI remote parity.
 
-        Method must be ``_x.ai/compact_conversation`` (``x.ai/…`` is not found).
-        Unknown extra fields are ignored by the agent; only pass context when set.
+        Uses method ``_x.ai/compact_conversation`` only (``x.ai/…`` is not found
+        on agent serve). This is the same agent compaction engine the TUI slash
+        ``/compact`` drives via serve; session/prompt of ``/compact`` does not
+        work. Unknown extra fields are ignored by the agent; only pass context
+        when set.
         """
         params: dict[str, Any] = {"sessionId": session_id}
         ctx = (context or "").strip()
@@ -1436,43 +1569,58 @@ class AcpClient:
 
         if session_id in self.active_turns:
             if self.is_turn_stuck(session_id=session_id):
-                self.force_clear_turn(
-                    "stuck turn before new prompt", session_id=session_id
-                )
+                await self.end_turn(session_id, "stuck turn before new prompt")
             else:
                 raise RuntimeError("Agent is busy with another turn")
+
+        # Hub pre-prompt timing (load vs reuse); no wait_until_up / sleep on this path.
+        t0 = time.monotonic()
+        did_load = False
 
         if self.loaded_session_id != session_id:
             if allow_load:
                 if not cwd:
                     raise RuntimeError("Session not loaded; cwd required to load")
-                await self.request(
-                    "session/load",
-                    {"sessionId": session_id, "cwd": cwd, "mcpServers": []},
-                    timeout=60.0,
-                    session_id=session_id,
-                )
+                # Prefer session_load so warm-set skip applies (not model prefill).
+                await self.session_load(session_id, cwd)
                 self.loaded_session_id = session_id
+                did_load = True
             else:
                 # Multi-session agent: prompt by id without session/load.
                 # Caller must have session/new'd this id in this process.
                 self.loaded_session_id = session_id
 
         key = cwd_key or ""
-        self._register_active_turn(session_id, key)
-        # Post-load re-prompt must not inherit load-replay suppress (note_activity).
+        # Historical load-replay must quiet-suppress fully before the live turn.
+        if session_id in self._loading_sessions:
+            await self.wait_load_suppress_settled(session_id)
+        # Idempotent if quiet timer already released suppress.
         self.release_load_suppress(session_id)
+        self._register_active_turn(session_id, key)
         self._cancel_stall_watchdog(session_id)
         # Always run continuous stall watchdog for mid-turn / max duration.
         self._stall_watchdogs[session_id] = asyncio.create_task(
             self._stall_watchdog_loop(session_id, thr),
             name=f"acp-stall-{session_id[:8]}",
         )
-        log.info("Prompt start session=%s (active=%d)", session_id, len(self.active_turns))
+        pre_send_ms = (time.monotonic() - t0) * 1000.0
+        log.info(
+            "Prompt start session=%s (active=%d) pre_send_ms=%.1f load=%s",
+            session_id,
+            len(self.active_turns),
+            pre_send_ms,
+            did_load,
+        )
         self._trace(
             "prompt_start",
             sessionId=session_id_slice(session_id),
             active=len(self.active_turns),
+        )
+        self._trace(
+            "prompt_send",
+            sessionId=session_id_slice(session_id),
+            preSendMs=round(pre_send_ms, 2),
+            load=did_load,
         )
         try:
             # Match request timeout to MAX_TURN_SECONDS (TUI-length agentic turns).
@@ -1504,31 +1652,40 @@ class AcpClient:
     async def notify_agent_cancel(self, session_id: str) -> bool:
         """Tell the agent to abort its in-flight turn. Does not force_clear locally.
 
-        Tries the same cancel methods as session_cancel with a short timeout.
-        Returns True if any method succeeded. Logs a warning if all fail.
-        Use before or after force_clear_turn so the agent does not keep the
-        old prompt and block the next session/prompt.
+        Prefers the last successful cancel method; short per-method timeout so
+        shotgun cancel stays bounded (~2s total with end_turn). Returns True if
+        any method succeeded. Logs a warning if all fail.
         """
-        last_exc: Exception | None = None
-        for method in (
+        methods: list[str] = [
             "session/cancel",
             "session/prompt/cancel",
             "x.ai/session/cancel",
             "_x.ai/session/cancel",
-        ):
+        ]
+        cached = self._cancel_method
+        if cached and cached in methods:
+            methods = [cached] + [m for m in methods if m != cached]
+        last_exc: Exception | None = None
+        # Short per-method timeout: total cancel budget stays ~2s under end_turn.
+        per_method_timeout = 1.5
+        for method in methods:
             try:
                 await self.request(
                     method,
                     {"sessionId": session_id},
-                    timeout=8.0,
+                    timeout=per_method_timeout,
                     session_id=session_id,
                 )
+                self._cancel_method = method
                 log.info(
                     "Agent cancel ok via %s session=%s", method, session_id[:12]
                 )
                 return True
             except Exception as exc:
                 last_exc = exc
+                if cached and method == cached:
+                    # Cached method failed; stop preferring it until one succeeds.
+                    self._cancel_method = None
                 log.debug("Cancel via %s failed: %s", method, exc)
         log.warning(
             "Agent cancel unsupported/failed session=%s: %s",
@@ -1537,6 +1694,80 @@ class AcpClient:
         )
         return False
 
+    async def end_turn(
+        self,
+        session_id: str | None,
+        reason: str,
+        *,
+        cancel_timeout: float = 2.0,
+    ) -> dict:
+        """Cancel agent then force-clear local turn. Single-flight per session.
+
+        Order is always cancel-before-clear so the agent releases the old prompt
+        before the hub unlocks. Cancel is bounded by cancel_timeout; clear runs
+        even if cancel fails (WS dead, unsupported method, etc.).
+        """
+        sid_key = str(session_id) if session_id is not None else "__all__"
+        lock = self._end_turn_locks.get(sid_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._end_turn_locks[sid_key] = lock
+
+        async with lock:
+            cancelled = False
+            if session_id is not None:
+                try:
+                    cancelled = bool(
+                        await asyncio.wait_for(
+                            self.notify_agent_cancel(str(session_id)),
+                            timeout=float(cancel_timeout),
+                        )
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "end_turn: cancel timed out session=%s reason=%s",
+                        str(session_id)[:12],
+                        reason,
+                    )
+                    cancelled = False
+                except Exception as exc:
+                    log.warning(
+                        "end_turn: cancel failed session=%s: %s",
+                        str(session_id)[:12],
+                        exc,
+                    )
+                    cancelled = False
+            else:
+                # All sessions: best-effort cancel each active id within budget.
+                sids = list(self.active_turns.keys())
+                if sids:
+                    per = max(0.3, float(cancel_timeout) / max(len(sids), 1))
+                    any_ok = False
+                    for sid in sids:
+                        try:
+                            ok = await asyncio.wait_for(
+                                self.notify_agent_cancel(sid),
+                                timeout=per,
+                            )
+                            any_ok = any_ok or bool(ok)
+                        except Exception:
+                            pass
+                    cancelled = any_ok
+
+            cleared = self.force_clear_turn(reason, session_id=session_id)
+            if session_id is not None and not cancelled:
+                log.warning(
+                    "end_turn: agent cancel failed session=%s force_cleared=%s reason=%s",
+                    str(session_id)[:12],
+                    cleared,
+                    reason,
+                )
+            return {
+                "cancelled": cancelled,
+                "cleared": cleared,
+                "reason": reason,
+            }
+
     async def session_cancel(self, session_id: str) -> None:
         """Cancel agent turn for one session and unlock local hub turn state.
 
@@ -1544,12 +1775,5 @@ class AcpClient:
         Other projects' turns are left running.
         """
         self._cancel_pending_user_questions_for_session(session_id)
-        agent_ok = await self.notify_agent_cancel(session_id)
-        cleared = self.force_clear_turn("user cancel", session_id=session_id)
-        if not agent_ok:
-            log.warning(
-                "session_cancel: agent cancel failed session=%s force_cleared=%s",
-                session_id,
-                cleared,
-            )
+        await self.end_turn(session_id, "user cancel")
         # Never raise after local force-clear: UI must unlock on Stop.

@@ -6,16 +6,19 @@ import json
 from pathlib import Path
 from typing import Any
 
-# Dead on arrival: no ACP update after prompt accepted.
+# Dead on arrival: no ACP update after prompt accepted (CLI-like first-byte silence).
 NO_OUTPUT_SECONDS = 60.0
-# Soft / heavy history: first TTFB can exceed 60s while agent digests updates.jsonl.
+# Legacy soft/heavy constants (no longer used for first-byte; kept for tests/docs).
 NO_OUTPUT_SOFT_SECONDS = 180.0
 NO_OUTPUT_HEAVY_SECONDS = 300.0
 NO_OUTPUT_HEAVY_UPDATES_BYTES = 12_000_000
 # Second attempt after no-output auto-retry (at least this long).
-NO_OUTPUT_RETRY_SECONDS = 300.0
+NO_OUTPUT_RETRY_SECONDS = 90.0
+# No auto KillAgent/restart-agent solely from no-output prefill timeouts.
+# Operator restart remains via POST /api/admin/restart-agent (zombie/down).
 
 # Silence after activity — only for truly dead agents (tools can be quiet minutes).
+# Heavy sessions with slow mid-turn tools use this, not first-byte scaling.
 MID_TURN_STALL_SECONDS = 600.0  # 10 min
 
 # Hard wall (align with session/prompt request timeout; long agentic like TUI).
@@ -33,6 +36,95 @@ CLIENT_STALL_UNLOCK_SECONDS = 0  # 0 = disabled auto-unlock
 CONTEXT_SOFT_UPDATES_BYTES = 6_000_000  # ~6MB updates.jsonl
 
 
+
+# Cap for "hub-imposed" pre-prompt work when already process-live + ACP up.
+# Not a sleep; used by tests/docs. Live reuse path must stay well under this.
+HOT_PATH_MAX_HUB_PRE_PROMPT_S = 5.0
+
+
+def is_live_hot_path(*, ensure_action: str, acp_connected: bool) -> bool:
+    """True when ensure is pure reuse and ACP is up (no load/new/wait)."""
+    return bool(acp_connected) and str(ensure_action or "").strip().lower() == "reuse"
+
+
+def ensure_action_blocks_prompt(ensure_action: str) -> bool:
+    """True when ensure may perform multi-second I/O (session/load or session/new)."""
+    return str(ensure_action or "").strip().lower() in ("load", "new")
+
+
+def should_skip_session_load(warm_set: set[str] | frozenset[str], session_id: str) -> bool:
+    """True when this process already session/new or session/load'd session_id.
+
+    Skip redundant agent session/load RPCs after first successful load in-process.
+    Does not avoid model prefill cost of large history on first real prompt.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    return sid in warm_set
+
+
+def counts_toward_agent_ttfb(update_kind: str | None) -> bool:
+    """True for agent work that starts user-visible response; False for user echo.
+
+    user_message_chunk and available_commands_update must NOT freeze TTFB.
+    None/empty kind (tool RPC, terminal) counts as agent work.
+    """
+    if update_kind is None:
+        return True
+    k = str(update_kind).strip().lower()
+    if not k:
+        return True
+    if k in ("user_message_chunk", "available_commands_update"):
+        return False
+    if k.startswith("user_"):
+        return False
+    return True
+
+
+def apply_turn_activity(
+    meta: dict,
+    *,
+    now: float,
+    update_kind: str | None = None,
+) -> bool:
+    """Mutate turn meta; return True if first_update_at was newly set (agent TTFB).
+
+    Always updates last_activity and saw_update (including user_message_chunk)
+    so stall/no-output sees the agent alive. Only freezes first_update_at for
+    kinds that count toward agent TTFB.
+    """
+    meta["last_activity"] = float(now)
+    meta["saw_update"] = True
+    if counts_toward_agent_ttfb(update_kind) and meta.get("first_update_at") is None:
+        meta["first_update_at"] = float(now)
+        return True
+    return False
+
+
+def split_prompt_latency(
+    *,
+    ensure_seconds: float | None,
+    prompt_send_seconds: float | None,
+    agent_first_seconds: float | None,
+) -> dict[str, float | None]:
+    """Return hubSeconds (ensure+send), agentSeconds (first agent update after send), totalSeconds."""
+    hub: float | None = None
+    if ensure_seconds is not None or prompt_send_seconds is not None:
+        hub = float(ensure_seconds or 0.0) + float(prompt_send_seconds or 0.0)
+    agent: float | None = None
+    if agent_first_seconds is not None:
+        agent = float(agent_first_seconds)
+    total: float | None = None
+    if hub is not None and agent is not None:
+        total = hub + agent
+    return {
+        "hubSeconds": hub,
+        "agentSeconds": agent,
+        "totalSeconds": total,
+    }
+
+
 def no_output_seconds_for_session(
     *,
     updates_bytes: int | None = None,
@@ -42,17 +134,13 @@ def no_output_seconds_for_session(
     heavy_bytes: int = NO_OUTPUT_HEAVY_UPDATES_BYTES,
     heavy_seconds: float = NO_OUTPUT_HEAVY_SECONDS,
 ) -> float:
-    """Return stall no-output threshold scaled by session history size."""
-    if updates_bytes is None:
-        return float(base_seconds)
-    try:
-        size = int(updates_bytes)
-    except (TypeError, ValueError):
-        return float(base_seconds)
-    if size > int(heavy_bytes):
-        return float(heavy_seconds)
-    if size > int(soft_updates_bytes):
-        return float(soft_seconds)
+    """First-byte silence only; always base (60s), never scale by updates_bytes.
+
+    Dead agents (Auth-dead workers, hung load) must fail fast like the CLI.
+    Heavy sessions still use MID_TURN_STALL after saw_update; do not stretch
+    zero-activity wait. kwargs retained for call-site compatibility.
+    """
+    _ = (updates_bytes, soft_updates_bytes, soft_seconds, heavy_bytes, heavy_seconds)
     return float(base_seconds)
 
 
@@ -100,6 +188,40 @@ def turn_telemetry(
         "sawUpdate": saw,
         "ttfbSeconds": ttfb,
     }
+
+
+def should_clear_turn_on_wake(
+    *,
+    turn_running: bool,
+    silence_seconds: float | None,
+    acp_quality: str | None,
+    silence_threshold_s: float = 120.0,
+    has_open_tools: bool = False,
+) -> bool:
+    """True when wake/resume should cancel+clear like CLI interrupt of a dead turn.
+
+    Server is authority for turnRunning. On visibility/online/WS reconnect:
+    - idle server → client unlocks (handled by caller)
+    - running + acpQuality in stale|zombie|down → clear
+    - running + silence_seconds >= threshold → clear, unless open tools/plan
+      and quality is ok/empty (healthy quiet mid-tool must survive wake)
+    - running + silence None and quality ok → keep (re-seed timers only)
+    """
+    if not turn_running:
+        return False
+    q = str(acp_quality or "").strip().lower()
+    if q in ("stale", "zombie", "down"):
+        return True
+    if silence_seconds is not None:
+        try:
+            if float(silence_seconds) >= float(silence_threshold_s):
+                # Open tools/plan + healthy quality: silence alone must not clear.
+                if has_open_tools and q in ("", "ok"):
+                    return False
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
 
 
 def should_force_clear_turn(

@@ -120,6 +120,11 @@
           <span id="capacity-banner-text"></span>
         </div>
 
+        <div id="latency-hint-banner" class="latency-hint-banner hidden" data-kind="" aria-live="polite">
+          <span id="latency-hint-banner-text"></span>
+          <button type="button" id="btn-latency-hint-dismiss" class="btn btn-ghost btn-sm latency-hint-dismiss hidden" aria-label="Dismiss">Dismiss</button>
+        </div>
+
         <div id="session-banner" class="session-banner hidden" data-mode="none" aria-live="polite">
           <span id="session-banner-text"></span>
         </div>
@@ -227,31 +232,37 @@
         <button type="button" class="btn btn-ghost btn-icon" data-close="modal-new" aria-label="Close">×</button>
       </header>
       <p class="muted modal-help" id="modal-new-help">Pick a project working directory.</p>
-      <div id="project-list-view">
-        <div class="project-create">
-          <input type="text" id="project-new-name" class="input" placeholder="New folder name" autocomplete="off" />
-          <button type="button" id="btn-create-project" class="btn btn-sm btn-accent">Create</button>
-        </div>
-        <div class="project-browse-toggle">
-          <button type="button" id="btn-browse-folders" class="btn btn-sm btn-ghost">Browse folders</button>
-        </div>
+      <div id="project-mode-tabs" class="project-mode-tabs" role="tablist" aria-label="Project source">
+        <button type="button" id="tab-projects" class="project-mode-tab is-active" role="tab" aria-selected="true" aria-controls="project-list-view">Projects</button>
+        <button type="button" id="tab-browse" class="project-mode-tab" role="tab" aria-selected="false" aria-controls="project-browser">Browse</button>
+      </div>
+      <div id="project-list-view" class="project-list-view">
         <input type="search" id="project-search" class="input" placeholder="Filter projects" autocomplete="off" />
+        <div class="project-create project-create-secondary">
+          <input type="text" id="project-new-name" class="input" placeholder="New folder name" autocomplete="off" />
+          <button type="button" id="btn-create-project" class="btn btn-sm btn-ghost">Create</button>
+        </div>
+        <div id="project-recents" class="project-recents hidden">
+          <div class="project-section-label">Recent</div>
+          <div id="project-recents-list" class="project-list project-recents-list" role="list"></div>
+        </div>
         <div id="project-list" class="project-list" role="list"></div>
-        <p id="project-empty" class="muted hidden">No projects found under the configured root.</p>
+        <p id="project-empty" class="muted hidden">No projects under the configured root. Switch to Browse or create a folder.</p>
       </div>
       <div id="project-browser" class="project-browser hidden">
-        <div class="project-browser-bar">
-          <span id="project-browser-path" class="project-browser-path" title="">/</span>
-          <button type="button" id="btn-browse-up" class="btn btn-sm btn-ghost" disabled>Up</button>
-        </div>
+        <nav id="project-browser-crumbs" class="project-browser-crumbs" aria-label="Folder path"></nav>
+        <p id="project-browser-status" class="muted project-browser-status hidden">Loading…</p>
         <div id="project-browser-list" class="project-list project-browser-list" role="list"></div>
-        <div class="project-browser-actions">
-          <button type="button" id="btn-browse-start" class="btn btn-sm btn-accent">Start session here</button>
-          <button type="button" id="btn-browse-back" class="btn btn-sm btn-ghost">Back to list</button>
+        <p id="project-browser-empty" class="muted project-browser-empty hidden">No subfolders</p>
+        <div class="project-browser-actions project-browser-sticky">
+          <button type="button" id="btn-browse-start" class="btn btn-accent project-use-btn">
+            <span id="btn-browse-start-label">Use this folder</span>
+          </button>
+          <span id="project-browser-path" class="project-browser-path" title=""></span>
         </div>
       </div>
       <div id="project-entry-choice" class="project-entry-choice hidden">
-        <p class="muted modal-help" id="project-entry-choice-help">This project has previous sessions. Resume one or start new.</p>
+        <p class="muted modal-help" id="project-entry-choice-help">Continue a previous session or start fresh in this folder.</p>
         <p class="project-entry-cwd muted" id="project-entry-cwd"></p>
         <div id="project-entry-priors" class="project-entry-priors" role="list"></div>
         <div class="project-browser-actions">

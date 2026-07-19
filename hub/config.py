@@ -19,8 +19,6 @@ else:
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.toml"
 DEFAULT_SESSIONS_ROOT = Path.home() / ".grok" / "sessions"
-# Portable default; override in config.toml (see config.example.toml).
-DEFAULT_PROJECTS_ROOT = Path.home() / "Projects"
 DEFAULT_AGENT_SECRET_PATH = PROJECT_ROOT / "data" / "agent.secret"
 DEFAULT_GROK_BIN_CANDIDATES = (
     Path.home() / ".grok" / "bin" / "grok.exe",
@@ -37,6 +35,37 @@ def _default_grok_bin() -> str:
         if candidate.is_file():
             return str(candidate)
     return "grok"
+
+
+def resolve_default_projects_root(
+    candidates: list[Path] | tuple[Path, ...] | None = None,
+) -> Path:
+    """Prefer the first existing directory among common projects roots.
+
+    Default order: ~/Projects, D:/Projects (common Windows layout),
+    ~/Documents/Projects. If none exist, return the first candidate
+    (default: ~/Projects, which may not exist yet).
+    Explicit ``hub.projects_root`` in config.toml still wins when set.
+    """
+    if candidates is None:
+        candidates = (
+            Path.home() / "Projects",
+            Path("D:/Projects"),
+            Path.home() / "Documents" / "Projects",
+        )
+    ordered = tuple(Path(c).expanduser() for c in candidates)
+    for path in ordered:
+        try:
+            if path.is_dir():
+                return path
+        except OSError:
+            continue
+    # Prefer first candidate as non-existing default (normally ~/Projects).
+    return ordered[0] if ordered else Path.home() / "Projects"
+
+
+# Resolved at import; override in config.toml (see config.example.toml).
+DEFAULT_PROJECTS_ROOT = resolve_default_projects_root()
 
 
 @dataclass

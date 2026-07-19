@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from hub.config import resolve_default_projects_root
 from hub.projects import (
     ProjectError,
     create_project,
@@ -174,3 +175,29 @@ def test_list_project_browse_not_found_and_not_dir(tmp_path: Path) -> None:
         list_project_browse(root, "missing")
     with pytest.raises(ProjectError, match="not a directory"):
         list_project_browse(root, "file.txt")
+
+
+def test_list_project_browse_creates_missing_root(tmp_path: Path) -> None:
+    """Missing projects root is mkdir'd so Browse can open an empty folder."""
+    root = tmp_path / "MissingProjects"
+    assert not root.exists()
+    result = list_project_browse(root, "")
+    assert root.is_dir()
+    assert result["entries"] == []
+    assert result["path"] == ""
+    assert Path(str(result["projectsRoot"])) == root.resolve()
+    assert Path(str(result["absolute"])) == root.resolve()
+
+
+def test_resolve_default_projects_root_prefers_existing(tmp_path: Path) -> None:
+    """First existing candidate wins; none existing falls back to first path."""
+    a = tmp_path / "a" / "Projects"
+    b = tmp_path / "b" / "Projects"
+    c = tmp_path / "c" / "Projects"
+    b.mkdir(parents=True)
+
+    assert resolve_default_projects_root((a, b, c)) == b
+    assert resolve_default_projects_root((a, c)) == a  # none exist → first
+
+    c.mkdir(parents=True)
+    assert resolve_default_projects_root((a, c)) == c  # skip missing a

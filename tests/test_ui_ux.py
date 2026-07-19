@@ -285,6 +285,18 @@ def test_js_scroll_ignore_held_across_raf() -> None:
     assert "state._ignoreScroll = false" in chunk
 
 
+def test_js_scroll_if_sticky_rate_limit() -> None:
+    """scrollIfSticky rate-limits non-forced sticky scrolls (~10/s)."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    idx = js.find("function scrollIfSticky")
+    assert idx >= 0
+    chunk = js[idx : idx + 900]
+    assert "_lastStickyScrollAt" in chunk
+    assert "90" in chunk
+    assert "force" in chunk
+
+
+
 def test_server_boot_id_in_health_and_status() -> None:
     """Hub exposes bootId/startedAt on process start for restart detection."""
     src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
@@ -430,13 +442,17 @@ def test_js_process_restart_clears_stale_live_state() -> None:
     # bootId change snapshots then clears live state and flags process restart
     note_idx = js.find("function noteBootId")
     assert note_idx >= 0
-    note_chunk = js[note_idx : note_idx + 900]
+    note_chunk = js[note_idx : note_idx + 1200]
     assert "snapshotLiveClientForRestart" in note_chunk
     assert "snapshotHadLive" in note_chunk
     assert "_pendingRestartInterrupt" in note_chunk
     assert "clearLiveClientStateAfterProcessRestart" in note_chunk
     assert "bootId changed" in note_chunk
     assert "_hubProcessRestarted" in note_chunk
+    # One hard reload per new bootId (sessionStorage) — no mixed old JS / new Python
+    assert "grh.bootReload." in note_chunk
+    assert "sessionStorage" in note_chunk
+    assert "location.reload" in note_chunk
 
     # clearStaleLiveTurns wipes turns, queue, flags, stall; optional questions
     clear_idx = js.find("function clearStaleLiveTurns")
@@ -753,41 +769,42 @@ def test_js_turn_idle_clears_selected_strip() -> None:
     assert idle_flag < row_status
 
 
-def _merge_stream_text(prev: str | None, chunk: str | None) -> str:
-    """Pure Python mirror of static/app.js mergeStreamText (history _merge_messages rules)."""
-    p = "" if prev is None else str(prev)
-    c = "" if chunk is None else str(chunk)
-    if not c:
-        return p
-    if not p:
-        return c
-    if p == c or p.startswith(c):
-        return p
-    if c.startswith(p):
-        return c
-    return p + c
-
-
 def test_merge_stream_text_algorithm() -> None:
-    """Cumulative snapshots replace; pure deltas append; shorter/equal ignored."""
+    """Cumulative / delta / mixed / overlap matrix (mirror of static/app.js)."""
+    from hub.ui_format import merge_stream_text
+
     # Cumulative: "a" then "ab" then "abc" → "abc" not "aababc"
     body = ""
     for snap in ("a", "ab", "abc"):
-        body = _merge_stream_text(body, snap)
+        body = merge_stream_text(body, snap)
     assert body == "abc"
 
-    # Pure deltas: "a"+"b" → "ab"
-    assert _merge_stream_text("a", "b") == "ab"
-    assert _merge_stream_text(_merge_stream_text("", "a"), "b") == "ab"
+    # Pure deltas: "a"+" b" → "a b"; "a"+"b" → "ab"
+    assert merge_stream_text("a", " b") == "a b"
+    assert merge_stream_text("a", "b") == "ab"
+    assert merge_stream_text(merge_stream_text("", "a"), "b") == "ab"
 
     # Ignore redundant shorter or equal snapshot
-    assert _merge_stream_text("abc", "ab") == "abc"
-    assert _merge_stream_text("abc", "abc") == "abc"
-    assert _merge_stream_text("hello", "") == "hello"
-    assert _merge_stream_text("", "x") == "x"
-    assert _merge_stream_text(None, "hi") == "hi"
-    assert _merge_stream_text("hi", None) == "hi"
-    assert _merge_stream_text(None, None) == ""
+    assert merge_stream_text("abc", "ab") == "abc"
+    assert merge_stream_text("abc", "abc") == "abc"
+    assert merge_stream_text("hello", "") == "hello"
+    assert merge_stream_text("", "x") == "x"
+    assert merge_stream_text(None, "hi") == "hi"
+    assert merge_stream_text("hi", None) == "hi"
+    assert merge_stream_text(None, None) == ""
+
+    # Mixed / redundant suffix (double delivery without full cumulative)
+    assert merge_stream_text("I will", " will") == "I will"
+    assert merge_stream_text("I", "I") == "I"
+    assert merge_stream_text("I", " I") == "I"
+
+    # Longest overlap: suffix of prev == prefix of chunk
+    assert merge_stream_text("hello", "lo world") == "hello world"
+    assert merge_stream_text("hel", "ello") == "hello"
+    assert merge_stream_text("hel", "lo") == "helo"  # only "l" overlaps
+
+    # Leading-space delta already present at end
+    assert merge_stream_text("word ", " word") == "word "
 
 
 def test_js_merge_stream_text_contract() -> None:
@@ -796,16 +813,20 @@ def test_js_merge_stream_text_contract() -> None:
 
     fn_idx = js.find("function mergeStreamText")
     assert fn_idx >= 0
-    fn = js[fn_idx : fn_idx + 450]
+    fn = js[fn_idx : fn_idx + 900]
     assert "prev" in fn and "chunk" in fn
     assert "startsWith" in fn
+    assert "endsWith" in fn
     assert "return p + c" in fn or "return p+c" in fn
 
     app_idx = js.find("function appendToBody")
     assert app_idx >= 0
-    app_fn = js[app_idx : app_idx + 700]
+    app_fn = js[app_idx : app_idx + 900]
     assert "mergeStreamText(prev, text)" in app_fn
     assert "const next = prev + text" not in app_fn
+    # Optional 50ms identical-chunk dedupe
+    assert "_lastChunk" in app_fn
+    assert "50" in app_fn
 
     thought_idx = js.find('if (kind === "agent_thought_chunk")')
     assert thought_idx >= 0
@@ -1083,21 +1104,29 @@ def test_restart_agent_admin_api_and_ui() -> None:
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     css = (STATIC / "app.css").read_text(encoding="utf-8")
 
-    # API route + handler
+    # API route + handler (thin wrapper) + shared restart helper
     assert '"/api/admin/restart-agent"' in src or "'/api/admin/restart-agent'" in src
     assert "handle_restart_agent" in src
+    assert "async def _restart_agent_process" in src
     assert "force_restart" in src
     assert "_agent_restart_in_progress" in src
-    # Does not restart hub process from this path
+    # Handler is a thin HTTP wrapper around the helper
     handler_idx = src.find("async def handle_restart_agent")
     assert handler_idx >= 0
-    handler = src[handler_idx : handler_idx + 4500]
-    assert "force_clear_turn" in handler
-    assert "force_restart" in handler
-    assert "reconnect" in handler
-    assert "_acp_heal_attempts = 0" in handler
+    handler = src[handler_idx : handler_idx + 2500]
+    assert "_restart_agent_process" in handler
     assert "sys.exit" not in handler
     assert "os._exit" not in handler
+    # Restart logic lives in _restart_agent_process (not hub process exit)
+    helper_idx = src.find("async def _restart_agent_process")
+    assert helper_idx >= 0
+    helper = src[helper_idx : helper_idx + 4500]
+    assert "force_clear_turn" in helper
+    assert "force_restart" in helper
+    assert "reconnect" in helper
+    assert "_acp_heal_attempts = 0" in helper
+    assert "sys.exit" not in helper
+    assert "os._exit" not in helper
 
     # Supervisor force kill + restart (attached listener, not only _started_by_us)
     assert "async def force_kill_agent" in sup
@@ -1298,6 +1327,31 @@ def test_context_budget_banner_removed() -> None:
     assert "Heavy session" not in js
 
 
+def test_latency_hint_loading_and_large_session_structural() -> None:
+    """Honest cold-attach + large-session first-reply hints (do not block Send)."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert 'id="latency-hint-banner"' in html
+    assert 'id="latency-hint-banner-text"' in html
+    assert ".latency-hint-banner" in css
+    assert "Loading session into agent…" in js
+    assert "Large session — first reply may take longer" in js
+    assert "function attachSessionLive" in js
+    attach_idx = js.find("async function attachSessionLive")
+    assert attach_idx >= 0
+    attach_chunk = js[attach_idx : attach_idx + 2200]
+    assert "attachingSessionId" in attach_chunk
+    assert "updateLatencyHintBanner" in attach_chunk
+    assert "function maybeShowLargeSessionHint" in js
+    assert "LARGE_SESSION_TOKENS" in js
+    # Soft language: loading hint must not say stuck
+    assert "stuck" not in attach_chunk.lower()
+    loading_line = [ln for ln in js.splitlines() if "Loading session into agent" in ln]
+    assert loading_line
+    assert "stuck" not in loading_line[0].lower()
+
+
 def test_js_history_batch_depth() -> None:
     """History rebuilds batch scroll/turn-strip updates via begin/endHistoryBatch."""
     js = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -1357,6 +1411,59 @@ def test_js_history_handler_skips_mid_turn() -> None:
     assert "turnRunningOnSelected()" in hist_chunk
     assert "applyHistoryMessages" in hist_chunk
     assert "hydrateSessionPane" in hist_chunk
+
+
+def test_js_force_history_refresh_on_reconnect_idle_visibility() -> None:
+    """Reconnect/visibility/idle force-refresh history so last disk messages appear."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    # refreshHistory accepts force; mid-turn guard respects opts.force
+    rh_idx = js.find("async function refreshHistory")
+    if rh_idx < 0:
+        rh_idx = js.find("function refreshHistory")
+    assert rh_idx >= 0
+    rh_chunk = js[rh_idx : rh_idx + 1200]
+    assert "opts.force" in rh_chunk
+    assert "turnRunningOnSelected()" in rh_chunk
+    assert "force: !!opts.force" in rh_chunk or "force: opts.force" in rh_chunk
+
+    # applyHistoryMessages: force bypasses turnRunning guard
+    apply_idx = js.find("function applyHistoryMessages")
+    assert apply_idx >= 0
+    apply_chunk = js[apply_idx : apply_idx + 900]
+    assert "opts.force" in apply_chunk
+    assert "turnRunningOnSelected()" in apply_chunk
+
+    # resumeAfterReconnect finish path force-refreshes selected history
+    resume_idx = js.find("async function resumeAfterReconnect")
+    if resume_idx < 0:
+        resume_idx = js.find("function resumeAfterReconnect")
+    assert resume_idx >= 0
+    resume_chunk = js[resume_idx : resume_idx + 9000]
+    assert "refreshHistory" in resume_chunk
+    assert "force: true" in resume_chunk
+    assert "reconcileTurnAfterWake" in resume_chunk
+    assert "silence >= 30" in resume_chunk or "silence != null && silence >= 30" in resume_chunk
+
+    # setTurnRunning idle path schedules force history refresh
+    assert "function scheduleForceHistoryRefresh" in js
+    turn_idx = js.find("function setTurnRunning")
+    assert turn_idx >= 0
+    turn_chunk = js[turn_idx : turn_idx + 3500]
+    assert "scheduleForceHistoryRefresh" in turn_chunk
+
+    # visibility: debounced wake → reconcile + gated force history
+    vis_idx = js.find('document.addEventListener("visibilitychange"')
+    assert vis_idx >= 0
+    vis_chunk = js[vis_idx : vis_idx + 500]
+    assert "scheduleWakeReconcile" in vis_chunk
+    wake_idx = js.find("async function handleWakeReconcile")
+    assert wake_idx >= 0
+    wake_chunk = js[wake_idx : wake_idx + 1200]
+    assert "reconcileTurnAfterWake" in wake_chunk
+    assert "force: true" in wake_chunk
+    assert "refreshHistory" in wake_chunk
+    assert "visibilityOnly" in wake_chunk
 
 
 def test_js_composer_drafts_per_session() -> None:
@@ -1420,30 +1527,44 @@ def test_js_tool_html_preview_discovery() -> None:
 
 
 def test_new_session_folder_browser_contract() -> None:
-    """New Session modal exposes sandboxed folder browser under projects_root."""
+    """New Session modal: Projects|Browse segments, breadcrumbs, sticky Use this folder."""
     html = (STATIC / "index.html").read_text(encoding="utf-8")
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     css = (STATIC / "app.css").read_text(encoding="utf-8")
     server = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
     projects = (ROOT / "hub" / "projects.py").read_text(encoding="utf-8")
 
-    assert 'id="btn-browse-folders"' in html
-    assert "Browse folders" in html
+    assert 'id="project-mode-tabs"' in html
+    assert 'id="tab-projects"' in html
+    assert 'id="tab-browse"' in html
+    assert "Projects" in html and "Browse" in html
     assert 'id="project-browser"' in html
+    assert 'id="project-browser-crumbs"' in html
     assert 'id="project-browser-path"' in html
-    assert 'id="btn-browse-up"' in html
-    assert "Start session here" in html
-    assert "Back to list" in html
-    assert 'id="btn-browse-start"' in html
-    assert 'id="btn-browse-back"' in html
     assert 'id="project-browser-list"' in html
+    assert 'id="project-browser-empty"' in html
+    assert 'id="project-browser-status"' in html
+    assert 'id="btn-browse-start"' in html
+    assert "Use this folder" in html
+    assert 'id="project-recents"' in html
+    assert 'id="project-recents-list"' in html
+    assert 'id="project-search"' in html
 
     assert "/api/projects/browse" in js
     assert "function loadProjectBrowse" in js
     assert "function renderProjectBrowse" in js
+    assert "function renderProjectCrumbs" in js
     assert "function openProjectBrowser" in js
     assert "function closeProjectBrowser" in js
     assert "function setProjectModalMode" in js
+    assert "function setProjectBrowseError" in js
+    # Browse error path must surface status (never blank panel)
+    assert "set hub.projects_root in config.toml" in js
+    assert "projectBrowserStatus" in js
+    assert "Could not load folders" in js
+    assert "grh.recentProjects.v1" in js
+    assert "rememberRecentProject" in js
+    assert "projectEntryReturnMode" in js
     # New-vs-Resume entry: browse/list pick path via onProjectChosen, not bare createSession
     assert "onProjectChosen(abs)" in js or "function onProjectChosen" in js
     assert "function createSession" in js
@@ -1453,7 +1574,11 @@ def test_new_session_folder_browser_contract() -> None:
     assert "list_project_browse" in server
     assert "def list_project_browse" in projects
 
+    assert ".project-mode-tabs" in css
+    assert ".project-mode-tab" in css
     assert ".project-browser" in css
+    assert ".project-browser-crumbs" in css
+    assert ".project-browser-sticky" in css
     assert ".project-browser-list" in css or ".project-browser" in css
 
 
@@ -1800,6 +1925,7 @@ def test_session_restore_and_goal_banner_contract() -> None:
     assert "grh.sessionGoals.v1" in js
     assert "function saveSelectedSession" in js
     assert "function loadSelectedSessionId" in js
+    assert "function loadSelectedSessionMeta" in js
     assert "function updateGoalBanner" in js
     assert "function rehydrateGoalFromHistory" in js
     assert "function noteGoalFromTool" in js
@@ -1810,13 +1936,22 @@ def test_session_restore_and_goal_banner_contract() -> None:
     assert "function applyGoalToolInput" in js
     assert "syncGoalTick" in js
 
-    # bootstrap restores saved session after /api/sessions
+    # saveSelectedSession stores cwd+title for restore-by-id
+    save_idx = js.find("function saveSelectedSession")
+    assert save_idx >= 0
+    save_chunk = js[save_idx : save_idx + 700]
+    assert "cwd" in save_chunk
+    assert "title" in save_chunk
+
+    # bootstrap restores saved session after /api/sessions; falls back to history-by-id
     boot_idx = js.find("async function bootstrap")
     assert boot_idx >= 0
-    boot_chunk = js[boot_idx : boot_idx + 4500]
-    assert "loadSelectedSessionId" in boot_chunk
+    boot_chunk = js[boot_idx : boot_idx + 5500]
+    assert "loadSelectedSessionMeta" in boot_chunk
     assert "openSession" in boot_chunk
     assert "/api/sessions" in boot_chunk
+    assert "/history" in boot_chunk
+    assert "clearSelectedSession" in boot_chunk
 
     # openSession persists selection
     open_idx = js.find("async function openSession")
@@ -1829,3 +1964,18 @@ def test_session_restore_and_goal_banner_contract() -> None:
     assert "def format_goal_elapsed" in py
     assert "def goal_banner_text" in py
     assert "def apply_goal_tool_input" in py
+
+
+def test_js_restore_pending_user_prompt_after_history() -> None:
+    """Pending lastPrompt reappears after history reload when not on disk."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "function restorePendingUserPromptIfMissing" in js
+    assert "function isNoOutputKeepPending" in js
+    assert "function offerNoOutputResend" in js
+    ah_idx = js.find("function applyHistoryMessages")
+    assert ah_idx >= 0
+    ah_chunk = js[ah_idx : ah_idx + 1600]
+    assert "restorePendingUserPromptIfMissing" in ah_chunk
+    # keepPending on no-output idle
+    assert "keepPending" in js
+    assert "opts.keepPending" in js or "opts && opts.keepPending" in js

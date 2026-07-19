@@ -124,9 +124,18 @@ def list_project_browse(projects_root: Path, rel: str = "") -> dict[str, object]
             parent = "/".join(parent_parts) if parent_parts else ""
 
     if not target.exists():
-        raise ProjectError("not found")
+        # Root missing: create it so Browse can open; never opaque "not found".
+        if not raw:
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ProjectError(
+                    f"projects root not found and could not create: {target} ({exc})"
+                ) from exc
+        else:
+            raise ProjectError(f"not found: {target}")
     if not target.is_dir():
-        raise ProjectError("not a directory")
+        raise ProjectError(f"not a directory: {target}")
 
     entries: list[dict[str, str]] = []
     try:
