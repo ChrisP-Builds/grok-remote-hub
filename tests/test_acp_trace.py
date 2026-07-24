@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from hub.acp_client import AcpClient
 from hub.acp_trace import AcpTrace, session_id_slice
+from hub.config import Config
 
 
 def test_emit_and_snapshot_order(tmp_path: Path) -> None:
@@ -96,3 +98,28 @@ def test_session_id_slice() -> None:
     assert session_id_slice(None) is None
     assert session_id_slice("abc") == "abc"
     assert session_id_slice("abcdefghijklmnop", 8) == "abcdefgh"
+
+
+def test_schedule_force_unhealthy_trace_no_duplicate_kwarg() -> None:
+    """Regression: snapshot already has consecutive_send_failures; must not TypeError.
+
+    Production 2026-07-23: _trace(force_unhealthy, consecutive_send_failures=…, **snapshot)
+    raised before recovery ran, wrapped as 'ACP recv ended: …'.
+    """
+    client = AcpClient(Config(), secret="test-force-unhealthy-trace")
+    client.consecutive_send_failures = 3
+    client.connected = True
+    # No running loop: schedule path traces then resets the flag and returns.
+    client._schedule_force_unhealthy(reason="send_failures")
+    events = client.trace.snapshot(20)
+    names = [e["event"] for e in events]
+    assert "force_unhealthy" in names
+    assert "zombie" in names
+    fu = next(e for e in events if e["event"] == "force_unhealthy")
+    assert fu["reason"] == "send_failures"
+    assert fu["consecutive_send_failures"] == 3
+    assert "has_pending" in fu
+    z = next(e for e in events if e["event"] == "zombie")
+    assert z["reason"] == "send_failures"
+    assert z["consecutive_send_failures"] == 3
+    assert client._force_unhealthy_scheduled is False

@@ -41,3 +41,5 @@ a new ADR.
 | 014 | In-hub agent restart from hung status pill | Accepted | 2026-07-14 |
 | 015 | CLI-aligned turn ownership (cancel frees agent; wake re-sync) | Accepted | 2026-07-16 |
 | 016 | Quiet-period session/load suppress before re-prompt | Accepted | 2026-07-17 |
+| 017 | Unresumable dead view forces pin (no blank fork) | Accepted | 2026-07-24 |
+| 018 | Cold ensure vs hot path attribution | Accepted | 2026-07-24 |

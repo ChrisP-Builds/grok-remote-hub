@@ -183,11 +183,11 @@ class AcpClient:
         if self._force_unhealthy_scheduled:
             return
         self._force_unhealthy_scheduled = True
+        # Snapshot already includes consecutive_send_failures; do not pass both.
         self._trace(
             "force_unhealthy",
             reason=reason,
-            consecutive_send_failures=self.consecutive_send_failures,
-            **{k: v for k, v in self.acp_liveness_snapshot().items()},
+            **self.acp_liveness_snapshot(),
         )
         if reason == "send_failures" or "zombie" in reason.lower():
             self._trace(

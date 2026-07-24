@@ -1471,6 +1471,60 @@ def test_js_force_history_refresh_on_reconnect_idle_visibility() -> None:
     assert "visibilityOnly" in wake_chunk
 
 
+def test_js_force_pin_loads_history_after_clear() -> None:
+    """applySessionSwitch force-pin path must refreshHistory after clearing transcript."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    apply_idx = js.find("async function applySessionSwitch")
+    assert apply_idx >= 0
+    # Soft-map early return is before full switch; slice whole function to next async fn.
+    next_fn = js.find("\n  function isRailVisible", apply_idx)
+    if next_fn < 0:
+        next_fn = apply_idx + 1200
+    apply_chunk = js[apply_idx:next_fn]
+    # Soft-map excludes force-pin reasons (full switch continues past this).
+    assert 'reason !== "resume_failed"' in apply_chunk
+    assert 'reason !== "dead_view"' in apply_chunk
+    assert 'reason !== "force_ui_switch"' in apply_chunk
+    # Full-switch path clears then force-loads liveId history.
+    clear_idx = apply_chunk.find("clearTranscript()")
+    loaded_false = apply_chunk.find("historyLoaded = false")
+    refresh_idx = apply_chunk.find("refreshHistory")
+    assert clear_idx >= 0, "force-pin path must clearTranscript"
+    assert loaded_false >= 0, "force-pin path must reset historyLoaded"
+    assert refresh_idx >= 0, "force-pin path must call refreshHistory"
+    assert refresh_idx > clear_idx
+    assert refresh_idx > loaded_false
+    assert "force: true" in apply_chunk[refresh_idx : refresh_idx + 120]
+    assert "jump: true" in apply_chunk[refresh_idx : refresh_idx + 120]
+    # Prefer after subscribe of toId
+    sub_idx = apply_chunk.find("subscribeSessionIds(toId")
+    assert sub_idx >= 0
+    assert refresh_idx > sub_idx
+
+
+def test_js_resume_after_reconnect_handles_attach_switch() -> None:
+    """resumeAfterReconnect must capture attach result and force-pin on dead_view."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    resume_idx = js.find("async function resumeAfterReconnect")
+    if resume_idx < 0:
+        resume_idx = js.find("function resumeAfterReconnect")
+    assert resume_idx >= 0
+    resume_chunk = js[resume_idx : resume_idx + 4500]
+    assert "const attached = await attachSessionLive" in resume_chunk
+    assert "attached.liveId" in resume_chunk
+    assert "attachReason" in resume_chunk
+    assert 'attachReason === "resume_failed"' in resume_chunk
+    assert 'attachReason === "dead_view"' in resume_chunk
+    assert "applySessionSwitch" in resume_chunk
+    # Order: capture attach, then possibly switch before hydrate/subscribe loop.
+    attach_idx = resume_chunk.find("const attached = await attachSessionLive")
+    switch_idx = resume_chunk.find("applySessionSwitch")
+    collect_idx = resume_chunk.find("collectLiveSessionIds")
+    assert attach_idx >= 0 and switch_idx >= 0
+    assert switch_idx > attach_idx
+    assert collect_idx < 0 or collect_idx > switch_idx
+
+
 def test_js_composer_drafts_per_session() -> None:
     """Composer drafts are per-session with save/restore/clear + localStorage."""
     js = (STATIC / "app.js").read_text(encoding="utf-8")

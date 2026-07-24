@@ -24,14 +24,17 @@ from hub.session_policy import (
     is_hub_resume_candidate,
     is_live_hot_path,
     is_no_output_error_message,
+    is_permanent_session_load_failure,
     is_turn_stuck_for_new_prompt,
     load_hub_session_ids,
     load_remote_sessions,
+    next_ensure_after_load_fail,
     no_output_seconds_for_session,
     recovery_keeps_session_id,
     resolve_ensure_action,
     resolve_live_session_id,
     save_remote_sessions,
+    session_on_disk,
     sessions_matching_cwd,
     should_auto_retry_no_output,
     should_clear_turn_on_wake,
@@ -562,6 +565,123 @@ def test_resolve_ensure_empty_view_uses_bycwd() -> None:
     assert target2 == mapped
     assert action2 == "load"
     assert reason2 == "resume_cwd"
+
+
+def test_is_permanent_session_load_failure() -> None:
+    """FS_NOT_FOUND / path-missing markers are permanent; unrelated errors are not."""
+    assert is_permanent_session_load_failure(None) is False
+    assert is_permanent_session_load_failure("") is False
+    assert is_permanent_session_load_failure("timeout waiting for agent") is False
+    assert is_permanent_session_load_failure("connection reset") is False
+    assert is_permanent_session_load_failure("Path not found (FS_NOT_FOUND)") is True
+    assert is_permanent_session_load_failure("fs_not_found") is True
+    assert is_permanent_session_load_failure("FS_NOT_FOUND") is True
+    assert is_permanent_session_load_failure("Cannot find the file specified") is True
+    assert is_permanent_session_load_failure("cannot find the path") is True
+    assert is_permanent_session_load_failure(
+        "os error 2: the system cannot find the file"
+    ) is True
+    assert is_permanent_session_load_failure("OS Error 3: path not found") is True
+    # OS error alone without path/fs context is not permanent
+    assert is_permanent_session_load_failure("os error 2") is False
+    assert is_permanent_session_load_failure(RuntimeError("Path not found")) is True
+
+
+def test_resolve_ensure_unresumable_view_falls_to_bycwd() -> None:
+    """Unresumable view is treated as empty; byCwd process-live wins."""
+    dead = "019f73a3-dead-view"
+    live = "019f9210-live-bycwd"
+    remote = {cwd_key(r"D:\Projects\Grok Remote Hub"): live}
+    hub_owned = {dead, live}
+    # Without unresumable: view still preferred (existing behavior)
+    target, action, reason = resolve_ensure_action(
+        dead,
+        r"D:\Projects\Grok Remote Hub",
+        set(),
+        remote,
+        hub_owned_ids=hub_owned,
+    )
+    assert target == dead
+    assert action == "load"
+    assert reason == "resume_view"
+    # With unresumable view: fall through to byCwd reuse
+    target2, action2, reason2 = resolve_ensure_action(
+        dead,
+        r"D:\Projects\Grok Remote Hub",
+        {live},
+        remote,
+        hub_owned_ids=hub_owned,
+        unresumable_ids={dead},
+    )
+    assert target2 == live
+    assert action2 == "reuse"
+    assert reason2 == "reuse_cwd"
+
+
+def test_resolve_ensure_unresumable_bycwd_skipped_needs_new() -> None:
+    """Unresumable byCwd entry is skipped → need_session_new when nothing else."""
+    dead = "019f73a3-dead-map"
+    remote = {cwd_key(r"D:\Projects\Demo"): dead}
+    target, action, reason = resolve_ensure_action(
+        None,
+        r"D:\Projects\Demo",
+        set(),
+        remote,
+        remote_hub_origin="attach",
+        hub_owned_ids={dead},
+        unresumable_ids={dead},
+    )
+    assert target is None
+    assert action == "new"
+    assert reason == "need_session_new"
+
+
+def test_resolve_ensure_view_preferred_when_not_unresumable() -> None:
+    """View still preferred over byCwd when not in unresumable set."""
+    viewed = "019f4d9f-older-hub-owned"
+    mapped = "019f578a-current-bycwd"
+    remote = {cwd_key(r"D:\Projects\Grok Remote Hub"): mapped}
+    hub_owned = {viewed, mapped}
+    target, action, reason = resolve_ensure_action(
+        viewed,
+        r"D:\Projects\Grok Remote Hub",
+        set(),
+        remote,
+        hub_owned_ids=hub_owned,
+        unresumable_ids=set(),
+    )
+    assert target == viewed
+    assert action == "load"
+    assert reason == "resume_view"
+
+
+def test_next_ensure_after_load_fail_prefers_bycwd() -> None:
+    """After failed target load, resolve without view; reuse process-live byCwd."""
+    failed = "019f73a3-dead"
+    live = "019f9210-already-minted"
+    remote = {cwd_key(r"D:\Projects\Demo"): live}
+    target, action, reason = next_ensure_after_load_fail(
+        failed,
+        r"D:\Projects\Demo",
+        {live},
+        remote,
+        unresumable_ids={failed},
+        hub_owned_ids={failed, live},
+    )
+    assert target == live
+    assert action == "reuse"
+    assert reason == "reuse_cwd"
+    # Failed id alone → new
+    target2, action2, reason2 = next_ensure_after_load_fail(
+        failed,
+        r"D:\Projects\Demo",
+        set(),
+        {cwd_key(r"D:\Projects\Demo"): failed},
+        unresumable_ids={failed},
+        hub_owned_ids={failed},
+    )
+    assert target2 is None
+    assert action2 == "new"
 
 
 def test_remote_sessions_load_missing_empty(tmp_path: Path) -> None:
@@ -1232,12 +1352,116 @@ def test_execute_prompt_hot_path_structural() -> None:
 def test_ensure_reuse_skips_load_new_wait() -> None:
     """_ensure_hub_agent_session: logs action; no wait_until_up on ensure path."""
     src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
-    body = _slice_method(src, "_ensure_hub_agent_session")
+    # Body lives in locked helper after single-flight wrap.
+    body = _slice_method(src, "_ensure_hub_agent_session_locked")
     assert "ensure action=%s" in body
     assert "wait_until_up(" not in body
     assert "resolve_ensure_action" in body
     assert 'action == "reuse"' in body
+    assert "unresumable_ids" in body
+    wrap = _slice_method(src, "_ensure_hub_agent_session")
+    assert "_ensure_lock_for" in wrap or "_ensure_locks" in wrap
+    assert "async with lock" in wrap or "async with" in wrap
 
+
+def test_unresumable_and_ensure_lock_structural() -> None:
+    """Server tracks permanent load fails, skips retry, single-flights ensure."""
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    assert "_unresumable_session_ids" in src
+    assert "_ensure_locks" in src
+    assert "is_permanent_session_load_failure" in src
+    assert "next_ensure_after_load_fail" in src
+    try_body = _slice_method(src, "_try_session_load")
+    assert "is_permanent_session_load_failure" in try_body
+    assert "_unresumable_session_ids" in try_body
+    load_body = _slice_method(src, "_load_or_fallback_session")
+    assert "permanent_target" in load_body
+    assert "asyncio.sleep(0.5)" in load_body
+    assert "_drop_unresumable_from_hub_ids" in load_body
+    assert "next_ensure_after_load_fail" in load_body
+    assert "_ensure_lock_for" in src
+
+
+def test_client_resume_failed_forces_ui_structural() -> None:
+    """attach returns reason; resume_failed/dead_view exclude soft-map / force UI switch."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    attach_idx = js.find("async function attachSessionLive")
+    assert attach_idx >= 0
+    attach_chunk = js[attach_idx : attach_idx + 2800]
+    assert 'reason: data.reason || ""' in attach_chunk
+    apply_idx = js.find("async function applySessionSwitch")
+    assert apply_idx >= 0
+    apply_chunk = js[apply_idx : apply_idx + 1400]
+    assert 'reason !== "resume_failed"' in apply_chunk
+    assert 'reason !== "dead_view"' in apply_chunk
+    assert 'reason !== "force_ui_switch"' in apply_chunk
+    open_idx = js.find("async function openSession")
+    assert open_idx >= 0
+    open_chunk = js[open_idx : open_idx + 9000]
+    assert 'attachReason === "resume_failed"' in open_chunk
+    assert 'attachReason === "dead_view"' in open_chunk
+    assert "applySessionSwitch" in open_chunk
+
+
+def test_session_on_disk_tmp_path(tmp_path: Path) -> None:
+    """session_on_disk matches root/sid and root/<cwd-enc>/sid layouts."""
+    missing = "019f0000-0000-7000-8000-000000000001"
+    assert session_on_disk(tmp_path, missing) is False
+    assert session_on_disk(tmp_path, "") is False
+    assert session_on_disk(tmp_path / "nope", missing) is False
+
+    direct = tmp_path / "019f0000-0000-7000-8000-000000000002"
+    direct.mkdir()
+    assert session_on_disk(tmp_path, direct.name) is True
+
+    nested_sid = "019f0000-0000-7000-8000-000000000003"
+    (tmp_path / "encoded-cwd" / nested_sid).mkdir(parents=True)
+    assert session_on_disk(tmp_path, nested_sid) is True
+
+    sub_sid = "019f0000-0000-7000-8000-000000000004"
+    (tmp_path / "parent-sid" / "subagents" / sub_sid).mkdir(parents=True)
+    assert session_on_disk(tmp_path, sub_sid) is True
+
+
+def test_ensure_dead_view_switch_reason_structural() -> None:
+    """When switched and view missing/unresumable, switch_reason is dead_view."""
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    body = _slice_method(src, "_ensure_hub_agent_session_locked")
+    assert 'switch_reason = "dead_view"' in body
+    assert "find_session(self.config.sessions_root, view)" in body
+    assert "_unresumable_session_ids" in body
+    assert "view_dead" in body
+    # Prefer dead_view over soft cli_or_foreign when view is dead.
+    dead_idx = body.find('switch_reason = "dead_view"')
+    soft_idx = body.find('switch_reason = "cli_or_foreign_session"')
+    assert dead_idx >= 0 and soft_idx >= 0
+    assert dead_idx < soft_idx
+
+
+def test_bootstrap_unresumable_missing_dirs_structural() -> None:
+    """Hub start marks missing session dirs unresumable and drops hubIds/byCwd."""
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    assert "_bootstrap_unresumable_missing_dirs" in src
+    assert "session_on_disk" in src
+    body = _slice_method(src, "_bootstrap_unresumable_missing_dirs")
+    assert "session_on_disk" in body
+    assert "_unresumable_session_ids" in body
+    assert "hub_owned_session_ids" in body
+    assert "remote_agent_session" in body
+    assert "_persist_remote_sessions_map" in body
+    init_chunk = src[src.find("self._load_remote_sessions_map()") : src.find("self._load_remote_sessions_map()") + 200]
+    assert "_bootstrap_unresumable_missing_dirs" in init_chunk
+
+
+def test_attach_response_cold_path_keys_structural() -> None:
+    """handle_attach_session exposes ensureMs, ensureAction, liveHotPath."""
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    body = _slice_method(src, "handle_attach_session")
+    assert '"ensureMs"' in body or "'ensureMs'" in body
+    assert '"ensureAction"' in body or "'ensureAction'" in body
+    assert '"liveHotPath"' in body or "'liveHotPath'" in body
+    assert "is_live_hot_path" in body
+    assert "ensure_ms" in body
 
 
 def test_forget_warm_session() -> None:

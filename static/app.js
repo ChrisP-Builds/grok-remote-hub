@@ -3845,12 +3845,15 @@
 
     // User is viewing a session they chose: do not steal focus to empty live id.
     // Map prompts to the live hub session while keeping history on screen.
+    // resume_failed / dead_view / force_ui_switch: dead view has no disk path — pin UI to liveId.
     if (
       state.selectedId &&
       from &&
       from !== toId &&
       state.selectedId === from &&
-      reason !== "force_ui_switch"
+      reason !== "force_ui_switch" &&
+      reason !== "resume_failed" &&
+      reason !== "dead_view"
     ) {
       state.livePromptSessionId = toId;
       setSessionMode("live-remote", { attachSwitched: true });
@@ -3890,6 +3893,7 @@
     if (meta && !meta.sessionId) meta.sessionId = toId;
     state.selectedMeta = meta;
     state.livePromptSessionId = toId;
+    saveSelectedSession(toId, meta);
     // Keep prior commands until agent sends a fresh list; builtins fill gaps.
     const v = showSessionPane(toId);
     v.streamBuffers = emptyStreamBuffers();
@@ -3919,6 +3923,8 @@
       if (state.subscribedSessions) state.subscribedSessions.delete(from);
       sendWs({ type: "unsubscribe", sessionId: from });
     }
+    // Force-pin path cleared transcript and never soft-mapped; load liveId history.
+    await refreshHistory(toId, { force: true, jump: true });
     setComposerEnabled(composerConnected());
     forceComposerUnlocked();
     updateTurnStrip();
@@ -6057,7 +6063,7 @@
   /**
    * POST /api/sessions/{id}/attach — ensure live hub session (session/load or new).
    * Shared by openSession and resumeAfterReconnect after process restart.
-   * @returns {{liveId: string, switched: boolean, message: string, cwd: string}|null}
+   * @returns {{liveId: string, switched: boolean, message: string, cwd: string, reason: string}|null}
    */
   async function attachSessionLive(viewId, cwd, opts = {}) {
     const showFailToast = opts.showFailToast !== false;
@@ -6103,6 +6109,7 @@
         switched,
         message: data.message || "",
         cwd: data.cwd || cwd || "",
+        reason: data.reason || "",
       };
     } catch (err) {
       if (showFailToast) toast("Attach failed: " + err, "danger");
@@ -6279,16 +6286,29 @@
         }
         liveId = attached.liveId;
         switched = !!attached.switched && liveId !== viewId;
+        const attachReason = String(attached.reason || "").trim();
 
         // Always remember where prompts should go
         state.livePromptSessionId = liveId;
 
         if (switched) {
-          // Keep the session the user clicked (history on screen). Do not jump to
-          // an empty/new hub remote id — that felt like "back to main".
-          if (state.selectedId !== viewId) {
+          // Dead view (resume_failed / dead_view): force UI + pin onto liveId so
+          // refresh does not re-attach the corpse and mint another untitled session.
+          if (
+            attachReason === "resume_failed" ||
+            attachReason === "dead_view"
+          ) {
+            await applySessionSwitch(
+              viewId,
+              liveId,
+              attachReason,
+              attached.message || ""
+            );
+          } else if (state.selectedId !== viewId) {
             // User navigated away during attach; do not steal focus back.
           } else {
+            // Keep the session the user clicked (history on screen). Soft-map
+            // prompts to live while showing this session's transcript.
             setSessionMode("live-remote", { attachSwitched: true });
             if (attached.message) {
               appendMessage({
@@ -6688,10 +6708,32 @@
         }
         if (cwd) {
           try {
-            await attachSessionLive(state.selectedId, cwd, {
+            const attached = await attachSessionLive(state.selectedId, cwd, {
               showFailToast: false,
               focusOnFail: false,
             });
+            if (attached && attached.liveId) {
+              const viewWas = state.selectedId;
+              const liveId = attached.liveId;
+              const attachReason = String(attached.reason || "").trim();
+              const switched = !!attached.switched && liveId !== viewWas;
+              state.livePromptSessionId = liveId;
+              if (
+                switched &&
+                (attachReason === "resume_failed" ||
+                  attachReason === "dead_view" ||
+                  attachReason === "force_ui_switch")
+              ) {
+                await applySessionSwitch(
+                  viewWas,
+                  liveId,
+                  attachReason || "dead_view",
+                  attached.message || ""
+                );
+              } else if (!switched && state.selectedId) {
+                // same session — hydrate loop force-refreshes selected history
+              }
+            }
           } catch (_) {
             // attach best-effort; user can re-open session
           }

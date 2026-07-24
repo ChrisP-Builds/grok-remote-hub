@@ -243,3 +243,38 @@ def test_no_output_auto_retry_uses_end_turn_no_auto_restart() -> None:
     assert "_restart_agent_process(" not in block
     # Optional log that escalation is disabled is fine.
     assert "would escalate restart" in block or "disabled" in block.lower()
+
+
+def test_no_output_heal_short_circuits_permanent_unresumable() -> None:
+    """Permanent unresumable must not reconnect ACP or re-prompt (ADR-009)."""
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    h_idx = src.find("async def _heal_session_for_no_output_retry")
+    assert h_idx >= 0
+    h_end = src.find("\n    async def ", h_idx + 1)
+    heal = src[h_idx : h_end if h_end > h_idx else h_idx + 5000]
+    assert "_unresumable_session_ids" in heal
+    assert "skip reconnect" in heal
+    assert "_drop_unresumable_from_hub_ids" in heal
+    # Already-unresumable check before reconnect path.
+    already = heal.find("already unresumable")
+    reconnect = heal.find("reconnecting ACP")
+    assert already >= 0 and reconnect >= 0 and already < reconnect
+    # Permanent after first load also skips reconnect.
+    assert "permanent load failure" in heal
+    # Never call session/new on no-output heal (ADR-009). Docstring may mention it.
+    body_start = heal.find('"""', heal.find('"""') + 3)
+    heal_body = heal[body_start + 3 :] if body_start >= 0 else heal
+    assert "session_new" not in heal_body
+    assert "session/new" not in heal_body
+
+    r_idx = src.find("async def _no_output_auto_retry")
+    assert r_idx >= 0
+    r_end = src.find("\n    async def ", r_idx + 1)
+    retry = src[r_idx : r_end if r_end > r_idx else r_idx + 6000]
+    assert "skip re-prompt" in retry
+    assert "_unresumable_session_ids" in retry
+    assert "NO_OUTPUT_RETRY_FAILED_MSG" in retry
+    # Permanent branch returns before session_prompt re-try.
+    skip = retry.find("skip re-prompt")
+    prompt = retry.find("session_prompt")
+    assert skip >= 0 and prompt >= 0 and skip < prompt

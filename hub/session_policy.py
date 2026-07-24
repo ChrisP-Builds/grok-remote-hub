@@ -47,6 +47,33 @@ def is_live_hot_path(*, ensure_action: str, acp_connected: bool) -> bool:
     return bool(acp_connected) and str(ensure_action or "").strip().lower() == "reuse"
 
 
+def session_on_disk(sessions_root: Path | str, session_id: str) -> bool:
+    """True when a session directory named session_id exists under sessions_root.
+
+    Matches agent layout: sessions_root/<encoded-cwd>/<sid>/ (and root/<sid>/,
+    or parent/subagents/<sid>/). Does not require useful content / summary.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return False
+    root = Path(sessions_root)
+    if not root.is_dir():
+        return False
+    try:
+        if (root / sid).is_dir():
+            return True
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            if (child / sid).is_dir():
+                return True
+            if (child / "subagents" / sid).is_dir():
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def should_skip_session_load(warm_set: set[str] | frozenset[str], session_id: str) -> bool:
     """True when this process already session/new or session/load'd session_id.
 
@@ -377,6 +404,40 @@ def recovery_keeps_session_id(
     return before == after
 
 
+def is_permanent_session_load_failure(exc: BaseException | str | None) -> bool:
+    """True for non-retryable session/load failures (missing path / FS_NOT_FOUND)."""
+    if exc is None:
+        return False
+    text = str(exc).casefold()
+    if not text:
+        return False
+    # Inherently path/fs missing markers.
+    if "fs_not_found" in text:
+        return True
+    if "path not found" in text:
+        return True
+    if "cannot find the file" in text:
+        return True
+    if "cannot find the path" in text:
+        return True
+    # Windows ENOENT / path-not-found; only when related to path/fs.
+    pathish = any(
+        token in text
+        for token in (
+            "path",
+            "file",
+            "directory",
+            "dir",
+            "fs",
+            "not found",
+            "no such",
+        )
+    )
+    if pathish and ("os error 2" in text or "os error 3" in text):
+        return True
+    return False
+
+
 def resolve_ensure_action(
     view_session_id: str | None,
     cwd: str | None,
@@ -386,6 +447,7 @@ def resolve_ensure_action(
     view_hub_origin: str | None = None,
     remote_hub_origin: str | None = None,
     hub_owned_ids: set[str] | frozenset[str] | None = None,
+    unresumable_ids: set[str] | frozenset[str] | None = None,
 ) -> tuple[str | None, str, str]:
     """Resolve ensure path: (target_id | None, action, reason).
 
@@ -402,8 +464,15 @@ def resolve_ensure_action(
     view is foreign/CLI or empty. One-live-per-cwd is kept by updating byCwd when
     view is used (caller _record_hub_session). hub_owned_ids: durable hub session
     ids from remote-sessions.json hubIds (union into resume set).
+    unresumable_ids: permanent session/load failures; treated as empty for view and
+    skipped for byCwd so ensure can fall through to a live map id or session/new.
     """
     view = str(view_session_id or "").strip() or None
+    unres: set[str] = set(unresumable_ids) if unresumable_ids else set()
+    # Dead-on-disk view must not win over byCwd / new.
+    if view and view in unres:
+        view = None
+
     remote_map_ids = set(remote_by_cwd.values()) if remote_by_cwd else set()
     if hub_owned_ids:
         remote_map_ids |= set(hub_owned_ids)
@@ -424,7 +493,7 @@ def resolve_ensure_action(
         existing = remote_by_cwd.get(key)
         if existing:
             existing = str(existing).strip()
-            if existing:
+            if existing and existing not in unres:
                 if existing in created_set:
                     return existing, "reuse", "reuse_cwd"
                 if is_hub_resume_candidate(
@@ -436,6 +505,32 @@ def resolve_ensure_action(
                     return existing, "load", "resume_cwd"
 
     return None, "new", "need_session_new"
+
+
+def next_ensure_after_load_fail(
+    failed_id: str,
+    cwd: str | None,
+    created_set: set[str] | frozenset[str],
+    remote_by_cwd: dict[str, str],
+    *,
+    unresumable_ids: set[str] | frozenset[str] | None = None,
+    hub_owned_ids: set[str] | frozenset[str] | None = None,
+    remote_hub_origin: str | None = None,
+) -> tuple[str | None, str, str]:
+    """After target load exhausted: resolve without the failed id as view (byCwd or new)."""
+    failed = str(failed_id or "").strip()
+    unres: set[str] = set(unresumable_ids) if unresumable_ids else set()
+    if failed:
+        unres.add(failed)
+    return resolve_ensure_action(
+        None,
+        cwd,
+        created_set,
+        remote_by_cwd,
+        remote_hub_origin=remote_hub_origin,
+        hub_owned_ids=hub_owned_ids,
+        unresumable_ids=unres,
+    )
 
 
 def resolve_live_session_id(

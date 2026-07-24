@@ -79,11 +79,14 @@ from hub.session_policy import (
     is_hub_resume_candidate,
     is_live_hot_path,
     is_no_output_error_message,
+    is_permanent_session_load_failure,
     load_hub_session_ids,
     load_remote_sessions,
+    next_ensure_after_load_fail,
     no_output_seconds_for_session,
     resolve_ensure_action,
     save_remote_sessions,
+    session_on_disk,
     should_auto_retry_no_output,
     turn_telemetry,
 )
@@ -217,10 +220,15 @@ class Hub:
         self.acp_created_sessions: set[str] = set()
         # Durable hub-owned ids from remote-sessions.json hubIds (resume candidates).
         self.hub_owned_session_ids: set[str] = set()
+        # Permanent session/load failures (missing path / FS_NOT_FOUND) — never re-prefer.
+        self._unresumable_session_ids: set[str] = set()
+        # Single-flight ensure per cwd_key (concurrent attach/prompt share one ensure).
+        self._ensure_locks: dict[str, asyncio.Lock] = {}
         # cwd (casefold) -> last hub-created agent session id for remote prompts.
         self.remote_agent_session: dict[str, str] = {}
         self.remote_sessions_path = REMOTE_SESSIONS_FILE
         self._load_remote_sessions_map()
+        self._bootstrap_unresumable_missing_dirs()
         # Per-cwd FIFO queues while that project has a turn running (data only).
         self._prompt_queues: dict[str, PromptQueue] = {}
         self._prompt_queue_lock = asyncio.Lock()
@@ -960,6 +968,44 @@ class Hub:
                 self.remote_sessions_path,
             )
 
+    def _bootstrap_unresumable_missing_dirs(self) -> None:
+        """At start: hubIds/byCwd with no session directory → unresumable + drop once."""
+        candidates: set[str] = set()
+        for sid in self.hub_owned_session_ids:
+            s = str(sid or "").strip()
+            if s:
+                candidates.add(s)
+        for sid in self.remote_agent_session.values():
+            s = str(sid or "").strip()
+            if s:
+                candidates.add(s)
+        missing = [
+            sid
+            for sid in candidates
+            if not session_on_disk(self.config.sessions_root, sid)
+        ]
+        if not missing:
+            return
+        for sid in missing:
+            self._unresumable_session_ids.add(sid)
+        changed = False
+        for sid in missing:
+            if sid in self.hub_owned_session_ids:
+                self.hub_owned_session_ids.discard(sid)
+                changed = True
+            dead_keys = [
+                k for k, v in list(self.remote_agent_session.items()) if v == sid
+            ]
+            for k in dead_keys:
+                self.remote_agent_session.pop(k, None)
+                changed = True
+        if changed:
+            self._persist_remote_sessions_map()
+        log.info(
+            "Bootstrap unresumable: %d missing session dir(s) marked and dropped from hub map",
+            len(missing),
+        )
+
     def _persist_remote_sessions_map(self) -> None:
         try:
             save_remote_sessions(
@@ -1036,6 +1082,7 @@ class Hub:
         """Attempt session/load with hard timeout. True on success.
 
         Already-warm sessions return quickly via acp.session_load skip (no agent RPC).
+        Permanent FS/path failures are recorded in _unresumable_session_ids (once).
         """
         try:
             await asyncio.wait_for(
@@ -1045,7 +1092,34 @@ class Hub:
             return True
         except Exception as exc:
             log.warning("session/load failed for %s: %s", session_id, exc)
+            if is_permanent_session_load_failure(exc):
+                sid = str(session_id or "").strip()
+                if sid and sid not in self._unresumable_session_ids:
+                    self._unresumable_session_ids.add(sid)
+                    log.warning(
+                        "session/load permanent failure for %s; marked unresumable",
+                        sid,
+                    )
             return False
+
+    def _drop_unresumable_from_hub_ids(self, session_id: str) -> None:
+        """Stop advertising a permanently dead session via hubIds / byCwd map."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        changed = False
+        if sid in self.hub_owned_session_ids:
+            self.hub_owned_session_ids.discard(sid)
+            changed = True
+        dead_keys = [
+            k for k, v in list(self.remote_agent_session.items()) if v == sid
+        ]
+        for k in dead_keys:
+            self.remote_agent_session.pop(k, None)
+            changed = True
+        if changed:
+            self._persist_remote_sessions_map()
+            log.info("Dropped unresumable session %s from hub map/ids", sid)
 
     async def _load_or_fallback_session(
         self,
@@ -1055,12 +1129,14 @@ class Hub:
         view_session_id: str,
         view_origin: str | None,
     ) -> str:
-        """Load target; on fail retry once, then try view if different, else session/new.
+        """Load target; on fail skip retry if permanent, re-resolve byCwd, else session/new.
 
         Prefers not abandoning the intended continuity id. When load fails for byCwd
         while view is a different hub resume candidate, tries load view before new.
+        After target is exhausted, reuses process-live / loadable byCwd before minting.
         """
         view = str(view_session_id or "").strip() or None
+        target = str(target or "").strip()
 
         async def _succeed(sid: str, how: str) -> str:
             self._record_hub_session(sid, cwd)
@@ -1078,19 +1154,26 @@ class Hub:
         if await self._try_session_load(target, cwd):
             return await _succeed(target, "session/load")
 
-        # Retry once after short delay (transient agent/load races).
-        log.warning(
-            "session/load first attempt failed for %s; retrying after 0.5s",
-            target,
-        )
-        await asyncio.sleep(0.5)
-        if await self._try_session_load(target, cwd):
-            return await _succeed(target, "session/load retry")
+        permanent_target = target in self._unresumable_session_ids
+        if permanent_target:
+            self._drop_unresumable_from_hub_ids(target)
+        else:
+            # Retry once after short delay (transient agent/load races).
+            log.warning(
+                "session/load first attempt failed for %s; retrying after 0.5s",
+                target,
+            )
+            await asyncio.sleep(0.5)
+            if await self._try_session_load(target, cwd):
+                return await _succeed(target, "session/load retry")
+            if target in self._unresumable_session_ids:
+                self._drop_unresumable_from_hub_ids(target)
 
         # byCwd load failed while view is a different hub resume candidate → try view.
         if (
             view
             and view != target
+            and view not in self._unresumable_session_ids
             and is_hub_resume_candidate(
                 view,
                 created_set=self.acp_created_sessions,
@@ -1105,6 +1188,52 @@ class Hub:
             )
             if await self._try_session_load(view, cwd):
                 return await _succeed(view, "session/load view-fallback")
+            if view in self._unresumable_session_ids:
+                self._drop_unresumable_from_hub_ids(view)
+
+        # Prefer process-live / loadable byCwd over minting another untitled session.
+        remote_id = None
+        key = self._cwd_key(cwd)
+        if key:
+            remote_id = self.remote_agent_session.get(key)
+        remote_origin = (
+            read_hub_origin(self.config.sessions_root, remote_id) if remote_id else ""
+        )
+        next_target, next_action, next_reason = next_ensure_after_load_fail(
+            target,
+            cwd,
+            self.acp_created_sessions,
+            self.remote_agent_session,
+            unresumable_ids=self._unresumable_session_ids,
+            hub_owned_ids=self.hub_owned_session_ids,
+            remote_hub_origin=remote_origin or None,
+        )
+        if next_action == "reuse" and next_target:
+            log.info(
+                "After load fail for %s, reusing process-live %s (%s)",
+                target,
+                next_target,
+                next_reason,
+            )
+            return await _succeed(next_target, f"reuse after load fail ({next_reason})")
+        if (
+            next_action == "load"
+            and next_target
+            and next_target != target
+            and next_target not in self._unresumable_session_ids
+        ):
+            log.warning(
+                "After load fail for %s, trying byCwd/map candidate %s (%s)",
+                target,
+                next_target,
+                next_reason,
+            )
+            if await self._try_session_load(next_target, cwd):
+                return await _succeed(
+                    next_target, f"session/load after fail ({next_reason})"
+                )
+            if next_target in self._unresumable_session_ids:
+                self._drop_unresumable_from_hub_ids(next_target)
 
         # Only mint new when continuity load is exhausted.
         log.error(
@@ -1126,6 +1255,15 @@ class Hub:
         )
         return agent_sid
 
+    def _ensure_lock_for(self, cwd: str, view_session_id: str) -> asyncio.Lock:
+        """Return single-flight lock for ensure, keyed by cwd (or view fallback)."""
+        key = self._cwd_key(cwd) or f"view:{(view_session_id or '').strip() or '_'}"
+        lock = self._ensure_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._ensure_locks[key] = lock
+        return lock
+
     async def _ensure_hub_agent_session(
         self,
         view_session_id: str,
@@ -1133,12 +1271,32 @@ class Hub:
         ws: web.WebSocketResponse | None = None,
         *,
         notify_switch: bool = True,
-    ) -> tuple[str, bool, str]:
-        """Return (live_session_id, switched, reason) safe for session/prompt.
+    ) -> tuple[str, bool, str, str]:
+        """Return (live_session_id, switched, reason, ensure_action) safe for session/prompt.
 
         Process-live: reuse. Hub-owned after restart: session/load same id.
         Foreign/CLI or load failure: session/new. Optionally notify session_switch.
+        Concurrent ensure for the same cwd is single-flight (one load/new).
+        ensure_action is the path taken: reuse | load | new.
         """
+        lock = self._ensure_lock_for(cwd, view_session_id)
+        async with lock:
+            return await self._ensure_hub_agent_session_locked(
+                view_session_id,
+                cwd,
+                ws,
+                notify_switch=notify_switch,
+            )
+
+    async def _ensure_hub_agent_session_locked(
+        self,
+        view_session_id: str,
+        cwd: str,
+        ws: web.WebSocketResponse | None = None,
+        *,
+        notify_switch: bool = True,
+    ) -> tuple[str, bool, str, str]:
+        """Ensure body (caller holds per-cwd lock)."""
         view_origin = read_hub_origin(self.config.sessions_root, view_session_id)
         key = self._cwd_key(cwd)
         remote_id = self.remote_agent_session.get(key) if key else None
@@ -1153,6 +1311,7 @@ class Hub:
             view_hub_origin=view_origin or None,
             remote_hub_origin=remote_origin or None,
             hub_owned_ids=self.hub_owned_session_ids,
+            unresumable_ids=self._unresumable_session_ids,
         )
         log.info(
             "ensure action=%s reason=%s view=%s target=%s acp=%s",
@@ -1163,10 +1322,12 @@ class Hub:
             self.acp.connected,
         )
 
+        ensure_action = action
         if action == "reuse" and target:
             agent_sid = target
             # Keep byCwd aligned with the working session (view wins).
             self._record_hub_session(agent_sid, cwd)
+            ensure_action = "reuse"
             log.info(
                 "Reuse hub remote session %s for view %s cwd=%s reason=%s",
                 agent_sid,
@@ -1183,12 +1344,21 @@ class Hub:
             )
             if agent_sid != target:
                 reason = "resume_failed"
+                # byCwd already updated via _record_hub_session inside load/fallback
+                # Path may have reused process-live or minted new after load fail.
+                if agent_sid in self.acp_created_sessions and agent_sid != target:
+                    # If target was never warm and we only reused another live id,
+                    # still report load (cold attempt) unless pure process-live reuse.
+                    ensure_action = "load"
+            else:
+                ensure_action = "load"
         else:
             agent_sid = await self.acp.session_new(cwd)
             self._record_hub_session(agent_sid, cwd)
             self._stamp_origin_sync(agent_sid, "attach")
             asyncio.create_task(self._stamp_origin_with_retry(agent_sid, "attach"))
             reason = "need_session_new"
+            ensure_action = "new"
             log.info(
                 "Created hub remote session %s for view %s cwd=%s",
                 agent_sid,
@@ -1199,7 +1369,15 @@ class Hub:
         switched = agent_sid != view_session_id
         switch_reason = "hub_session"
         if switched:
-            if reason == "resume_failed":
+            view = str(view_session_id or "").strip()
+            # Missing on disk or permanently unresumable → force client pin (not soft-map).
+            view_dead = bool(view) and (
+                view in self._unresumable_session_ids
+                or find_session(self.config.sessions_root, view) is None
+            )
+            if view_dead:
+                switch_reason = "dead_view"
+            elif reason == "resume_failed":
                 switch_reason = "resume_failed"
             elif reason in (
                 "reuse_cwd",
@@ -1230,7 +1408,7 @@ class Hub:
         else:
             switch_reason = "hub_session"
 
-        return agent_sid, switched, switch_reason
+        return agent_sid, switched, switch_reason, ensure_action
 
     def build_app(self) -> web.Application:
         app = web.Application(middlewares=[self._auth_middleware])
@@ -2425,16 +2603,24 @@ class Hub:
                 )
                 await self.broadcast(self.status_payload())
 
+        t0 = time.monotonic()
         try:
-            live_id, switched, reason = await self._ensure_hub_agent_session(
-                view_session_id,
-                cwd,
-                ws=None,
-                notify_switch=True,
+            live_id, switched, reason, ensure_action = (
+                await self._ensure_hub_agent_session(
+                    view_session_id,
+                    cwd,
+                    ws=None,
+                    notify_switch=True,
+                )
             )
         except Exception as exc:
             log.exception("attach failed view=%s", view_session_id)
             return web.json_response({"error": str(exc)}, status=500)
+        ensure_ms = (time.monotonic() - t0) * 1000.0
+        live_hot = is_live_hot_path(
+            ensure_action=ensure_action,
+            acp_connected=self.acp.connected,
+        )
 
         cmds = list(self.acp.available_commands or [])
         if cmds:
@@ -2457,6 +2643,9 @@ class Hub:
                 "cwd": cwd,
                 "message": message,
                 "commands": cmds,
+                "ensureMs": ensure_ms,
+                "ensureAction": ensure_action,
+                "liveHotPath": live_hot,
             }
         )
 
@@ -2836,7 +3025,21 @@ class Hub:
         After successful load, wait for quiet-period suppress to finish so
         history flush does not leak into the re-prompt (session_prompt also
         waits via wait_load_suppress_settled). Do not force-release in finally.
+
+        Permanent unresumable (already marked or first load FS_NOT_FOUND):
+        return healed=False immediately — no ACP reconnect (would drop other
+        sessions' WS) and no second load attempt.
         """
+        sid = str(session_id or "").strip()
+        if sid and sid in self._unresumable_session_ids:
+            self._drop_unresumable_from_hub_ids(sid)
+            log.warning(
+                "no-output heal: session already unresumable session=%s; "
+                "skip reconnect",
+                sid,
+            )
+            return False
+
         # Dead/stuck worker may still look "loaded"; force a real reload.
         self.acp.forget_warm_session(session_id)
         if await self._try_session_load(session_id, cwd):
@@ -2845,6 +3048,17 @@ class Hub:
             log.info("no-output heal: session/load ok session=%s", session_id)
             await self.acp.wait_load_suppress_settled(session_id)
             return True
+
+        # Permanent FS/path failure: do not reconnect ACP.
+        if sid and sid in self._unresumable_session_ids:
+            self._drop_unresumable_from_hub_ids(sid)
+            log.warning(
+                "no-output heal: permanent load failure session=%s; "
+                "skip reconnect",
+                sid,
+            )
+            return False
+
         log.warning(
             "no-output heal: session/load failed session=%s; reconnecting ACP",
             session_id,
@@ -2865,6 +3079,8 @@ class Hub:
             )
             await self.acp.wait_load_suppress_settled(session_id)
             return True
+        if sid and sid in self._unresumable_session_ids:
+            self._drop_unresumable_from_hub_ids(sid)
         log.warning(
             "no-output heal: session/load still failed session=%s", session_id
         )
@@ -2901,6 +3117,31 @@ class Hub:
             session_id, cwd or ""
         )
         if not healed:
+            sid = str(session_id or "").strip()
+            # Permanent unresumable: re-prompt will hang again — skip it.
+            if sid and sid in self._unresumable_session_ids:
+                log.warning(
+                    "no-output heal permanent unresumable session=%s; "
+                    "skip re-prompt",
+                    session_id,
+                )
+                if self.acp.is_session_active(session_id):
+                    await self.acp.end_turn(
+                        session_id,
+                        "no-output recovery: permanent unresumable, skip re-prompt",
+                    )
+                await self._broadcast_turn(
+                    session_id,
+                    "idle",
+                    NO_OUTPUT_RETRY_FAILED_MSG,
+                    also_session_id=view_session_id,
+                )
+                await self._emit_error(
+                    NO_OUTPUT_RETRY_FAILED_MSG,
+                    session_id=session_id,
+                    level="warning",
+                )
+                return False
             log.warning(
                 "no-output heal incomplete session=%s; still retrying prompt",
                 session_id,
@@ -2978,8 +3219,10 @@ class Hub:
         session_id = view_session_id
         t0 = time.monotonic()
         try:
-            session_id, _switched, _reason = await self._ensure_hub_agent_session(
-                view_session_id, cwd, ws=ws, notify_switch=True
+            session_id, _switched, _reason, _action = (
+                await self._ensure_hub_agent_session(
+                    view_session_id, cwd, ws=ws, notify_switch=True
+                )
             )
         except Exception as exc:
             log.exception("ensure hub agent session failed for compact view=%s", view_session_id)
@@ -3222,8 +3465,10 @@ class Hub:
         # Hub-owned session for prompts (CLI / foreign ids cannot be prompted)
         t0 = time.monotonic()
         try:
-            session_id, _switched, _reason = await self._ensure_hub_agent_session(
-                view_session_id, cwd, ws=ws, notify_switch=True
+            session_id, _switched, _reason, _action = (
+                await self._ensure_hub_agent_session(
+                    view_session_id, cwd, ws=ws, notify_switch=True
+                )
             )
         except Exception as exc:
             log.exception("ensure hub agent session failed view=%s", view_session_id)
