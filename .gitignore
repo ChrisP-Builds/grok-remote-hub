@@ -42,6 +42,11 @@ mcps/
 playwright-report/
 test-results/
 .playwright/
+.playwright-mcp/
+# Root lab probes / dumps (broad; product scripts are not underscore-prefixed)
+/_*.py
+/_*.txt
+1.49.0
 node_modules/
 package-lock.json
 npm_install_log.txt

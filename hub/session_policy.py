@@ -47,11 +47,6 @@ def is_live_hot_path(*, ensure_action: str, acp_connected: bool) -> bool:
     return bool(acp_connected) and str(ensure_action or "").strip().lower() == "reuse"
 
 
-def ensure_action_blocks_prompt(ensure_action: str) -> bool:
-    """True when ensure may perform multi-second I/O (session/load or session/new)."""
-    return str(ensure_action or "").strip().lower() in ("load", "new")
-
-
 def should_skip_session_load(warm_set: set[str] | frozenset[str], session_id: str) -> bool:
     """True when this process already session/new or session/load'd session_id.
 
@@ -100,29 +95,6 @@ def apply_turn_activity(
         meta["first_update_at"] = float(now)
         return True
     return False
-
-
-def split_prompt_latency(
-    *,
-    ensure_seconds: float | None,
-    prompt_send_seconds: float | None,
-    agent_first_seconds: float | None,
-) -> dict[str, float | None]:
-    """Return hubSeconds (ensure+send), agentSeconds (first agent update after send), totalSeconds."""
-    hub: float | None = None
-    if ensure_seconds is not None or prompt_send_seconds is not None:
-        hub = float(ensure_seconds or 0.0) + float(prompt_send_seconds or 0.0)
-    agent: float | None = None
-    if agent_first_seconds is not None:
-        agent = float(agent_first_seconds)
-    total: float | None = None
-    if hub is not None and agent is not None:
-        total = hub + agent
-    return {
-        "hubSeconds": hub,
-        "agentSeconds": agent,
-        "totalSeconds": total,
-    }
 
 
 def no_output_seconds_for_session(
@@ -312,21 +284,6 @@ def should_auto_retry_no_output(
     if already_retried:
         return False
     return is_no_output_error_message(exc)
-
-
-def needs_fresh_agent_session(session_id: str | None, created_set: set[str] | frozenset[str]) -> bool:
-    """True when this hub process never created the session via session/new.
-
-    CLI-originated (or other-process) sessions must not receive session/prompt
-    via session/load; agent serve hangs with zero session/update. View history
-    is fine; prompting requires a hub-managed agent session.
-    """
-    if not session_id:
-        return True
-    sid = str(session_id).strip()
-    if not sid:
-        return True
-    return sid not in created_set
 
 
 def is_hub_resume_candidate(

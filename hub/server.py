@@ -416,22 +416,6 @@ class Hub:
             return None
         return None
 
-    def _session_updates_bytes(self, session_id: str | None) -> int | None:
-        """Size of updates.jsonl for a session, or None if unknown."""
-        sid = str(session_id or "").strip()
-        if not sid:
-            return None
-        try:
-            session_dir = self._resolve_loaded_session_dir(sid)
-            if session_dir is None:
-                return None
-            updates = session_dir / "updates.jsonl"
-            if updates.is_file():
-                return int(updates.stat().st_size)
-        except OSError:
-            return None
-        return None
-
     def status_payload(self) -> dict[str, Any]:
         mapped, live = self._map_agent_from_live()
         compat = self.compat or {}
@@ -1872,6 +1856,7 @@ class Hub:
             return web.json_response({"error": "session not found"}, status=404)
 
         self.acp_created_sessions.discard(session_id)
+        self._acp_dedupe.clear_session(session_id)
         removed_keys = [
             key
             for key, sid in list(self.remote_agent_session.items())
@@ -2921,11 +2906,7 @@ class Hub:
                 session_id,
             )
 
-        updates_bytes = self._session_updates_bytes(session_id)
-        retry_thr = max(
-            NO_OUTPUT_RETRY_SECONDS,
-            no_output_seconds_for_session(updates_bytes=updates_bytes),
-        )
+        retry_thr = max(NO_OUTPUT_RETRY_SECONDS, no_output_seconds_for_session())
         try:
             await self.acp.session_prompt(
                 session_id,
@@ -3318,8 +3299,7 @@ class Hub:
             )
 
         # ensure path session/new'd if needed; multi-session agent holds id without load.
-        updates_bytes = self._session_updates_bytes(session_id)
-        thr = no_output_seconds_for_session(updates_bytes=updates_bytes)
+        thr = no_output_seconds_for_session()
         try:
             await self.acp.session_prompt(
                 session_id,

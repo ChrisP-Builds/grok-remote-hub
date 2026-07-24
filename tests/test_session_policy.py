@@ -20,7 +20,6 @@ from hub.session_policy import (
     apply_turn_activity,
     counts_toward_agent_ttfb,
     cwd_key,
-    ensure_action_blocks_prompt,
     entry_requires_resume_choice,
     is_hub_resume_candidate,
     is_live_hot_path,
@@ -28,7 +27,6 @@ from hub.session_policy import (
     is_turn_stuck_for_new_prompt,
     load_hub_session_ids,
     load_remote_sessions,
-    needs_fresh_agent_session,
     no_output_seconds_for_session,
     recovery_keeps_session_id,
     resolve_ensure_action,
@@ -39,7 +37,6 @@ from hub.session_policy import (
     should_clear_turn_on_wake,
     should_force_clear_turn,
     should_skip_session_load,
-    split_prompt_latency,
     turn_telemetry,
 )
 
@@ -160,29 +157,6 @@ def test_turn_telemetry_no_activity_stamp_uses_age_for_silence() -> None:
     assert tel["ageSeconds"] == 12.0
     assert tel["silenceSeconds"] == 12.0
     assert tel["ttfbSeconds"] is None
-
-
-def test_needs_fresh_when_empty_id() -> None:
-    assert needs_fresh_agent_session(None, set()) is True
-    assert needs_fresh_agent_session("", set()) is True
-    assert needs_fresh_agent_session("   ", set()) is True
-
-
-def test_needs_fresh_when_not_in_created_set() -> None:
-    created = {"hub-aaa", "hub-bbb"}
-    assert needs_fresh_agent_session("cli-session-xyz", created) is True
-    assert needs_fresh_agent_session("019f493c-af12-7652-a6d8-bf645c10921c", created) is True
-
-
-def test_no_fresh_when_hub_created() -> None:
-    created = {"hub-aaa", "hub-bbb"}
-    assert needs_fresh_agent_session("hub-aaa", created) is False
-    assert needs_fresh_agent_session("hub-bbb", created) is False
-
-
-def test_created_set_is_process_local_without_restore() -> None:
-    # Without loading remote-sessions.json, empty set means all need fresh.
-    assert needs_fresh_agent_session("hub-from-prior-process", set()) is True
 
 
 def test_is_hub_resume_candidate_true_paths() -> None:
@@ -449,17 +423,15 @@ def test_resolve_ensure_reuse_cwd_process_live() -> None:
 
 
 def test_multi_turn_same_hub_session_no_fresh() -> None:
-    """Two prompts on same hub session: needs_fresh stays false; view live → hub_session."""
+    """Two prompts on same hub session: view live → hub_session both turns."""
     hub_id = "hub-multi-turn"
     created = {hub_id}
     remote = {cwd_key(r"D:\Projects\X"): hub_id}
 
-    assert needs_fresh_agent_session(hub_id, created) is False
     live1, n1, r1 = resolve_live_session_id(hub_id, r"D:\Projects\X", created, remote)
     assert live1 == hub_id and n1 is False and r1 == "hub_session"
 
     # Second turn: same state
-    assert needs_fresh_agent_session(hub_id, created) is False
     live2, n2, r2 = resolve_live_session_id(hub_id, r"D:\Projects\X", created, remote)
     assert live2 == hub_id and n2 is False and r2 == "hub_session"
     assert live1 == live2
@@ -1042,15 +1014,6 @@ def test_is_live_hot_path_reuse_only() -> None:
     assert HOT_PATH_MAX_HUB_PRE_PROMPT_S < NO_OUTPUT_SECONDS
 
 
-def test_ensure_action_blocks_prompt() -> None:
-    assert ensure_action_blocks_prompt("load") is True
-    assert ensure_action_blocks_prompt("new") is True
-    assert ensure_action_blocks_prompt("LOAD") is True
-    assert ensure_action_blocks_prompt("reuse") is False
-    assert ensure_action_blocks_prompt("") is False
-    assert ensure_action_blocks_prompt("hub_session") is False
-
-
 def test_counts_toward_agent_ttfb() -> None:
     assert counts_toward_agent_ttfb(None) is True
     assert counts_toward_agent_ttfb("") is True
@@ -1095,36 +1058,6 @@ def test_apply_turn_activity_none_kind_is_agent() -> None:
     assert meta["first_update_at"] == 3.0
 
 
-def test_split_prompt_latency() -> None:
-    both_none = split_prompt_latency(
-        ensure_seconds=None, prompt_send_seconds=None, agent_first_seconds=None
-    )
-    assert both_none["hubSeconds"] is None
-    assert both_none["agentSeconds"] is None
-    assert both_none["totalSeconds"] is None
-
-    hub_only = split_prompt_latency(
-        ensure_seconds=0.001, prompt_send_seconds=None, agent_first_seconds=None
-    )
-    assert hub_only["hubSeconds"] == 0.001
-    assert hub_only["agentSeconds"] is None
-    assert hub_only["totalSeconds"] is None
-
-    send_only = split_prompt_latency(
-        ensure_seconds=None, prompt_send_seconds=0.002, agent_first_seconds=30.0
-    )
-    assert send_only["hubSeconds"] == 0.002
-    assert send_only["agentSeconds"] == 30.0
-    assert send_only["totalSeconds"] == 30.002
-
-    full = split_prompt_latency(
-        ensure_seconds=0.001, prompt_send_seconds=0.001, agent_first_seconds=29.5
-    )
-    assert full["hubSeconds"] == 0.002
-    assert full["agentSeconds"] == 29.5
-    assert full["totalSeconds"] == 29.502
-
-
 def test_resolve_ensure_process_live_is_reuse() -> None:
     """Alias clarity: view in created_set => action reuse (hot path)."""
     created = {"hub-live-1"}
@@ -1137,7 +1070,6 @@ def test_resolve_ensure_process_live_is_reuse() -> None:
     assert target == "hub-live-1"
     assert action == "reuse"
     assert reason == "hub_session"
-    assert ensure_action_blocks_prompt(action) is False
     assert is_live_hot_path(ensure_action=action, acp_connected=True) is True
 
 

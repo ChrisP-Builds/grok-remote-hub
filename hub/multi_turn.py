@@ -7,8 +7,6 @@ this module still ensures the hub does not globally block different projects.
 
 from __future__ import annotations
 
-from typing import Iterable
-
 STATUS_WORKING = "working"
 STATUS_QUESTION = "question"
 STATUS_IDLE = "idle"
@@ -20,7 +18,6 @@ __all__ = (
     "session_status_flag",
     "can_start_concurrent_turn",
     "merge_session_flags",
-    "LiveTurnRegistry",
 )
 
 
@@ -84,66 +81,3 @@ def merge_session_flags(
             has_pending_question=sid in pending,
         )
     return out
-
-
-class LiveTurnRegistry:
-    """In-memory tracker for active turns and pending user questions."""
-
-    def __init__(self) -> None:
-        # session_id -> cwd_key
-        self._active: dict[str, str] = {}
-        self._pending_questions: set[str] = set()
-
-    def start_turn(self, session_id: str, cwd_key: str = "") -> None:
-        sid = str(session_id or "")
-        if not sid:
-            return
-        self._active[sid] = str(cwd_key or "")
-
-    def end_turn(self, session_id: str) -> None:
-        sid = str(session_id or "")
-        if sid:
-            self._active.pop(sid, None)
-
-    def set_question(self, session_id: str) -> None:
-        sid = str(session_id or "")
-        if sid:
-            self._pending_questions.add(sid)
-
-    def clear_question(self, session_id: str) -> None:
-        sid = str(session_id or "")
-        if sid:
-            self._pending_questions.discard(sid)
-
-    def clear_all(self) -> None:
-        self._active.clear()
-        self._pending_questions.clear()
-
-    def is_active(self, session_id: str) -> bool:
-        return str(session_id or "") in self._active
-
-    def active_count(self) -> int:
-        return len(self._active)
-
-    def active_by_session(self) -> dict[str, str]:
-        return dict(self._active)
-
-    def active_session_ids(self) -> set[str]:
-        return set(self._active.keys())
-
-    def pending_question_sessions(self) -> set[str]:
-        return set(self._pending_questions)
-
-    def flag_for(self, session_id: str) -> str:
-        sid = str(session_id or "")
-        return session_status_flag(
-            turn_running=sid in self._active,
-            has_pending_question=sid in self._pending_questions,
-        )
-
-    def flags_for(self, session_ids: Iterable[str]) -> dict[str, str]:
-        return merge_session_flags(
-            [str(s) for s in session_ids],
-            active_sessions=self.active_session_ids(),
-            pending_question_sessions=self.pending_question_sessions(),
-        )

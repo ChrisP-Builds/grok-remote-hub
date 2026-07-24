@@ -59,6 +59,6 @@ def test_css_version_and_banner() -> None:
 def test_readme_product_scope() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     # Product scope is stated in plain language (heading optional).
-    assert "remote control of the agent stream" in readme
+    assert "remote control plane for the agent stream" in readme
     assert "not full tui parity" in readme.lower()
     assert "/api/compat" in readme

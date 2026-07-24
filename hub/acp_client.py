@@ -35,6 +35,7 @@ from hub.status_view import (
     ACP_PROBE_TIMEOUT_S,
     LOAD_SUPPRESS_MAX_S,
     LOAD_SUPPRESS_QUIET_S,
+    load_suppress_should_release,
     should_probe_acp_liveness,
     should_suppress_session_load_fanout,
 )
@@ -1383,9 +1384,18 @@ class AcpClient:
             return
         now = time.monotonic()
         deadline = self._load_suppress_deadline.get(sid)
-        if deadline is not None and now >= deadline:
-            self.release_load_suppress(sid)
-            return
+        # No deadline yet (mid session/load before finally): do not force-release.
+        # Missing deadline must not be treated as held_s=max.
+        if deadline is not None:
+            held_s = now - (deadline - LOAD_SUPPRESS_MAX_S)
+            if load_suppress_should_release(
+                quiet_elapsed_s=0.0,  # rearm means frame just arrived
+                quiet_s=LOAD_SUPPRESS_QUIET_S,
+                held_s=held_s,
+                max_s=LOAD_SUPPRESS_MAX_S,
+            ):
+                self.release_load_suppress(sid)
+                return
         prev = self._load_release_handles.pop(sid, None)
         if prev is not None:
             prev.cancel()

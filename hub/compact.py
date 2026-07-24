@@ -20,13 +20,9 @@ _COMPACT_STATES = {
 HUB_COMPACT_GATE_INFLIGHT_S = 3600.0
 HUB_COMPACT_GATE_GRACE_S = 15.0
 
-# Must match static/app.js COMPACT_TERMINAL_MSG_DEDUPE_MS (terminal line dedupe).
-COMPACT_TERMINAL_MSG_DEDUPE_MS = 12000
-
 _COMPACT_NOTIFICATION_BLOCKED_STATES = frozenset(
     {"started", "completed", "failed", "cancelled"}
 )
-_DID_NOT_FREE_RE = re.compile(r"did not free context", re.I)
 
 
 def hub_compact_gate_set_inflight(
@@ -63,36 +59,6 @@ def hub_compact_gate_suppresses_notification(
         gate.pop(session_id, None)
         return False
     return body_state in _COMPACT_NOTIFICATION_BLOCKED_STATES
-
-
-def compact_terminal_message_should_emit(
-    last_by_sid: dict[str, dict[str, Any]],
-    session_id: str | None,
-    message: str,
-    *,
-    now_ms: int,
-    window_ms: int = COMPACT_TERMINAL_MSG_DEDUPE_MS,
-) -> bool:
-    """UI-equivalent terminal line gate.
-
-    False if same trimmed text OR both match /did not free context/i within
-    window_ms. On True (and non-empty trimmed text), update last_by_sid[sid]
-    to {text, at}. Mirror of static/app.js allowCompactSystemLine terminal branch.
-    """
-    msg_text = (message or "").strip()
-    sid = str(session_id or "")
-    if msg_text:
-        prev = last_by_sid.get(sid)
-        if prev is not None and (now_ms - int(prev.get("at") or 0)) < window_ms:
-            prev_text = str(prev.get("text") or "")
-            if prev_text == msg_text:
-                return False
-            if _DID_NOT_FREE_RE.search(prev_text) and _DID_NOT_FREE_RE.search(
-                msg_text
-            ):
-                return False
-        last_by_sid[sid] = {"text": msg_text, "at": now_ms}
-    return True
 
 
 def parse_compact_slash(text: str) -> dict[str, str] | None:

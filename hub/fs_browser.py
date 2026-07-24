@@ -324,7 +324,7 @@ def write_upload_bytes(
 
     safe_name = sanitize_upload_filename(filename)
     ext = Path(safe_name).suffix.lower()
-    if ext not in UPLOAD_ALLOWED_EXTS:
+    if not is_upload_allowed_ext(safe_name):
         raise FsBrowserError("unsupported media type", 415)
 
     if ext in UPLOAD_IMAGE_EXTS:

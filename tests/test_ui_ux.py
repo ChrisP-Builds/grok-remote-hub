@@ -853,13 +853,16 @@ def test_js_stream_visibility_contract() -> None:
     assert 'role: "thought"' in thought_chunk or "role: 'thought'" in thought_chunk
     assert "open: true" in thought_chunk
 
-    # handleAcpMessage marks working on stream kinds and dispatches paint
+    # Stream allowlist + handleAcpMessage marks working and dispatches paint
+    assert "STREAM_WORKING_KINDS" in js
+    assert "function isStreamWorkingKind" in js
+    assert '"agent_message_chunk"' in js
+    assert '"agent_thought_chunk"' in js
     handle_idx = js.find("function handleAcpMessage")
     assert handle_idx >= 0
     handle_chunk = js[handle_idx : handle_idx + 3500]
     assert "markSessionActivity" in handle_chunk
-    assert "agent_message_chunk" in handle_chunk
-    assert "agent_thought_chunk" in handle_chunk
+    assert "isStreamWorkingKind(kind)" in handle_chunk
     assert '"working"' in handle_chunk
     assert "processAcpSessionUpdate" in handle_chunk
 
@@ -1029,13 +1032,15 @@ def test_js_session_pills_near_streaming() -> None:
     render_chunk = js[render_idx : render_idx + 2500]
     assert "data-session-id" in render_chunk
 
-    # Stream path marks activity for offscreen sessions
+    # Stream path marks activity for offscreen sessions via allowlist helper
     acp_idx = js.find("function handleAcpMessage")
     assert acp_idx >= 0
     acp_chunk = js[acp_idx : acp_idx + 2500]
     assert 'markSessionActivity(targetId, "working")' in acp_chunk
-    assert "user_message_chunk" in acp_chunk
-    assert "agent_message_chunk" in acp_chunk
+    assert "isStreamWorkingKind(kind)" in acp_chunk
+    assert "STREAM_WORKING_KINDS" in js
+    assert '"user_message_chunk"' in js
+    assert '"agent_message_chunk"' in js
 
 
 def test_server_status_resync_near_streaming() -> None:
