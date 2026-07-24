@@ -502,8 +502,7 @@ def test_server_status_no_context_budget_banner() -> None:
     assert "def _context_budget_payload" not in src
     assert "contextBudget" not in src
     assert "context_budget_level" not in src
-    assert "def _session_updates_bytes" in src
-    assert "updates.jsonl" in src
+    assert "def _session_updates_bytes" not in src
     assert "no_output_seconds_for_session" in src
     assert "NO_OUTPUT_RETRY_SECONDS" in src
 
@@ -642,3 +641,39 @@ def test_wait_load_suppress_settled_noop_when_not_loading() -> None:
         await client.wait_load_suppress_settled("no-such", timeout=1.0)
 
     asyncio.run(run())
+
+
+def test_rearm_without_deadline_does_not_force_release() -> None:
+    """Missing deadline (mid load) must not treat held_s as max and force-release."""
+    import asyncio
+    from hub.acp_client import AcpClient
+    from hub.config import Config
+
+    async def _case() -> None:
+        client = AcpClient(Config(), secret="test")
+        sid = "sess-no-deadline"
+        client._loading_sessions.add(sid)
+        # deliberately no deadline
+        client._rearm_load_suppress_release(sid)
+        assert sid in client._loading_sessions
+        client.release_load_suppress(sid)
+
+    asyncio.run(_case())
+
+
+def test_rearm_past_deadline_releases() -> None:
+    """Max-hold release still fires when deadline is already past."""
+    import asyncio
+    import time
+    from hub.acp_client import AcpClient
+    from hub.config import Config
+
+    async def _past() -> None:
+        client = AcpClient(Config(), secret="test")
+        sid = "sess-past"
+        client._loading_sessions.add(sid)
+        client._load_suppress_deadline[sid] = time.monotonic() - 1.0  # already past
+        client._rearm_load_suppress_release(sid)
+        assert sid not in client._loading_sessions
+
+    asyncio.run(_past())

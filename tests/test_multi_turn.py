@@ -8,7 +8,6 @@ from hub.multi_turn import (
     STATUS_IDLE,
     STATUS_QUESTION,
     STATUS_WORKING,
-    LiveTurnRegistry,
     can_start_concurrent_turn,
     merge_session_flags,
     session_status_flag,
@@ -102,42 +101,6 @@ def test_merge_session_flags():
     assert flags["a"] == STATUS_WORKING
     assert flags["b"] == STATUS_QUESTION
     assert flags["c"] == STATUS_IDLE
-
-
-def test_live_turn_registry_start_end_question():
-    reg = LiveTurnRegistry()
-    assert reg.active_count() == 0
-    assert reg.flag_for("x") == STATUS_IDLE
-
-    reg.start_turn("a", "cwd-a")
-    reg.start_turn("b", "cwd-b")
-    assert reg.active_count() == 2
-    assert reg.is_active("a")
-    assert reg.flag_for("a") == STATUS_WORKING
-    assert reg.flag_for("b") == STATUS_WORKING
-
-    reg.set_question("b")
-    assert reg.flag_for("b") == STATUS_QUESTION
-    assert reg.pending_question_sessions() == {"b"}
-
-    flags = reg.flags_for(["a", "b", "c"])
-    assert flags == {
-        "a": STATUS_WORKING,
-        "b": STATUS_QUESTION,
-        "c": STATUS_IDLE,
-    }
-
-    reg.clear_question("b")
-    assert reg.flag_for("b") == STATUS_WORKING
-
-    reg.end_turn("a")
-    assert not reg.is_active("a")
-    assert reg.active_count() == 1
-    assert reg.active_by_session() == {"b": "cwd-b"}
-
-    reg.clear_all()
-    assert reg.active_count() == 0
-    assert reg.pending_question_sessions() == set()
 
 
 def test_acp_client_turn_running_any_of_two_active():

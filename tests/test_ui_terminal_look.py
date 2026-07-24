@@ -68,15 +68,10 @@ def test_js_term_line_structure() -> None:
     assert "turn-strip" in js or "turnStrip" in js
     assert "beginNewUserTurn" in js
     assert "formatTermPrefix" in js
-    assert "formatToolLine" in js
-    assert "parseSimpleMarkdownTable" in js
     assert "findSimpleMarkdownTables" in js
     assert "splitTextWithMarkdownTables" in js
     assert "finalizeAssistantTables" in js
     assert "bodyEl._rawText = raw" in js
-    assert "shouldShowToolLine" in js
-    # Tools always visible path
-    assert "shouldShowToolLine" in js
     # Collapsible tool rows + plan auto-expand
     assert "createToolLine" in js
     assert "tool-one-liner" in js

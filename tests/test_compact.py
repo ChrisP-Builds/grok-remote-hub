@@ -5,13 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from hub.compact import (
-    COMPACT_TERMINAL_MSG_DEDUPE_MS,
     COMPACT_TOKEN_ABSURD_MAX,
     COMPACT_VS_SIGNALS_SHRINK_SLACK,
     HUB_COMPACT_GATE_GRACE_S,
     HUB_COMPACT_GATE_INFLIGHT_S,
     compact_claims_reduction,
-    compact_terminal_message_should_emit,
     compact_toast_should_claim_window_shrink,
     compact_user_outcome_state,
     extract_compact_update,
@@ -405,7 +403,6 @@ def test_ui_has_compact_handlers() -> None:
     assert "already minimal" not in js
     assert "sanitizeCompactToken" in js
     assert "COMPACT_TOKEN_ABSURD_MAX" in js
-    assert "compactClaimsReduction" in js
     assert "allowCompactSystemLine" in js
     assert "COMPACT_FEEDBACK_COOLDOWN_MS" in js
     # Hub message is authority for completed compact copy.
@@ -665,47 +662,6 @@ def test_hub_compact_gate_grace_window() -> None:
     assert sid not in gate
 
 
-def test_compact_terminal_message_should_emit_dedupes_identical() -> None:
-    last: dict[str, dict] = {}
-    sid = "s1"
-    msg = (
-        "Compact did not free context — session still 421K / 500K (84%)."
-    )
-    assert (
-        compact_terminal_message_should_emit(
-            last, sid, msg, now_ms=1_000
-        )
-        is True
-    )
-    assert (
-        compact_terminal_message_should_emit(
-            last, sid, msg, now_ms=1_000 + 5_000
-        )
-        is False
-    )
-    assert (
-        compact_terminal_message_should_emit(
-            last,
-            sid,
-            msg,
-            now_ms=1_000 + COMPACT_TERMINAL_MSG_DEDUPE_MS,
-        )
-        is True
-    )
-
-
-def test_compact_terminal_message_should_emit_dedupes_both_did_not_free() -> None:
-    last: dict[str, dict] = {}
-    sid = "s2"
-    a = "Compact did not free context — session still 421K / 500K (84%)."
-    b = "Compact did not free context — session still ~400K tokens."
-    assert compact_terminal_message_should_emit(last, sid, a, now_ms=0) is True
-    assert (
-        compact_terminal_message_should_emit(last, sid, b, now_ms=3_000)
-        is False
-    )
-
-
 def test_server_hub_compact_gate_suppresses_notification_terminal() -> None:
     """Hub /compact owns terminal outcome; gate covers in-flight + post grace."""
     root = Path(__file__).resolve().parents[1]
@@ -738,12 +694,11 @@ def test_server_hub_compact_gate_suppresses_notification_terminal() -> None:
 
 
 def test_ui_compact_terminal_message_dedupe() -> None:
-    """UI suppresses duplicate terminal compact lines; window matches Python."""
+    """UI suppresses duplicate terminal compact lines."""
     root = Path(__file__).resolve().parents[1]
     js = (root / "static" / "app.js").read_text(encoding="utf-8")
     assert "COMPACT_TERMINAL_MSG_DEDUPE_MS" in js
     assert "COMPACT_TERMINAL_MSG_DEDUPE_MS = 12000" in js
-    assert COMPACT_TERMINAL_MSG_DEDUPE_MS == 12000
     assert "allowCompactSystemLine" in js
     allow_idx = js.find("function allowCompactSystemLine")
     assert allow_idx > 0

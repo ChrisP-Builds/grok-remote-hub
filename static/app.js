@@ -14,22 +14,8 @@
     return "·";
   }
 
-  function formatToolLine(title, status, summary) {
-    const label = String(title || "tool").trim() || "tool";
-    const parts = [label];
-    const st = String(status || "").trim();
-    if (st) parts.push(`[${st}]`);
-    const snip = String(summary || "").trim();
-    if (snip && !label.includes(snip)) parts.push(snip);
-    return parts.join(" ");
-  }
-
   const PLACEHOLDER_SHORT = "Message…";
   const PLACEHOLDER_FULL = "Message… · / for commands";
-
-  function shouldShowToolLine() {
-    return true;
-  }
 
   /* ANSI SGR parser + safe DOM render (mirror hub/ui_format.py) */
   const _ANSI_FG = {
@@ -771,13 +757,6 @@
       parts.push({ kind: "text", value: lines.slice(cursor).join("\n") });
     }
     return parts.length ? parts : [{ kind: "text", value: s }];
-  }
-
-  /** First-table helper (back-compat); multi-table use find/split. */
-  function parseSimpleMarkdownTable(text) {
-    const found = findSimpleMarkdownTables(text);
-    if (!found.length) return null;
-    return found[0].rows;
   }
 
   function buildTermTableEl(rows) {
@@ -3625,7 +3604,7 @@
     }
     const root = transcriptRoot();
     if (!root) return;
-    const users = root.querySelectorAll(".term-line.user .term-body, .msg-user .term-body");
+    const users = root.querySelectorAll(".term-line.user .term-body");
     const scan = Math.min(users.length, 8);
     for (let i = users.length - 1; i >= users.length - scan && i >= 0; i--) {
       const body = users[i];
@@ -5124,7 +5103,6 @@
   }
 
   function appendToolLine(meta, text) {
-    if (!shouldShowToolLine()) return null;
     noteTermLineActivity();
     // Prefer short label for the name; path/command lives in the one-liner.
     const label = String(meta.label || "").trim();
@@ -5744,10 +5722,6 @@
   // Same terminal text (or both "did not free") shown once per session per window.
   const COMPACT_TERMINAL_MSG_DEDUPE_MS = 12000;
 
-  function compactClaimsReduction(before, after) {
-    return before != null && after != null && Number(after) < Number(before);
-  }
-
   function allowCompactSystemLine(sid, phase, opts) {
     // phase: "started" | "terminal" — at most one of each per session per cooldown.
     // Grounded failed / "did not free context" force-bypass cooldown, but message-
@@ -5952,6 +5926,20 @@
     }
   }
 
+  /** Stream-relevant sessionUpdate kinds that mark a session Working. */
+  const STREAM_WORKING_KINDS = new Set([
+    "user_message_chunk",
+    "agent_message_chunk",
+    "agent_thought_chunk",
+    "plan",
+    "tool_call",
+    "tool_call_update",
+  ]);
+
+  function isStreamWorkingKind(kind) {
+    return STREAM_WORKING_KINDS.has(String(kind || ""));
+  }
+
   function handleAcpMessage(sessionId, message) {
     const method = message.method || "";
     const isSessionUpdate =
@@ -5990,15 +5978,7 @@
 
     // Stream activity → Working pill immediately (including offscreen sessions).
     // markSessionActivity never overwrites question with working.
-    if (
-      kind === "user_message_chunk" ||
-      kind === "agent_message_chunk" ||
-      kind === "agent_thought_chunk" ||
-      kind === "plan" ||
-      kind === "tool_call" ||
-      kind === "tool_call_update" ||
-      kind
-    ) {
+    if (isStreamWorkingKind(kind)) {
       markSessionActivity(targetId, "working");
     }
 
