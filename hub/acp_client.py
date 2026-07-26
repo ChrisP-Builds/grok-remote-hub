@@ -144,6 +144,8 @@ class AcpClient:
         self.on_session_activity: (
             Callable[[str, str | None], Awaitable[None] | None] | None
         ) = None
+        # Hub ops: (reason, session_id_or_None) when a force-clear actually clears.
+        self.on_force_clear: Callable[[str, str | None], None] | None = None
         # session_id -> monotonic last notification activity (orphan/bg work).
         self._bg_activity_at: dict[str, float] = {}
         # session_id -> monotonic first stamp of current bg episode (continuous age).
@@ -511,6 +513,7 @@ class AcpClient:
         if cleared_ids and "acp disconnect" in reason.lower():
             self.disconnect_turn_session_ids = cleared_ids
             self.disconnect_turn_session_id = cleared_ids[0]
+        self._notify_force_clear(reason, cleared_sid)
         return True
 
     def _force_clear_one(self, session_id: str, reason: str) -> bool:
@@ -549,7 +552,17 @@ class AcpClient:
             self.disconnect_turn_session_id = sid
             if sid not in self.disconnect_turn_session_ids:
                 self.disconnect_turn_session_ids.append(sid)
+        self._notify_force_clear(reason, sid)
         return True
+
+    def _notify_force_clear(self, reason: str, session_id: str | None) -> None:
+        cb = self.on_force_clear
+        if cb is None:
+            return
+        try:
+            cb(reason, session_id)
+        except Exception:
+            log.debug("on_force_clear failed", exc_info=True)
 
     def _cancel_stall_watchdog(self, session_id: str | None = None) -> None:
         if session_id is None:

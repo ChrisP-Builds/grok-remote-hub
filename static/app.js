@@ -2160,26 +2160,52 @@
     const restartable =
       !state.restartingAgent &&
       (stateKey === "acp-hung" || stateKey === "agent-down");
+    let tipBase = "Connection status";
     if (restartable) {
       pill.setAttribute("role", "button");
       pill.tabIndex = 0;
-      pill.title = "Restart agent (KillAgent-style)";
+      tipBase = "Restart agent (KillAgent-style)";
       pill.classList.add("status-pill-action");
       pill.classList.remove("is-restarting");
       pill.setAttribute("aria-disabled", "false");
     } else if (state.restartingAgent) {
       pill.setAttribute("role", "button");
       pill.tabIndex = -1;
-      pill.title = "Restarting agent…";
+      tipBase = "Restarting agent…";
       pill.classList.add("status-pill-action", "is-restarting");
       pill.setAttribute("aria-disabled", "true");
     } else {
       pill.removeAttribute("role");
       pill.removeAttribute("tabindex");
-      pill.title = "Connection status";
       pill.classList.remove("status-pill-action", "is-restarting");
       pill.removeAttribute("aria-disabled");
     }
+    // Ops hint: short bootId + uptime from status/health when present.
+    const boot =
+      (state.status && state.status.bootId) || state.bootId || null;
+    const startedAt =
+      (state.status && state.status.startedAt) || null;
+    const upSecs =
+      state.status && state.status.uptimeSeconds != null
+        ? Number(state.status.uptimeSeconds)
+        : startedAt
+          ? Math.max(0, Math.floor((Date.now() - Date.parse(startedAt)) / 1000))
+          : null;
+    const tipParts = [tipBase];
+    if (boot) tipParts.push("boot " + String(boot).slice(0, 8));
+    if (upSecs != null && Number.isFinite(upSecs)) {
+      const h = Math.floor(upSecs / 3600);
+      const m = Math.floor((upSecs % 3600) / 60);
+      const s = Math.floor(upSecs % 60);
+      const upStr =
+        h > 0
+          ? h + "h " + m + "m"
+          : m > 0
+            ? m + "m " + s + "s"
+            : s + "s";
+      tipParts.push("up " + upStr);
+    }
+    pill.title = tipParts.join(" · ");
     updateTurnStrip();
   }
 

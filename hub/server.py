@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import mimetypes
+import os
 import re
 import secrets
 import subprocess
@@ -17,6 +18,7 @@ from aiohttp import WSMsgType, web
 from hub.acp_client import AcpClient
 from hub.agent_supervisor import AgentSupervisor
 from hub.config import Config, PROJECT_ROOT, TAILSCALE_EXE
+from hub.ops_metrics import OpsMetrics
 from hub.fs_browser import (
     RAW_MAX_BYTES,
     FsBrowserError,
@@ -209,9 +211,14 @@ class Hub:
         self.acp.on_user_question = self._on_user_question
         self.acp.on_terminal_out = self._on_terminal_out
         self.acp.on_session_activity = self._on_session_activity
+        self.acp.on_force_clear = self._on_force_clear
+        # Process-local ops counters + event ring (never external backends).
+        self.ops = OpsMetrics(log_dir=getattr(config, "log_dir", None))
         # Debounce status broadcasts from high-rate bg activity (e.g. 8s subagent_progress).
         self._bg_status_broadcast_at: dict[str, float] = {}
         self._had_bg_activity = False
+        # Last ops-reported bg phase per session (transition-only counters).
+        self._ops_bg_phase: dict[str, str] = {}
         self._last_acp_quality: str | None = None
         self._last_heal_skip_reason: str | None = None
         self._acp_dedupe = EventDedupe(maxlen=2000)
@@ -525,7 +532,12 @@ class Hub:
             "hubSessionIds": self._hub_session_ids(50),
             "bootId": self.boot_id,
             "startedAt": self._started_at_iso(),
+            "uptimeSeconds": max(0, int(time.time() - self.started_at)),
         }
+        try:
+            body["opsCounters"] = self.ops.snapshot_counters()
+        except Exception:
+            body["opsCounters"] = {}
         try:
             body["acpTraceRecent"] = self.acp.trace.snapshot(5)
         except Exception:
@@ -658,6 +670,19 @@ class Hub:
             session_id=session_id if isinstance(session_id, str) else None,
         )
 
+    def _on_force_clear(self, reason: str, session_id: str | None) -> None:
+        """Ops hook when AcpClient actually force-clears a turn."""
+        try:
+            self.ops.inc("turn_force_clear")
+            r = str(reason or "")[:200]
+            self.ops.emit(
+                "force_clear",
+                reason=r,
+                sessionId=session_id_slice(session_id),
+            )
+        except Exception:
+            log.debug("ops force_clear hook failed", exc_info=True)
+
     async def _on_session_activity(
         self, session_id: str, kind: str | None
     ) -> None:
@@ -672,6 +697,14 @@ class Hub:
             return
         kind_s = str(kind or "").strip()
         if kind_s == "bg_cleared":
+            try:
+                self.ops.inc("bg_activity_cleared")
+                self.ops.emit(
+                    "bg_cleared", sessionId=session_id_slice(sid)
+                )
+                self._ops_bg_phase.pop(sid, None)
+            except Exception:
+                log.debug("ops bg_cleared failed", exc_info=True)
             try:
                 await self.broadcast(
                     {
@@ -694,6 +727,24 @@ class Hub:
                 )
             return
         phase = self.acp.bg_activity_phase_for(sid)
+        try:
+            prev = self._ops_bg_phase.get(sid)
+            if phase in ("working", "stuck") and phase != prev:
+                self._ops_bg_phase[sid] = phase
+                if phase == "working":
+                    self.ops.inc("bg_activity_working")
+                    self.ops.emit(
+                        "bg_working", sessionId=session_id_slice(sid)
+                    )
+                elif phase == "stuck":
+                    self.ops.inc("bg_activity_stuck")
+                    self.ops.emit(
+                        "bg_stuck", sessionId=session_id_slice(sid)
+                    )
+            elif phase not in ("working", "stuck"):
+                self._ops_bg_phase.pop(sid, None)
+        except Exception:
+            log.debug("ops bg phase failed", exc_info=True)
         label = bg_activity_label(kind)
         try:
             await self.broadcast(
@@ -1033,11 +1084,21 @@ class Hub:
             except Exception:
                 dead.append(ws)
         for ws in dead:
+            try:
+                self.ops.inc("ws_client_reset")
+            except Exception:
+                pass
             await self._drop_client(ws)
 
     async def _drop_client(self, ws: web.WebSocketResponse) -> None:
+        was_present = ws in self.clients
         self.clients.discard(ws)
         self.subscriptions.pop(ws, set())
+        if was_present:
+            try:
+                self.ops.inc("ws_disconnect")
+            except Exception:
+                pass
         try:
             await ws.close()
         except Exception:
@@ -1477,6 +1538,26 @@ class Hub:
                 cwd,
             )
 
+        # Ops: ensure path outcome (resume_failed is additive to load/new).
+        try:
+            if reason == "resume_failed":
+                self.ops.inc("ensure_resume_failed")
+            if ensure_action == "reuse":
+                self.ops.inc("ensure_reuse")
+            elif ensure_action == "load":
+                self.ops.inc("ensure_load")
+            elif ensure_action == "new":
+                self.ops.inc("ensure_new")
+            self.ops.emit(
+                "ensure",
+                action=ensure_action,
+                reason=str(reason or "")[:120],
+                sessionId=session_id_slice(agent_sid),
+                viewSessionId=session_id_slice(view_session_id),
+            )
+        except Exception:
+            log.debug("ops ensure emit failed", exc_info=True)
+
         switched = agent_sid != view_session_id
         switch_reason = "hub_session"
         if switched:
@@ -1508,6 +1589,16 @@ class Hub:
                     "cwd": cwd,
                     "message": REMOTE_SESSION_SYSTEM_NOTE,
                 }
+                try:
+                    self.ops.inc("session_switch")
+                    self.ops.emit(
+                        "session_switch",
+                        reason=switch_reason,
+                        fromSessionId=session_id_slice(view_session_id),
+                        toSessionId=session_id_slice(agent_sid),
+                    )
+                except Exception:
+                    log.debug("ops session_switch failed", exc_info=True)
                 await self.broadcast(switch)
                 if ws is not None:
                     self.subscriptions.setdefault(ws, set()).add(agent_sid)
@@ -1542,6 +1633,7 @@ class Hub:
         app.router.add_post("/api/admin/reconnect-acp", self.handle_reconnect_acp)
         app.router.add_post("/api/admin/restart-agent", self.handle_restart_agent)
         app.router.add_get("/api/admin/acp-trace", self.handle_acp_trace)
+        app.router.add_get("/api/admin/diagnostics", self.handle_diagnostics)
         app.router.add_get("/api/projects", self.handle_projects)
         app.router.add_get("/api/projects/browse", self.handle_projects_browse)
         app.router.add_post("/api/projects", self.handle_create_project)
@@ -1602,6 +1694,16 @@ class Hub:
         self._status_resync_task = asyncio.create_task(
             self._status_resync_loop(), name="hub-status-resync"
         )
+        try:
+            self.ops.emit(
+                "hub_start",
+                bootId=self.boot_id,
+                hubVersion=HUB_VERSION,
+                bind=self.bind_mode,
+                port=self.config.bind_port,
+            )
+        except Exception:
+            log.debug("ops hub_start emit failed", exc_info=True)
         log.info(
             "compat structural ok=%s hub=%s cli=%s issues=%s",
             self.compat.get("ok"),
@@ -1751,6 +1853,15 @@ class Hub:
             disconnected_for if disconnected_for is not None else -1.0,
         )
         try:
+            self.ops.inc("acp_heal_attempt")
+            self.ops.emit(
+                "acp_heal_attempt",
+                attempts=n,
+                max_attempts=self._acp_heal_max,
+            )
+        except Exception:
+            pass
+        try:
             self.acp._trace(
                 "heal_start",
                 attempts=n,
@@ -1767,12 +1878,26 @@ class Hub:
                 log.info("ACP heal: reconnect ok n=%s", n)
                 self._acp_heal_last_error = None
                 try:
+                    self.ops.inc("acp_heal_ok")
+                    self.ops.emit("acp_heal_ok", attempts=n)
+                except Exception:
+                    pass
+                try:
                     self.acp._trace("heal_ok", attempts=n)
                 except Exception:
                     pass
             else:
                 self._acp_heal_last_error = "reconnect returned without connection"
                 log.warning("ACP heal: failed n=%s: %s", n, self._acp_heal_last_error)
+                try:
+                    self.ops.inc("acp_heal_fail")
+                    self.ops.emit(
+                        "acp_heal_fail",
+                        attempts=n,
+                        error=self._acp_heal_last_error,
+                    )
+                except Exception:
+                    pass
                 try:
                     self.acp._trace(
                         "heal_fail",
@@ -1784,6 +1909,13 @@ class Hub:
         except Exception as exc:
             self._acp_heal_last_error = str(exc)
             log.warning("ACP heal: failed n=%s: %s", n, exc)
+            try:
+                self.ops.inc("acp_heal_fail")
+                self.ops.emit(
+                    "acp_heal_fail", attempts=n, error=str(exc)[:200]
+                )
+            except Exception:
+                pass
             try:
                 self.acp._trace("heal_fail", attempts=n, error=str(exc)[:200])
             except Exception:
@@ -1808,7 +1940,8 @@ class Hub:
     async def handle_index(self, request: web.Request) -> web.FileResponse:
         return web.FileResponse(Path(self.config.static_dir) / "index.html")
 
-    async def handle_health(self, request: web.Request) -> web.Response:
+    def _health_body(self) -> dict[str, Any]:
+        """Shared health fields for /health and diagnostics."""
         compat = self.compat or {}
         mapped, live = self._map_agent_from_live()
         primary_tel = self._primary_turn_telemetry()
@@ -1859,12 +1992,26 @@ class Hub:
             "productTag": "remote-stream",
             "bootId": self.boot_id,
             "startedAt": self._started_at_iso(),
+            "uptimeSeconds": max(0, int(time.time() - self.started_at)),
+            "pid": os.getpid(),
+            "wsClients": len(self.clients),
         }
+        try:
+            body["opsCounters"] = self.ops.snapshot_counters()
+        except Exception:
+            body["opsCounters"] = {}
+        try:
+            body["opsRecent"] = self.ops.snapshot_events(10)
+        except Exception:
+            body["opsRecent"] = []
         try:
             body["acpTraceRecent"] = self.acp.trace.snapshot(5)
         except Exception:
             body["acpTraceRecent"] = []
-        return web.json_response(body)
+        return body
+
+    async def handle_health(self, request: web.Request) -> web.Response:
+        return web.json_response(self._health_body())
 
     async def handle_acp_trace(self, request: web.Request) -> web.Response:
         """Return recent structured ACP lifecycle events (admin / phone debug)."""
@@ -1879,6 +2026,97 @@ class Hub:
         except Exception:
             events = []
         return web.json_response({"ok": True, "events": events})
+
+    async def handle_diagnostics(self, request: web.Request) -> web.Response:
+        """Unified ops snapshot: counters, events, acp trace, watch state, maps."""
+        try:
+            n_raw = request.rel_url.query.get("n", "50")
+            n = int(n_raw) if n_raw is not None else 50
+        except (TypeError, ValueError):
+            n = 50
+        n = max(1, min(n, 500))
+        try:
+            trace_raw = request.rel_url.query.get("trace", "50")
+            trace_n = int(trace_raw) if trace_raw is not None else 50
+        except (TypeError, ValueError):
+            trace_n = 50
+        trace_n = max(1, min(trace_n, 500))
+
+        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+        log_dir = Path(getattr(self.config, "log_dir", None) or (PROJECT_ROOT / "logs"))
+        try:
+            rel_log = str(log_dir.relative_to(PROJECT_ROOT)).replace("\\", "/")
+        except ValueError:
+            rel_log = "logs"
+
+        watch: dict[str, Any] | None = None
+        watch_path = log_dir / "watch-hub-state.json"
+        try:
+            if watch_path.is_file():
+                raw = watch_path.read_text(encoding="utf-8-sig")
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    # Never surface secrets if a future schema adds them.
+                    watch = {
+                        k: v
+                        for k, v in parsed.items()
+                        if not any(
+                            s in str(k).lower()
+                            for s in ("secret", "token", "password", "authorization")
+                        )
+                    }
+        except Exception:
+            log.debug("diagnostics watch state read failed", exc_info=True)
+            watch = None
+
+        try:
+            acp_trace = self.acp.trace.snapshot(trace_n)
+        except Exception:
+            acp_trace = []
+
+        try:
+            ops_snap = self.ops.snapshot(n)
+        except Exception:
+            ops_snap = {"counters": {}, "events": []}
+
+        # Health without the largest nested blobs for a cleaner top-level shape.
+        health = self._health_body()
+        health.pop("opsCounters", None)
+        health.pop("opsRecent", None)
+        health.pop("acpTraceRecent", None)
+        health.pop("liveTurns", None)
+        health.pop("capacity", None)
+
+        try:
+            bg_working = len(self.acp.live_bg_working_sessions())
+            bg_stuck = len(self.acp.live_bg_stuck_sessions())
+        except Exception:
+            bg_working = 0
+            bg_stuck = 0
+
+        body: dict[str, Any] = {
+            "ok": True,
+            "generatedAt": self._now_iso(),
+            "health": health,
+            "ops": ops_snap,
+            "acpTrace": acp_trace,
+            "watch": watch,
+            "files": {
+                "hubLog": f"{rel_log}/hub-{day}.log",
+                "acpTrace": f"{rel_log}/acp-trace-{day}.jsonl",
+                "opsLog": f"{rel_log}/ops-{day}.jsonl",
+                "watchState": f"{rel_log}/watch-hub-state.json",
+            },
+            "maps": {
+                "byCwdCount": len(self.remote_agent_session),
+                "hubIdsCount": len(self.hub_owned_session_ids),
+                "acpCreatedCount": len(self.acp_created_sessions),
+                "unresumableCount": len(self._unresumable_session_ids),
+                "bgWorkingCount": bg_working,
+                "bgStuckCount": bg_stuck,
+            },
+        }
+        return web.json_response(body)
 
     async def handle_compat(self, request: web.Request) -> web.Response:
         return web.json_response(self.compat or {})
@@ -1978,6 +2216,11 @@ class Hub:
         if self._acp_disconnected_at is None and not self.acp_connected:
             self._acp_disconnected_at = time.monotonic()
         log.info("ACP heal: manual reconnect via POST /api/admin/reconnect-acp")
+        try:
+            self.ops.inc("acp_reconnect")
+            self.ops.emit("acp_reconnect", source="admin")
+        except Exception:
+            pass
         self._acp_heal_in_progress = True
         err: str | None = None
         try:
@@ -2020,6 +2263,14 @@ class Hub:
             return False, "agent restart already in progress"
         self._agent_restart_in_progress = True
         log.warning("restart-agent: begin reason=%s (KillAgent-style, hub stays up)", reason)
+        try:
+            self.ops.inc("agent_restart")
+            self.ops.emit(
+                "agent_restart",
+                reason=str(reason or "")[:200],
+            )
+        except Exception:
+            pass
         err: str | None = None
         try:
             # 1) Drop in-flight turns so clients unlock after kill.
@@ -2797,6 +3048,11 @@ class Hub:
         await ws.prepare(request)
         self.clients.add(ws)
         self.subscriptions[ws] = set()
+        try:
+            self.ops.inc("ws_connect")
+            self.ops.emit("ws_connect", clients=len(self.clients))
+        except Exception:
+            pass
         await ws.send_str(json.dumps(self.status_payload()))
         items = self._scan_sessions()
         await ws.send_str(json.dumps({"type": "sessions", "items": self._sessions_items_with_status()}))
@@ -3248,6 +3504,15 @@ class Hub:
             "no-output: auto-retry starting session=%s (no session/new, no map rewrite)",
             session_id,
         )
+        try:
+            self.ops.inc("prompt_no_output")
+            self.ops.emit(
+                "prompt_no_output",
+                phase="retry_start",
+                sessionId=session_id_slice(session_id),
+            )
+        except Exception:
+            pass
         await self._broadcast_turn(
             session_id,
             "running",
@@ -3301,6 +3566,15 @@ class Hub:
                 no_output_seconds=retry_thr,
             )
             log.info("no-output: auto-retry ok session=%s", session_id)
+            try:
+                self.ops.inc("prompt_ok")
+                self.ops.emit(
+                    "prompt_ok",
+                    sessionId=session_id_slice(session_id),
+                    via="no_output_retry",
+                )
+            except Exception:
+                pass
             await self._broadcast_turn(
                 session_id, "idle", None, also_session_id=view_session_id
             )
@@ -3309,6 +3583,17 @@ class Hub:
             log.exception(
                 "no-output: auto-retry failed session=%s", session_id
             )
+            try:
+                self.ops.inc("prompt_no_output")
+                self.ops.inc("prompt_error")
+                self.ops.emit(
+                    "prompt_no_output",
+                    phase="retry_fail",
+                    sessionId=session_id_slice(session_id),
+                    error=str(retry_exc)[:200],
+                )
+            except Exception:
+                pass
             if self.acp.is_session_active(session_id):
                 await self.acp.end_turn(
                     session_id,
@@ -3698,11 +3983,27 @@ class Hub:
                 no_output_seconds=thr,
             )
             log.info("WS prompt end session=%s ok", session_id)
+            try:
+                self.ops.inc("prompt_ok")
+                self.ops.emit(
+                    "prompt_ok", sessionId=session_id_slice(session_id)
+                )
+            except Exception:
+                pass
             await self._broadcast_turn(
                 session_id, "idle", None, also_session_id=view_session_id
             )
         except Exception as exc:
             log.exception("prompt failed session=%s", session_id)
+            try:
+                self.ops.inc("prompt_error")
+                self.ops.emit(
+                    "prompt_error",
+                    sessionId=session_id_slice(session_id),
+                    error=str(exc)[:200],
+                )
+            except Exception:
+                pass
             if self.acp.is_session_active(session_id):
                 await self.acp.end_turn(
                     session_id, f"prompt exception: {exc}"
@@ -3720,6 +4021,15 @@ class Hub:
             else:
                 err_msg = str(exc)
                 if self._is_no_output_error(exc):
+                    try:
+                        self.ops.inc("prompt_no_output")
+                        self.ops.emit(
+                            "prompt_no_output",
+                            phase="fail",
+                            sessionId=session_id_slice(session_id),
+                        )
+                    except Exception:
+                        pass
                     err_msg = (
                         NO_OUTPUT_RETRY_FAILED_MSG
                         if not _auto_retry

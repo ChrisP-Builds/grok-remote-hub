@@ -98,7 +98,7 @@ Node 18+ (ES modules), stdlib only. Separate from the Python hub on `:8787`.
 - **Sole-writer prompts** — live turns use hub-owned `session/new`
 - **Dual browser, not dual TUI** — phone + desktop share this process; stock TUI is separate
 
-Design write-ups: **[docs/adr/](docs/adr/)** (ADR 001–016).
+Design write-ups: **[docs/adr/](docs/adr/)** (ADR 001–020).
 
 | Path | Live together? | Notes |
 |---|---|---|
