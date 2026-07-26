@@ -7,6 +7,7 @@ from hub.config import Config
 from hub.multi_turn import (
     STATUS_IDLE,
     STATUS_QUESTION,
+    STATUS_STUCK,
     STATUS_WORKING,
     can_start_concurrent_turn,
     merge_session_flags,
@@ -101,6 +102,51 @@ def test_merge_session_flags():
     assert flags["a"] == STATUS_WORKING
     assert flags["b"] == STATUS_QUESTION
     assert flags["c"] == STATUS_IDLE
+
+
+def test_merge_session_flags_background_active():
+    """Orphan subagent/progress after force-clear: background_active → working."""
+    flags = merge_session_flags(
+        ["a", "b", "c", "d"],
+        active_sessions={"a"},
+        pending_question_sessions={"b"},
+        background_active={"c", "b"},  # b also pending: question wins
+    )
+    assert flags["a"] == STATUS_WORKING
+    assert flags["b"] == STATUS_QUESTION
+    assert flags["c"] == STATUS_WORKING
+    assert flags["d"] == STATUS_IDLE
+    # No background_active arg still works (compat)
+    flags2 = merge_session_flags(
+        ["x"],
+        active_sessions=set(),
+        pending_question_sessions=set(),
+    )
+    assert flags2["x"] == STATUS_IDLE
+
+
+def test_merge_session_flags_background_stuck():
+    """Heartbeat-only past grace: background_stuck → stuck (not working)."""
+    flags = merge_session_flags(
+        ["a", "b", "c", "d", "e"],
+        active_sessions={"a"},
+        pending_question_sessions={"b"},
+        background_active={"c"},
+        background_stuck={"d", "b"},  # b also pending: question wins
+    )
+    assert flags["a"] == STATUS_WORKING
+    assert flags["b"] == STATUS_QUESTION
+    assert flags["c"] == STATUS_WORKING
+    assert flags["d"] == STATUS_STUCK
+    assert flags["e"] == STATUS_IDLE
+    # Active turn beats stuck for same sid
+    flags2 = merge_session_flags(
+        ["z"],
+        active_sessions={"z"},
+        pending_question_sessions=set(),
+        background_stuck={"z"},
+    )
+    assert flags2["z"] == STATUS_WORKING
 
 
 def test_acp_client_turn_running_any_of_two_active():

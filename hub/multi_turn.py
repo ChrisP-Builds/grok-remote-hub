@@ -9,11 +9,13 @@ from __future__ import annotations
 
 STATUS_WORKING = "working"
 STATUS_QUESTION = "question"
+STATUS_STUCK = "stuck"
 STATUS_IDLE = "idle"
 
 __all__ = (
     "STATUS_WORKING",
     "STATUS_QUESTION",
+    "STATUS_STUCK",
     "STATUS_IDLE",
     "session_status_flag",
     "can_start_concurrent_turn",
@@ -21,12 +23,19 @@ __all__ = (
 )
 
 
-def session_status_flag(*, turn_running: bool, has_pending_question: bool) -> str:
-    """Return mutually exclusive status: question wins over working; else idle."""
+def session_status_flag(
+    *,
+    turn_running: bool,
+    has_pending_question: bool,
+    background_stuck: bool = False,
+) -> str:
+    """Return mutually exclusive status: question > working > stuck > idle."""
     if has_pending_question:
         return STATUS_QUESTION
     if turn_running:
         return STATUS_WORKING
+    if background_stuck:
+        return STATUS_STUCK
     return STATUS_IDLE
 
 
@@ -69,15 +78,27 @@ def merge_session_flags(
     *,
     active_sessions: set[str],
     pending_question_sessions: set[str],
+    background_active: set[str] | None = None,
+    background_stuck: set[str] | None = None,
 ) -> dict[str, str]:
-    """Map each session id to working | question | idle."""
+    """Map each session id to working | question | stuck | idle.
+
+    Priority: question > working (active turn or bg working) > stuck > idle.
+
+    ``background_active`` sessions (orphan rich/recent subagent work after
+    force-clear) count as working unless a pending question wins.
+    ``background_stuck`` is heartbeat-only past grace (shown as stuck, not working).
+    """
     active = {str(s) for s in (active_sessions or set())}
     pending = {str(s) for s in (pending_question_sessions or set())}
+    bg = {str(s) for s in (background_active or set())}
+    stuck = {str(s) for s in (background_stuck or set())}
     out: dict[str, str] = {}
     for raw in session_ids or []:
         sid = str(raw)
         out[sid] = session_status_flag(
-            turn_running=sid in active,
+            turn_running=(sid in active) or (sid in bg),
             has_pending_question=sid in pending,
+            background_stuck=sid in stuck and sid not in active and sid not in bg,
         )
     return out

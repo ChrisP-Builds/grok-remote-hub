@@ -8,7 +8,9 @@
 # -NoWait: fire-and-forget (agent-owned restarts must use this).
 param(
     [switch]$NoWait,
-    [switch]$KillAgent
+    [switch]$KillAgent,
+    # Explicit KeepAgent (default behavior). Accepted so callers/watchdog can pass -KeepAgent.
+    [switch]$KeepAgent
 )
 
 $ErrorActionPreference = "Stop"

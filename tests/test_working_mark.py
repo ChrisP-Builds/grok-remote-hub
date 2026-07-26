@@ -38,13 +38,16 @@ def _extract_stream_working_kinds(js: str) -> set[str]:
 
 
 def _working_mark_block(js: str) -> str:
-    """Slice around markSessionActivity(..., 'working') near handleAcpMessage."""
+    """Slice around stream-kind markSessionActivity near handleAcpMessage."""
     handle = js.find("function handleAcpMessage")
     assert handle >= 0, "handleAcpMessage not found"
-    mark = js.find('markSessionActivity(targetId, "working")', handle)
+    # Prefer the stream allowlist path (isStreamWorkingKind), not bg-activity only.
+    stream = js.find("isStreamWorkingKind(kind)", handle)
+    assert stream > handle, "isStreamWorkingKind not found in handleAcpMessage"
+    mark = js.find('markSessionActivity(targetId, "working")', stream)
     if mark < 0:
-        mark = js.find("markSessionActivity(targetId, 'working')", handle)
-    assert mark > handle, "Working markSessionActivity not found in handleAcpMessage"
+        mark = js.find("markSessionActivity(targetId, 'working')", stream)
+    assert mark > stream, "Working markSessionActivity not found after isStreamWorkingKind"
     start = max(handle, mark - 400)
     return js[start : mark + 80]
 

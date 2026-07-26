@@ -75,6 +75,7 @@ from hub.session_policy import (
     HOT_PATH_MAX_HUB_PRE_PROMPT_S,
     NO_OUTPUT_RETRY_SECONDS,
     STUCK_TURN_SECONDS,
+    bg_activity_label,
     cwd_key,
     is_hub_resume_candidate,
     is_live_hot_path,
@@ -207,6 +208,10 @@ class Hub:
         )
         self.acp.on_user_question = self._on_user_question
         self.acp.on_terminal_out = self._on_terminal_out
+        self.acp.on_session_activity = self._on_session_activity
+        # Debounce status broadcasts from high-rate bg activity (e.g. 8s subagent_progress).
+        self._bg_status_broadcast_at: dict[str, float] = {}
+        self._had_bg_activity = False
         self._last_acp_quality: str | None = None
         self._last_heal_skip_reason: str | None = None
         self._acp_dedupe = EventDedupe(maxlen=2000)
@@ -296,10 +301,17 @@ class Hub:
 
     def _session_flags_map(self, extra_ids: list[str] | None = None) -> dict[str, str]:
         ids = list(self._hub_session_ids(50))
+        bg_status = self.acp.bg_activity_status_map()
+        bg_working = {sid for sid, phase in bg_status.items() if phase == "working"}
+        bg_stuck = {sid for sid, phase in bg_status.items() if phase == "stuck"}
+        bg_all = set(bg_status.keys())
         for sid in self.acp.turn_session_ids:
             if sid not in ids:
                 ids.append(sid)
         for sid in self.acp.sessions_with_pending_questions():
+            if sid not in ids:
+                ids.append(sid)
+        for sid in bg_all:
             if sid not in ids:
                 ids.append(sid)
         if extra_ids:
@@ -310,6 +322,8 @@ class Hub:
             ids,
             active_sessions=set(self.acp.turn_session_ids),
             pending_question_sessions=self.acp.sessions_with_pending_questions(),
+            background_active=bg_working,
+            background_stuck=bg_stuck,
         )
 
     def _sessions_items_with_status(self) -> list[dict[str, Any]]:
@@ -352,9 +366,14 @@ class Hub:
         return mapped, live
 
     def _live_turns_payload(self) -> list[dict[str, Any]]:
-        """liveTurns entries with age/silence/sawUpdate/ttfb telemetry."""
+        """liveTurns entries with age/silence/sawUpdate/ttfb telemetry.
+
+        Includes background-only sessions (subagent_progress after force-clear)
+        so clients do not paint idle while the agent still emits activity.
+        """
         now = time.monotonic()
         out: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for sid in self.acp.turn_session_ids:
             meta = self.acp.active_turns.get(sid) or {}
             tel = turn_telemetry(
@@ -374,6 +393,35 @@ class Hub:
                     "ttfbSeconds": tel["ttfbSeconds"],
                 }
             )
+            seen.add(sid)
+        bg_status = self.acp.bg_activity_status_map(now)
+        for sid, phase in bg_status.items():
+            if sid in seen:
+                continue
+            # ageSeconds = continuous from first pulse in this bg episode;
+            # silenceSeconds = time since last pulse (resets each progress).
+            age, silence = self.acp.bg_activity_ages(sid, now)
+            if age is None:
+                age = 0.0
+            if silence is None:
+                silence = 0.0
+            is_stuck = phase == "stuck"
+            kind = self.acp.bg_activity_kind(sid)
+            entry: dict[str, Any] = {
+                "sessionId": sid,
+                "state": "stuck" if is_stuck else "running",
+                "ageSeconds": age,
+                "silenceSeconds": silence,
+                "sawUpdate": True,
+                "ttfbSeconds": None,
+                "background": True,
+            }
+            # heartbeatOnly only when stuck (orphan progress past grace).
+            if is_stuck:
+                entry["heartbeatOnly"] = True
+            if kind:
+                entry["kind"] = kind
+            out.append(entry)
         return out
 
     def _primary_turn_telemetry(self) -> dict[str, Any]:
@@ -397,6 +445,9 @@ class Hub:
 
     def _capacity_payload(self) -> dict[str, Any]:
         busy = list(self.acp.turn_session_ids)
+        for sid in self.acp.live_bg_activity_sessions():
+            if sid not in busy:
+                busy.append(sid)
         return {
             "activeTurnCount": len(busy),
             "maxConcurrentTurns": self._max_concurrent_turns,
@@ -606,6 +657,66 @@ class Hub:
             },
             session_id=session_id if isinstance(session_id, str) else None,
         )
+
+    async def _on_session_activity(
+        self, session_id: str, kind: str | None
+    ) -> None:
+        """Lightweight activity event + debounced status when bg work is live.
+
+        subagent_progress can arrive ~every 8s after force-clear empties
+        active_turns; keep rail Working/Stuck without flooding status.
+        bg_cleared: auto-drop past max age — toast once, stop Working lie.
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        kind_s = str(kind or "").strip()
+        if kind_s == "bg_cleared":
+            try:
+                await self.broadcast(
+                    {
+                        "type": "system",
+                        "sessionId": sid,
+                        "text": (
+                            "Background activity cleared — orphan subagent "
+                            "heartbeat timed out (no rich work for 10+ min)."
+                        ),
+                    },
+                    session_id=sid,
+                )
+            except Exception:
+                log.debug("bg_cleared toast failed session=%s", sid, exc_info=True)
+            try:
+                await self.broadcast(self.status_payload())
+            except Exception:
+                log.debug(
+                    "bg_cleared status broadcast failed session=%s", sid, exc_info=True
+                )
+            return
+        phase = self.acp.bg_activity_phase_for(sid)
+        label = bg_activity_label(kind)
+        try:
+            await self.broadcast(
+                {
+                    "type": "activity",
+                    "sessionId": sid,
+                    "kind": kind_s,
+                    "label": label,
+                    "phase": phase,
+                },
+                session_id=sid,
+            )
+        except Exception:
+            log.debug("activity broadcast failed session=%s", sid, exc_info=True)
+        now = time.monotonic()
+        last = self._bg_status_broadcast_at.get(sid, 0.0)
+        if (now - last) < 1.0:
+            return
+        self._bg_status_broadcast_at[sid] = now
+        try:
+            await self.broadcast(self.status_payload())
+        except Exception:
+            log.debug("bg activity status broadcast failed session=%s", sid, exc_info=True)
 
     async def _ws_user_question_answer(
         self, ws: web.WebSocketResponse, payload: dict[str, Any]
@@ -1524,8 +1635,13 @@ class Hub:
         """
         try:
             while True:
-                active = bool(self.acp.turn_running) or bool(self.acp.turn_session_ids)
-                # 1.0s while turns run so rail pills stay fresh; 5–10s when idle.
+                bg_live = self.acp.live_bg_activity_sessions()
+                active = (
+                    bool(self.acp.turn_running)
+                    or bool(self.acp.turn_session_ids)
+                    or bool(bg_live)
+                )
+                # 1.0s while turns/bg run so rail pills stay fresh; slower when idle.
                 await asyncio.sleep(1.0 if active else 8.0)
                 try:
                     await self.acp.maybe_probe_liveness()
@@ -1550,11 +1666,19 @@ class Hub:
                             await self._broadcast_turn(sid, "idle", err)
                         except Exception:
                             log.debug("status resync turn idle broadcast failed", exc_info=True)
-                if self.acp.turn_running or bool(self.acp.turn_session_ids):
+                bg_now = self.acp.live_bg_activity_sessions()
+                still_active = (
+                    self.acp.turn_running
+                    or bool(self.acp.turn_session_ids)
+                    or bool(bg_now)
+                )
+                # Broadcast while active, and once more when bg TTL just expired.
+                if still_active or self._had_bg_activity:
                     try:
                         await self.broadcast(self.status_payload())
                     except Exception:
                         log.debug("status resync broadcast failed", exc_info=True)
+                self._had_bg_activity = bool(bg_now)
         except asyncio.CancelledError:
             return
 
@@ -1915,6 +2039,8 @@ class Hub:
                             },
                             session_id=sid,
                         )
+                # Orphan bg heartbeats die with the process; do not keep Working/Stuck.
+                self.acp.clear_bg_activity()
             except Exception as exc:
                 log.warning("restart-agent: force_clear_turn failed: %s", exc)
 
@@ -2622,6 +2748,21 @@ class Hub:
             acp_connected=self.acp.connected,
         )
 
+        # Move load-suppress quiet settle onto attach so first Send is hot-path.
+        # ensureMs stays ensure-only; settleMs is separate.
+        settle_ms = 0.0
+        load_settled = False
+        if live_id and self.acp.is_load_suppressing(live_id):
+            t1 = time.monotonic()
+            await self.acp.wait_load_suppress_settled(live_id)
+            settle_ms = (time.monotonic() - t1) * 1000.0
+            load_settled = True
+            log.info(
+                "attach settle session=%s settle_ms=%.1f",
+                live_id,
+                settle_ms,
+            )
+
         cmds = list(self.acp.available_commands or [])
         if cmds:
             await self.broadcast(
@@ -2646,6 +2787,8 @@ class Hub:
                 "ensureMs": ensure_ms,
                 "ensureAction": ensure_action,
                 "liveHotPath": live_hot,
+                "loadSettled": load_settled,
+                "settleMs": settle_ms,
             }
         )
 

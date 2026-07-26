@@ -72,7 +72,18 @@ if (Test-HubHealth "127.0.0.1" $port) {
         Write-Host "Stopping stale hub PID $($_.ProcessId)"
         Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
     }
-    Start-Sleep -Milliseconds 400
+
+    # Wait for port to free after kill (up to 5s) to avoid bind conflict on restart
+    $portFreeDeadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $portFreeDeadline) {
+        $still = @(Get-HubProcesses)
+        $healthStill = Test-HubHealth "127.0.0.1" $port
+        if ($still.Count -eq 0 -and -not $healthStill) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    if (@(Get-HubProcesses).Count -gt 0) {
+        Write-Host "WARNING: hub process(es) still present after kill wait; starting anyway"
+    }
 
     $py = (Resolve-Path $Python).Path
     $cmdLine = "`"$py`" -m hub"

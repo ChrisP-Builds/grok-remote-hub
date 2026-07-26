@@ -655,7 +655,8 @@ def test_js_scroll_linked_sticky_user_prompt() -> None:
     assert "scheduleStickyUserFromScroll" in ah_chunk
 
     open_idx = js.find("async function openSession")
-    open_chunk = js[open_idx : open_idx + 5500]
+    # Parallel hist+attach expands openSession; sticky runs after hist paint.
+    open_chunk = js[open_idx : open_idx + 10000]
     assert "scheduleStickyUserFromScroll" in open_chunk
 
     # Exposed for tests
@@ -674,13 +675,24 @@ def test_js_attach_session_live_helper() -> None:
     if attach_idx < 0:
         attach_idx = js.find("function attachSessionLive")
     assert attach_idx >= 0
-    attach_chunk = js[attach_idx : attach_idx + 1800]
+    attach_chunk = js[attach_idx : attach_idx + 2200]
     assert "/attach" in attach_chunk
     assert "liveSessionId" in attach_chunk
     open_idx = js.find("async function openSession")
     assert open_idx >= 0
-    open_chunk = js[open_idx : open_idx + 8000]
+    open_chunk = js[open_idx : open_idx + 10000]
     assert "attachSessionLive" in open_chunk
+    # openSession starts history + attach in parallel when both needed.
+    assert "fetchAndApplyHistory" in open_chunk
+    assert "histPromise" in open_chunk
+    assert "attachPromise" in open_chunk
+    assert "needHist" in open_chunk
+    assert "needAttach" in open_chunk
+    # History result applied before awaiting attach (paint-first order).
+    hist_await = open_chunk.find("await histPromise")
+    attach_await = open_chunk.find("await attachPromise")
+    assert hist_await >= 0 and attach_await >= 0
+    assert hist_await < attach_await
 
     # Status trusts empty server liveTurns (no forever quiet · queue)
     status_idx = js.find('if (type === "status")')
@@ -860,11 +872,15 @@ def test_js_stream_visibility_contract() -> None:
     assert '"agent_thought_chunk"' in js
     handle_idx = js.find("function handleAcpMessage")
     assert handle_idx >= 0
-    handle_chunk = js[handle_idx : handle_idx + 3500]
+    handle_chunk = js[handle_idx : handle_idx + 5500]
     assert "markSessionActivity" in handle_chunk
     assert "isStreamWorkingKind(kind)" in handle_chunk
     assert '"working"' in handle_chunk
     assert "processAcpSessionUpdate" in handle_chunk
+    # Bg activity (subagent_progress via params.kind) must paint, not early-return
+    assert "params.kind" in handle_chunk
+    assert "function isBgActivityKind" in js
+    assert 'type === "activity"' in js
 
     # Optimistic user bubble on submit (instant feedback, not wait for ACP echo)
     submit_idx = js.find("function submitPrompt")
@@ -958,7 +974,7 @@ def test_js_hub_session_pill() -> None:
     css = (STATIC / "app.css").read_text(encoding="utf-8")
     render_idx = js.find("function renderSessions")
     assert render_idx >= 0
-    render_chunk = js[render_idx : render_idx + 5000]
+    render_chunk = js[render_idx : render_idx + 7000]
     assert "!s.isCli" in render_chunk
     assert "s.isCli" in render_chunk
     assert "session-pill hub" in render_chunk
@@ -1008,10 +1024,11 @@ def test_js_session_pills_near_streaming() -> None:
 
     mark_idx = js.find("function markSessionActivity")
     assert mark_idx >= 0
-    mark_chunk = js[mark_idx : mark_idx + 2200]
+    mark_chunk = js[mark_idx : mark_idx + 3200]
     assert '"working"' in mark_chunk
     assert '"question"' in mark_chunk
     assert '"idle"' in mark_chunk
+    assert '"stuck"' in mark_chunk
     # Question must not be overwritten by working
     assert '!== "question"' in mark_chunk
     assert "scheduleSessionPills()" in mark_chunk
@@ -1019,10 +1036,11 @@ def test_js_session_pills_near_streaming() -> None:
 
     sync_idx = js.find("function syncVisibleSessionPills")
     assert sync_idx >= 0
-    sync_chunk = js[sync_idx : sync_idx + 2000]
+    sync_chunk = js[sync_idx : sync_idx + 3200]
     assert "data-session-id" in sync_chunk
     assert "status-working" in sync_chunk
     assert "status-question" in sync_chunk
+    assert "status-stuck" in sync_chunk
     assert "Needs reply" in sync_chunk
     assert "Working" in sync_chunk
 
@@ -1035,12 +1053,19 @@ def test_js_session_pills_near_streaming() -> None:
     # Stream path marks activity for offscreen sessions via allowlist helper
     acp_idx = js.find("function handleAcpMessage")
     assert acp_idx >= 0
-    acp_chunk = js[acp_idx : acp_idx + 2500]
+    acp_chunk = js[acp_idx : acp_idx + 5500]
     assert 'markSessionActivity(targetId, "working")' in acp_chunk
     assert "isStreamWorkingKind(kind)" in acp_chunk
     assert "STREAM_WORKING_KINDS" in js
     assert '"user_message_chunk"' in js
     assert '"agent_message_chunk"' in js
+    # x.ai notifications use params.kind; must not early-return all session_notifications
+    assert "params.kind" in acp_chunk
+    assert "isBgActivityKind" in acp_chunk
+    assert "subagent_progress" in acp_chunk or "isBgActivityKind(kind)" in acp_chunk
+    assert "setSessionActivityLine" in acp_chunk
+    # auto_compact still handled and returns; other notifications paint working
+    assert "auto_compact_" in acp_chunk
 
 
 def test_server_status_resync_near_streaming() -> None:
@@ -1182,11 +1207,12 @@ def test_capacity_banner_structural() -> None:
     assert "Busy on other session" in js
     assert "quiet " in js
     assert "tool open" in js
-    # Soft language: no "stuck" in capacity banner path
+    # Soft language for normal quiet; Stuck reserved for orphan heartbeat bg only.
     cap_idx = js.find("function updateCapacityBanner")
     assert cap_idx >= 0
-    cap_chunk = js[cap_idx : cap_idx + 3200]
-    assert "stuck" not in cap_chunk.lower()
+    cap_chunk = js[cap_idx : cap_idx + 6000]
+    assert "isBgStuck" in cap_chunk
+    assert "subagent heartbeat" in cap_chunk
     assert "silenceSeconds" in cap_chunk or "silence" in cap_chunk
     assert "sawUpdate" in cap_chunk
     assert "tool open" in cap_chunk
@@ -1316,6 +1342,103 @@ def test_js_server_turn_timers_structural() -> None:
     assert stall_idx >= 0
     stall_chunk = js[stall_idx : stall_idx + 900]
     assert "if (!state.turnStartedAt)" in stall_chunk
+
+
+def test_js_turn_strip_idle_no_stale_running_structural() -> None:
+    """Strip must not show running from stale flags when liveTurns is empty."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+
+    # turnRunningOnSelected: liveTurns / question only (not flags working/stuck alone)
+    tr_idx = js.find("function turnRunningOnSelected")
+    assert tr_idx >= 0
+    tr_chunk = js[tr_idx : tr_idx + 900]
+    assert "liveTurns" in tr_chunk
+    assert "pendingQuestionSessions" in tr_chunk
+    assert '=== "question"' in tr_chunk or '== "question"' in tr_chunk
+    # Must not treat sessionLiveStatus working/stuck as strip-running
+    assert "sessionLiveStatus" not in tr_chunk
+    assert '=== "working"' not in tr_chunk
+    assert '=== "stuck"' not in tr_chunk
+    # liveTurns sessionId check comes before any flag path
+    live_check = tr_chunk.find("liveTurns")
+    question_flag = tr_chunk.find('=== "question"')
+    assert live_check >= 0
+    assert question_flag < 0 or live_check < question_flag
+
+    # applyServerTurnTimers: clear turnStartedAt when selected not live (no guard)
+    apply_idx = js.find("function applyServerTurnTimers")
+    assert apply_idx >= 0
+    apply_chunk = js[apply_idx : apply_idx + 2200]
+    assert "selectedLive" in apply_chunk
+    assert "state.turnStartedAt = null" in apply_chunk
+    # Circular-lock guard must be gone: clear unconditionally when !selectedLive
+    # Marker unique to the idle-clear condition (not the liveTurns assignment)
+    idle_marker = "s.turnRunning === false"
+    idle_branch = apply_chunk.find(idle_marker)
+    assert idle_branch >= 0
+    idle_region = apply_chunk[idle_branch : idle_branch + 250]
+    assert "state.turnStartedAt = null" in idle_region
+    assert "state.lastTermLineAt = null" in idle_region
+    assert "if (!turnRunningOnSelected())" not in idle_region
+    assert "turnRunningOnSelected()" not in idle_region
+
+    # forceIdleFlags clears stuck as well as working
+    set_idx = js.find("function setTurnRunning")
+    assert set_idx >= 0
+    set_chunk = js[set_idx : set_idx + 2800]
+    force_idx = set_chunk.find("forceIdleFlags")
+    assert force_idx >= 0
+    force_region = set_chunk[force_idx : force_idx + 400]
+    assert '=== "working"' in force_region
+    assert '=== "stuck"' in force_region
+
+    # updateTurnStrip belt: null stale turnStartedAt when not running
+    strip_idx = js.find("function updateTurnStrip")
+    assert strip_idx >= 0
+    strip_chunk = js[strip_idx : strip_idx + 600]
+    assert "turnRunningOnSelected" in strip_chunk
+    assert "turnStartedAt = null" in strip_chunk or "turnStartedAt=null" in strip_chunk
+
+
+def test_js_bg_activity_continuous_age_structural() -> None:
+    """Bg liveTurns use continuous episode age; client must not thrash on pulses."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    # Capacity banner: background turns show continuous age, not waiting first token
+    cap_idx = js.find("function updateCapacityBanner")
+    assert cap_idx >= 0
+    cap_chunk = js[cap_idx : cap_idx + 6500]
+    assert "background === true" in cap_chunk
+    assert "ageSeconds" in cap_chunk
+    assert "subagent" in cap_chunk
+    # Stuck orphan heartbeats: Stuck language, not Working
+    assert "isBgStuck" in cap_chunk
+    assert "subagent heartbeat" in cap_chunk
+    assert "Stuck" in cap_chunk
+    # applyServerTurnTimers: never move bg turnStartedAt later (age drop)
+    apply_idx = js.find("function applyServerTurnTimers")
+    assert apply_idx >= 0
+    apply_chunk = js[apply_idx : apply_idx + 2200]
+    assert "selectedBg" in apply_chunk or "background === true" in apply_chunk
+    # type:activity handler refreshes silence via noteTermLineActivity, not age reset
+    act_idx = js.find('if (type === "activity")')
+    assert act_idx >= 0
+    act_chunk = js[act_idx : act_idx + 1800]
+    assert "noteTermLineActivity" in act_chunk
+    assert "setSessionActivityLine" in act_chunk
+    assert 'phase === "stuck"' in act_chunk or 'msg.phase === "stuck"' in act_chunk
+    # sessionLiveStatus + pill: stuck
+    status_idx = js.find("function sessionLiveStatus")
+    assert status_idx >= 0
+    status_chunk = js[status_idx : status_idx + 1800]
+    assert '"stuck"' in status_chunk or "'stuck'" in status_chunk
+    mark_idx = js.find("function markSessionActivity")
+    assert mark_idx >= 0
+    mark_chunk = js[mark_idx : mark_idx + 1600]
+    assert 'mode === "stuck"' in mark_chunk
+    assert "status-stuck" in js
+    assert "status-stuck" in css
+    assert "session-pill.status-stuck" in css
 
 
 def test_context_budget_banner_removed() -> None:
@@ -2038,3 +2161,40 @@ def test_js_restore_pending_user_prompt_after_history() -> None:
     # keepPending on no-output idle
     assert "keepPending" in js
     assert "opts.keepPending" in js or "opts && opts.keepPending" in js
+
+
+def test_index_no_blocking_mermaid_script() -> None:
+    """mermaid.min.js must not block first paint before app.js."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    # Blocking tag without defer/async is forbidden
+    assert 'src="/vendor/mermaid.min.js"' not in html
+    assert "mermaid.min.js" not in html
+    # Core libs still load before app (app may be cache-busted: /app.js?v=...)
+    assert 'src="/vendor/marked.min.js"' in html
+    assert 'src="/vendor/purify.min.js"' in html
+    assert 'src="/app.js' in html
+    marked_i = html.find('src="/vendor/marked.min.js"')
+    purify_i = html.find('src="/vendor/purify.min.js"')
+    app_i = html.find('src="/app.js')
+    assert 0 <= marked_i < purify_i < app_i
+
+
+def test_js_mermaid_lazy_loaded() -> None:
+    """Mermaid is loaded on demand via createElement/loadScriptOnce."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "function loadScriptOnce" in js
+    assert "function ensureMermaidReady" in js
+    assert "mermaidLoadPromise" in js
+    ensure_idx = js.find("async function ensureMermaidReady")
+    assert ensure_idx >= 0, "ensureMermaidReady must be async for lazy load"
+    ensure_chunk = js[ensure_idx : ensure_idx + 1200]
+    assert "vendor/mermaid" in ensure_chunk or "mermaid.min.js" in ensure_chunk
+    assert "loadScriptOnce" in ensure_chunk
+    assert 'createElement("script")' in js
+    # bootstrap openSession must not hang forever before connectWs
+    boot_idx = js.find("async function bootstrap")
+    assert boot_idx >= 0
+    boot_chunk = js[boot_idx : boot_idx + 6000]
+    assert "Promise.race" in boot_chunk
+    assert "12000" in boot_chunk
+    assert "connectWs()" in boot_chunk

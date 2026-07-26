@@ -5,6 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from hub.session_policy import (
+    BG_ACTIVITY_MAX_S,
+    BG_ACTIVITY_TTL_S,
+    BG_HEARTBEAT_GRACE_S,
+    BG_HEARTBEAT_STUCK_S,
     CLIENT_STALL_UNLOCK_SECONDS,
     CLIENT_STALL_WARN_SECONDS,
     CONTEXT_SOFT_UPDATES_BYTES,
@@ -18,6 +22,9 @@ from hub.session_policy import (
     NO_OUTPUT_SOFT_SECONDS,
     STUCK_TURN_SECONDS,
     apply_turn_activity,
+    bg_activity_is_live,
+    bg_activity_label,
+    bg_activity_phase,
     counts_toward_agent_ttfb,
     cwd_key,
     entry_requires_resume_choice,
@@ -30,10 +37,14 @@ from hub.session_policy import (
     load_remote_sessions,
     next_ensure_after_load_fail,
     no_output_seconds_for_session,
+    notification_counts_as_turn_activity,
+    notification_is_heartbeat_only,
+    notification_is_rich_activity,
     recovery_keeps_session_id,
     resolve_ensure_action,
     resolve_live_session_id,
     save_remote_sessions,
+    session_notification_kind,
     session_on_disk,
     sessions_matching_cwd,
     should_auto_retry_no_output,
@@ -1148,6 +1159,175 @@ def test_counts_toward_agent_ttfb() -> None:
     assert counts_toward_agent_ttfb("tool_call_update") is True
 
 
+def test_session_notification_kind_from_params_kind() -> None:
+    assert session_notification_kind(None) == ""
+    assert session_notification_kind({}) == ""
+    assert session_notification_kind({"kind": "subagent_progress"}) == "subagent_progress"
+    assert session_notification_kind({"kind": "  goal_updated  "}) == "goal_updated"
+
+
+def test_session_notification_kind_from_update_or_top_level() -> None:
+    assert (
+        session_notification_kind(
+            {"update": {"sessionUpdate": "auto_compact_started"}}
+        )
+        == "auto_compact_started"
+    )
+    assert (
+        session_notification_kind(
+            {"update": {"session_update": "hook_execution"}}
+        )
+        == "hook_execution"
+    )
+    assert (
+        session_notification_kind({"sessionUpdate": "pending_interaction"})
+        == "pending_interaction"
+    )
+    # params.kind wins over nested update
+    assert (
+        session_notification_kind(
+            {
+                "kind": "subagent_progress",
+                "update": {"sessionUpdate": "auto_compact_started"},
+            }
+        )
+        == "subagent_progress"
+    )
+
+
+def test_notification_counts_as_turn_activity_matrix() -> None:
+    # Unknown / noise
+    assert notification_counts_as_turn_activity(None) is False
+    assert notification_counts_as_turn_activity("") is False
+    assert notification_counts_as_turn_activity("   ") is False
+    assert notification_counts_as_turn_activity("random_noise") is False
+    assert notification_counts_as_turn_activity("agent_message_chunk") is False
+
+    # Explicit allowlist
+    for kind in (
+        "subagent_progress",
+        "SUBAGENT_PROGRESS",
+        "tool_call_delta_chunk",
+        "tool_call_delta",
+        "goal_updated",
+        "goal_completed",
+        "pending_interaction",
+        "interaction_resolved",
+        "hook_execution",
+    ):
+        assert notification_counts_as_turn_activity(kind) is True, kind
+
+    # Prefix families
+    assert notification_counts_as_turn_activity("auto_compact_started") is True
+    assert notification_counts_as_turn_activity("auto_compact_completed") is True
+    assert notification_counts_as_turn_activity("subagent_spawned") is True
+    assert notification_counts_as_turn_activity("goal_started") is True
+
+
+def test_bg_activity_is_live_ttl() -> None:
+    assert BG_ACTIVITY_TTL_S == 45.0
+    assert BG_HEARTBEAT_GRACE_S == 90.0
+    assert BG_HEARTBEAT_STUCK_S == 120.0
+    assert BG_ACTIVITY_MAX_S == 600.0
+    assert bg_activity_is_live(None, 100.0) is False
+    assert bg_activity_is_live(100.0, 100.0) is True
+    assert bg_activity_is_live(100.0, 144.9) is True
+    assert bg_activity_is_live(100.0, 145.0) is False
+    assert bg_activity_is_live(100.0, 200.0) is False
+    assert bg_activity_is_live(100.0, 120.0, ttl=10.0) is False
+    assert bg_activity_is_live(100.0, 105.0, ttl=10.0) is True
+    # Negative age (clock skew) is not live
+    assert bg_activity_is_live(200.0, 100.0) is False
+
+
+def test_notification_heartbeat_vs_rich() -> None:
+    assert notification_is_heartbeat_only("subagent_progress") is True
+    assert notification_is_heartbeat_only("subagent_spawned") is False
+    assert notification_is_heartbeat_only(None) is False
+    assert notification_is_rich_activity("subagent_progress") is False
+    assert notification_is_rich_activity("subagent_spawned") is True
+    assert notification_is_rich_activity("goal_updated") is True
+    assert notification_is_rich_activity("tool_call_delta") is True
+    assert notification_is_rich_activity("random_noise") is False
+
+
+def test_bg_activity_phase_heartbeat_only() -> None:
+    """Heartbeat-only: working under grace, stuck past grace, idle when not live."""
+    # Fresh pulse within TTL, age 30s → working (grace)
+    assert (
+        bg_activity_phase(
+            started_at=100.0,
+            last_at=130.0,
+            rich_at=None,
+            now=130.0,
+        )
+        == "working"
+    )
+    # Age 150s, still pulsing, no rich → stuck
+    assert (
+        bg_activity_phase(
+            started_at=100.0,
+            last_at=250.0,
+            rich_at=None,
+            now=250.0,
+        )
+        == "stuck"
+    )
+    # Age past max with only heartbeats → still stuck (caller may drop)
+    assert (
+        bg_activity_phase(
+            started_at=100.0,
+            last_at=800.0,
+            rich_at=None,
+            now=800.0,
+        )
+        == "stuck"
+    )
+    # Not live (last_at too old) → idle
+    assert (
+        bg_activity_phase(
+            started_at=100.0,
+            last_at=100.0,
+            rich_at=None,
+            now=200.0,
+        )
+        == "idle"
+    )
+
+
+def test_bg_activity_phase_rich_keeps_working() -> None:
+    """Rich activity within stuck window keeps working even at age 200s."""
+    assert (
+        bg_activity_phase(
+            started_at=100.0,
+            last_at=300.0,
+            rich_at=280.0,  # 20s ago, within stuck_s=120
+            now=300.0,
+        )
+        == "working"
+    )
+    # Rich too old (> stuck_s) and age past grace → stuck
+    assert (
+        bg_activity_phase(
+            started_at=100.0,
+            last_at=400.0,
+            rich_at=100.0,  # 300s ago
+            now=400.0,
+        )
+        == "stuck"
+    )
+
+
+def test_bg_activity_label() -> None:
+    assert bg_activity_label("subagent_progress") == "subagent running"
+    assert bg_activity_label("subagent_spawned") == "subagent running"
+    assert bg_activity_label("goal_updated") == "goal active"
+    assert bg_activity_label("tool_call_delta") == "tool active"
+    assert bg_activity_label("hook_execution") == "hook running"
+    assert bg_activity_label(None) == "active"
+    assert bg_activity_label("") == "active"
+
+
 def test_apply_turn_activity_user_echo_not_ttfb() -> None:
     meta: dict = {
         "started_at": 100.0,
@@ -1462,6 +1642,12 @@ def test_attach_response_cold_path_keys_structural() -> None:
     assert '"liveHotPath"' in body or "'liveHotPath'" in body
     assert "is_live_hot_path" in body
     assert "ensure_ms" in body
+    # Attach settles load suppress so first Send is closer to CLI hot path.
+    assert "wait_load_suppress_settled" in body
+    assert "is_load_suppressing" in body
+    assert '"loadSettled"' in body or "'loadSettled'" in body
+    assert '"settleMs"' in body or "'settleMs'" in body
+    assert "attach settle session=" in body
 
 
 def test_forget_warm_session() -> None:

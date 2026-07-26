@@ -23,6 +23,10 @@ ACP_PROBE_TIMEOUT_S = 5.0
 # session/load replay suppress: hold until quiet period or max wall time.
 LOAD_SUPPRESS_QUIET_S = 1.5
 LOAD_SUPPRESS_MAX_S = 20.0
+# Tiny load flushes (few residual frames) use a shorter quiet so first Send
+# after attach is closer to the CLI hot path. Fat flushes keep full quiet.
+LOAD_SUPPRESS_QUIET_SMALL_S = 0.45
+LOAD_SUPPRESS_SMALL_FRAME_MAX = 5
 
 
 def map_acp_quality(
@@ -238,6 +242,22 @@ def should_suppress_session_load_fanout(
             return False
         return True
     return False
+
+
+def load_suppress_quiet_s_for_count(frame_count: int) -> float:
+    """Shorter quiet after tiny load flushes; full quiet when fat.
+
+    Count is the number of suppressed residual frames so far for this load.
+    Fat sessions (count > LOAD_SUPPRESS_SMALL_FRAME_MAX) keep the full
+    LOAD_SUPPRESS_QUIET_S so ADR-016 flood protection is unchanged.
+    """
+    try:
+        n = int(frame_count)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= LOAD_SUPPRESS_SMALL_FRAME_MAX:
+        return LOAD_SUPPRESS_QUIET_SMALL_S
+    return LOAD_SUPPRESS_QUIET_S
 
 
 def load_suppress_should_release(

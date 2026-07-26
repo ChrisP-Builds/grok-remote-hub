@@ -20,12 +20,19 @@ from hub.acp_terminal import TerminalManager
 from hub.acp_trace import AcpTrace, session_id_slice
 from hub.config import Config
 from hub.session_policy import (
+    BG_ACTIVITY_MAX_S,
+    BG_ACTIVITY_TTL_S,
     MAX_TURN_SECONDS,
     MID_TURN_STALL_SECONDS,
     NO_OUTPUT_SECONDS,
     STUCK_TURN_SECONDS,
     apply_turn_activity,
+    bg_activity_is_live,
+    bg_activity_phase,
     is_turn_stuck_for_new_prompt,
+    notification_counts_as_turn_activity,
+    notification_is_rich_activity,
+    session_notification_kind,
     should_force_clear_turn,
     should_skip_session_load,
 )
@@ -34,7 +41,8 @@ from hub.status_view import (
     ACP_PROBE_SILENCE_S,
     ACP_PROBE_TIMEOUT_S,
     LOAD_SUPPRESS_MAX_S,
-    LOAD_SUPPRESS_QUIET_S,
+    LOAD_SUPPRESS_QUIET_S,  # fat-path quiet; adaptive helper selects small vs this
+    load_suppress_quiet_s_for_count,
     load_suppress_should_release,
     should_probe_acp_liveness,
     should_suppress_session_load_fanout,
@@ -131,6 +139,19 @@ class AcpClient:
         self.on_user_question: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None
         # Hub sets this to fan out live terminal/* pump deltas to the web UI.
         self.on_terminal_out: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None
+        # Hub: session still active after force-clear (subagent_progress, goals, …).
+        # Callback: (session_id, kind) — may be async.
+        self.on_session_activity: (
+            Callable[[str, str | None], Awaitable[None] | None] | None
+        ) = None
+        # session_id -> monotonic last notification activity (orphan/bg work).
+        self._bg_activity_at: dict[str, float] = {}
+        # session_id -> monotonic first stamp of current bg episode (continuous age).
+        self._bg_activity_started_at: dict[str, float] = {}
+        # session_id -> last activity kind (stable UI label).
+        self._bg_activity_kind: dict[str, str] = {}
+        # session_id -> last rich (non-heartbeat) activity stamp in this episode.
+        self._bg_activity_rich_at: dict[str, float] = {}
         # Wire terminal pump → hub fanout
         self._terminals.on_output = self._on_terminal_output_chunk
         # ACP wire liveness (half-open / zombie detection for status quality).
@@ -585,6 +606,244 @@ class AcpClient:
         # Fan out to all active turns when session unknown (tool RPCs, etc.)
         for sid in list(self.active_turns):
             _touch(sid)
+
+    def note_bg_activity(
+        self,
+        session_id: str | None,
+        *,
+        kind: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Stamp background activity for a session (even when not in active_turns).
+
+        Returns True when the session was not already within the bg TTL (became live).
+        Invokes on_session_activity when set (sync or schedules async).
+
+        Episode semantics: first pulse (or first after TTL expiry) sets
+        ``_bg_activity_started_at``; subsequent pulses only refresh last-at so
+        continuous age does not reset on every subagent_progress.
+
+        Heartbeat-only kinds (subagent_progress) refresh last-at only.
+        Rich kinds also stamp ``_bg_activity_rich_at`` so phase stays working.
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        ts = time.monotonic() if now is None else float(now)
+        prev = self._bg_activity_at.get(sid)
+        was_live = bg_activity_is_live(prev, ts)
+        is_rich = notification_is_rich_activity(kind)
+        if not was_live:
+            # New bg episode: continuous age starts here.
+            self._bg_activity_started_at[sid] = ts
+            # Clear prior rich stamp unless this note itself is rich.
+            if not is_rich:
+                self._bg_activity_rich_at.pop(sid, None)
+        self._bg_activity_at[sid] = ts
+        if is_rich:
+            self._bg_activity_rich_at[sid] = ts
+        if kind is not None:
+            k = str(kind).strip()
+            if k:
+                self._bg_activity_kind[sid] = k
+        if self.on_session_activity:
+            try:
+                result = self.on_session_activity(sid, kind)
+                if asyncio.iscoroutine(result):
+                    try:
+                        loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        pass
+                    else:
+                        loop.create_task(
+                            result, name=f"hub-bg-act-{sid[:8]}"
+                        )
+            except Exception:
+                log.debug("on_session_activity failed session=%s", sid, exc_info=True)
+        return not was_live
+
+    def _pop_bg_activity(self, session_id: str) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        self._bg_activity_at.pop(sid, None)
+        self._bg_activity_started_at.pop(sid, None)
+        self._bg_activity_kind.pop(sid, None)
+        self._bg_activity_rich_at.pop(sid, None)
+
+    def clear_bg_activity(self) -> None:
+        """Drop all background activity stamps (e.g. agent process restart)."""
+        self._bg_activity_at.clear()
+        self._bg_activity_started_at.clear()
+        self._bg_activity_kind.clear()
+        self._bg_activity_rich_at.clear()
+
+    def bg_activity_ages(
+        self,
+        session_id: str | None,
+        now: float | None = None,
+        ttl: float = BG_ACTIVITY_TTL_S,
+    ) -> tuple[float | None, float | None]:
+        """Return ``(age_seconds, silence_seconds)`` for a live bg session.
+
+        * age = now - episode started_at (continuous for the current bg episode)
+        * silence = now - last activity stamp
+
+        Returns ``(None, None)`` when the session is not currently live.
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return (None, None)
+        ts = time.monotonic() if now is None else float(now)
+        last = self._bg_activity_at.get(sid)
+        if last is None or not bg_activity_is_live(last, ts, ttl):
+            return (None, None)
+        started = self._bg_activity_started_at.get(sid)
+        start = float(started) if started is not None else float(last)
+        age = float(ts) - start
+        if age < 0.0:
+            age = 0.0
+        silence = float(ts) - float(last)
+        if silence < 0.0:
+            silence = 0.0
+        return (age, silence)
+
+    def bg_activity_kind(self, session_id: str | None) -> str | None:
+        """Last recorded bg activity kind for ``session_id``, if any."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+        return self._bg_activity_kind.get(sid)
+
+    def bg_activity_phase_for(
+        self,
+        session_id: str | None,
+        now: float | None = None,
+        ttl: float = BG_ACTIVITY_TTL_S,
+    ) -> str:
+        """Return idle | working | stuck for one session (pure phase; no prune)."""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return "idle"
+        ts = time.monotonic() if now is None else float(now)
+        return bg_activity_phase(
+            started_at=self._bg_activity_started_at.get(sid),
+            last_at=self._bg_activity_at.get(sid),
+            rich_at=self._bg_activity_rich_at.get(sid),
+            now=ts,
+            ttl=ttl,
+        )
+
+    def prune_expired_bg_activity(
+        self,
+        now: float | None = None,
+        ttl: float = BG_ACTIVITY_TTL_S,
+        max_s: float = BG_ACTIVITY_MAX_S,
+    ) -> list[str]:
+        """Drop idle stamps and stuck-past-max episodes. Returns auto-cleared sids."""
+        ts = time.monotonic() if now is None else float(now)
+        cleared: list[str] = []
+        for sid in list(self._bg_activity_at.keys()):
+            last = self._bg_activity_at.get(sid)
+            started = self._bg_activity_started_at.get(sid)
+            rich = self._bg_activity_rich_at.get(sid)
+            phase = bg_activity_phase(
+                started_at=started,
+                last_at=last,
+                rich_at=rich,
+                now=ts,
+                ttl=ttl,
+                max_s=max_s,
+            )
+            if phase == "idle":
+                self._pop_bg_activity(sid)
+                continue
+            if phase == "stuck":
+                start = float(started) if started is not None else float(last or ts)
+                age = float(ts) - start
+                if age < 0.0:
+                    age = 0.0
+                if age >= float(max_s):
+                    log.warning(
+                        "bg activity auto-cleared (max age) session=%s age=%.0fs kind=%s",
+                        sid[:16],
+                        age,
+                        self._bg_activity_kind.get(sid) or "",
+                    )
+                    self._pop_bg_activity(sid)
+                    cleared.append(sid)
+                    if self.on_session_activity:
+                        try:
+                            result = self.on_session_activity(sid, "bg_cleared")
+                            if asyncio.iscoroutine(result):
+                                try:
+                                    loop = asyncio.get_running_loop()
+                                except RuntimeError:
+                                    pass
+                                else:
+                                    loop.create_task(
+                                        result, name=f"hub-bg-clr-{sid[:8]}"
+                                    )
+                        except Exception:
+                            log.debug(
+                                "on_session_activity bg_cleared failed session=%s",
+                                sid,
+                                exc_info=True,
+                            )
+        return cleared
+
+    def bg_activity_status_map(
+        self,
+        now: float | None = None,
+        ttl: float = BG_ACTIVITY_TTL_S,
+    ) -> dict[str, str]:
+        """Map session_id -> working|stuck for live bg episodes (prunes idle/max)."""
+        ts = time.monotonic() if now is None else float(now)
+        self.prune_expired_bg_activity(now=ts, ttl=ttl)
+        out: dict[str, str] = {}
+        for sid in list(self._bg_activity_at.keys()):
+            phase = bg_activity_phase(
+                started_at=self._bg_activity_started_at.get(sid),
+                last_at=self._bg_activity_at.get(sid),
+                rich_at=self._bg_activity_rich_at.get(sid),
+                now=ts,
+                ttl=ttl,
+            )
+            if phase in ("working", "stuck"):
+                out[sid] = phase
+        return out
+
+    def live_bg_working_sessions(
+        self,
+        now: float | None = None,
+        ttl: float = BG_ACTIVITY_TTL_S,
+    ) -> set[str]:
+        """Session ids in bg working phase (rich or within heartbeat grace)."""
+        return {
+            sid
+            for sid, phase in self.bg_activity_status_map(now=now, ttl=ttl).items()
+            if phase == "working"
+        }
+
+    def live_bg_stuck_sessions(
+        self,
+        now: float | None = None,
+        ttl: float = BG_ACTIVITY_TTL_S,
+    ) -> set[str]:
+        """Session ids stuck on heartbeat-only bg activity past grace."""
+        return {
+            sid
+            for sid, phase in self.bg_activity_status_map(now=now, ttl=ttl).items()
+            if phase == "stuck"
+        }
+
+    def live_bg_activity_sessions(
+        self,
+        now: float | None = None,
+        ttl: float = BG_ACTIVITY_TTL_S,
+    ) -> set[str]:
+        """Session ids with live bg activity (working or stuck; prunes idle/max)."""
+        return set(self.bg_activity_status_map(now=now, ttl=ttl).keys())
 
     def _url(self) -> str:
         key = quote(self.secret, safe="")
@@ -1137,17 +1396,15 @@ class AcpClient:
         sid_str = str(sid) if sid else None
         method_str = str(method) if method else None
 
-        # Compact / session notifications count as activity so stall watchdog
-        # does not mis-fire while compaction runs mid-session.
+        # Session notifications that prove the agent is alive mid-turn must
+        # refresh last_activity (subagent_progress, goals, auto_compact, etc.).
+        # Otherwise no-output force-clear fires while the agent is working.
         if method in (
             "_x.ai/session_notification",
             "x.ai/session_notification",
         ):
-            kind_n = str(
-                update_pre.get("sessionUpdate")
-                or update_pre.get("session_update")
-                or params.get("sessionUpdate")
-                or ""
+            kind_n = session_notification_kind(
+                params if isinstance(params, dict) else None
             )
             suppress_n = should_suppress_session_load_fanout(
                 loading_session_ids=self._loading_sessions,
@@ -1156,8 +1413,14 @@ class AcpClient:
                 update_kind=kind_n or None,
                 active_turn_session_ids=frozenset(self.active_turns.keys()),
             )
-            if kind_n.startswith("auto_compact_") and not suppress_n:
+            if (
+                notification_counts_as_turn_activity(kind_n or None)
+                and not suppress_n
+            ):
                 self.note_activity(sid_str, update_kind=kind_n or None)
+                # Always stamp bg activity so orphan subagent_progress after
+                # force-clear still paints Working / sessionFlags (not idle).
+                self.note_bg_activity(sid_str, kind=kind_n or None)
             return
 
         if method not in ("session/update", "_x.ai/session/update"):
@@ -1353,6 +1616,7 @@ class AcpClient:
                 # Quiet-period release: agent may flush historical frames for many
                 # seconds after the RPC result. Keep sid in _loading_sessions; each
                 # suppressed frame rearms the quiet timer until silence or max hold.
+                # Adaptive quiet: tiny flush (few frames) settles faster; fat keeps 1.5s.
                 now = time.monotonic()
                 self._load_suppress_deadline[sid] = now + LOAD_SUPPRESS_MAX_S
                 prev = self._load_release_handles.pop(sid, None)
@@ -1363,8 +1627,11 @@ class AcpClient:
                     self._load_release_handles.pop(s, None)
                     self.release_load_suppress(s)
 
+                quiet_s = load_suppress_quiet_s_for_count(
+                    self._load_suppress_counts.get(sid, 0)
+                )
                 self._load_release_handles[sid] = loop.call_later(
-                    LOAD_SUPPRESS_QUIET_S, _delayed_release
+                    quiet_s, _delayed_release
                 )
             if not fut.done():
                 fut.set_result(result)
@@ -1377,6 +1644,11 @@ class AcpClient:
             if self._load_inflight.get(sid) is fut:
                 self._load_inflight.pop(sid, None)
 
+    def is_load_suppressing(self, session_id: str) -> bool:
+        """True while session/load residual suppress is active for session_id."""
+        sid = str(session_id or "").strip()
+        return bool(sid and sid in self._loading_sessions)
+
     def _rearm_load_suppress_release(self, session_id: str) -> None:
         """Reset quiet-period timer after a suppressed frame; release if past max."""
         sid = str(session_id or "").strip()
@@ -1384,13 +1656,16 @@ class AcpClient:
             return
         now = time.monotonic()
         deadline = self._load_suppress_deadline.get(sid)
+        quiet_s = load_suppress_quiet_s_for_count(
+            self._load_suppress_counts.get(sid, 0)
+        )
         # No deadline yet (mid session/load before finally): do not force-release.
         # Missing deadline must not be treated as held_s=max.
         if deadline is not None:
             held_s = now - (deadline - LOAD_SUPPRESS_MAX_S)
             if load_suppress_should_release(
                 quiet_elapsed_s=0.0,  # rearm means frame just arrived
-                quiet_s=LOAD_SUPPRESS_QUIET_S,
+                quiet_s=quiet_s,
                 held_s=held_s,
                 max_s=LOAD_SUPPRESS_MAX_S,
             ):
@@ -1402,7 +1677,7 @@ class AcpClient:
         remaining = (
             (deadline - now) if deadline is not None else LOAD_SUPPRESS_MAX_S
         )
-        delay = min(LOAD_SUPPRESS_QUIET_S, max(0.0, remaining))
+        delay = min(quiet_s, max(0.0, remaining))
         if delay <= 0:
             self.release_load_suppress(sid)
             return
@@ -1417,7 +1692,6 @@ class AcpClient:
             self.release_load_suppress(s)
 
         self._load_release_handles[sid] = loop.call_later(delay, _delayed_release)
-
 
     async def wait_load_suppress_settled(
         self, session_id: str, *, timeout: float | None = None

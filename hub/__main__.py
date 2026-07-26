@@ -29,7 +29,25 @@ def _setup_logging(log_dir: Path) -> None:
     root.addHandler(fh)
 
 
+def _ignore_proactor_reset(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Demote normal client disconnects (ConnectionReset / WinError 10054) to debug."""
+    exc = context.get("exception")
+    if isinstance(exc, ConnectionResetError):
+        logging.getLogger("asyncio").debug(
+            "connection reset (client closed): %s", exc
+        )
+        return
+    msg = context.get("message", "")
+    if "ConnectionResetError" in str(exc) or "10054" in str(msg) or "10054" in str(exc):
+        logging.getLogger("asyncio").debug("%s", context)
+        return
+    loop.default_exception_handler(context)
+
+
 async def _run(hub: Hub, hosts: list[str], port: int) -> None:
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(_ignore_proactor_reset)
+
     app = hub.build_app()
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()

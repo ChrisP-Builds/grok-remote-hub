@@ -104,6 +104,169 @@ def counts_toward_agent_ttfb(update_kind: str | None) -> bool:
     return True
 
 
+def session_notification_kind(params: dict | None) -> str:
+    """Resolve notification kind from params.kind, update.sessionUpdate, or params.
+
+    x.ai session_notification may put kind on params.kind while classic ACP
+    shapes use update.sessionUpdate / params.sessionUpdate.
+    """
+    if not isinstance(params, dict):
+        return ""
+    kind = params.get("kind")
+    if kind is not None and str(kind).strip():
+        return str(kind).strip()
+    update = params.get("update")
+    if isinstance(update, dict):
+        for key in ("sessionUpdate", "session_update", "kind"):
+            val = update.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+    for key in ("sessionUpdate", "session_update"):
+        val = params.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return ""
+
+
+def notification_counts_as_turn_activity(kind: str | None) -> bool:
+    """True when _x.ai/session_notification kind means agent is alive mid-turn.
+
+    Prevents false no-output force-clear while subagents/goals progress without
+    classic session/update chunks.
+    """
+    if kind is None:
+        return False
+    k = str(kind).strip().casefold()
+    if not k:
+        return False
+    if k in (
+        "subagent_progress",
+        "tool_call_delta_chunk",
+        "tool_call_delta",
+        "goal_updated",
+        "goal_completed",
+        "pending_interaction",
+        "interaction_resolved",
+        "hook_execution",
+    ):
+        return True
+    if k.startswith("auto_compact_"):
+        return True
+    if k.startswith("subagent_"):
+        return True
+    if k.startswith("goal_"):
+        return True
+    return False
+
+
+# After force-clear, orphan session_notification activity (subagent_progress, etc.)
+# still means the agent is working. Keep rail/status "working" for this TTL.
+BG_ACTIVITY_TTL_S = 45.0
+# First 90s of heartbeats can still count as working (real subagent start).
+BG_HEARTBEAT_GRACE_S = 90.0
+# After this much episode age with only heartbeats → stuck.
+BG_HEARTBEAT_STUCK_S = 120.0
+# Hard wall: drop bg status after 10 min without rich activity.
+BG_ACTIVITY_MAX_S = 600.0
+
+
+def bg_activity_is_live(
+    last_at: float | None,
+    now: float,
+    ttl: float = BG_ACTIVITY_TTL_S,
+) -> bool:
+    """True when last background-activity stamp is within ttl of now (monotonic)."""
+    if last_at is None:
+        return False
+    try:
+        age = float(now) - float(last_at)
+        return age >= 0.0 and age < float(ttl)
+    except (TypeError, ValueError):
+        return False
+
+
+def notification_is_heartbeat_only(kind: str | None) -> bool:
+    """True for subagent_progress only (pure keepalive, not rich work)."""
+    k = str(kind or "").strip().casefold()
+    return k == "subagent_progress"
+
+
+def notification_is_rich_activity(kind: str | None) -> bool:
+    """True when notification implies real work (not pure heartbeat)."""
+    if not notification_counts_as_turn_activity(kind):
+        return False
+    return not notification_is_heartbeat_only(kind)
+
+
+def bg_activity_phase(
+    *,
+    started_at: float | None,
+    last_at: float | None,
+    rich_at: float | None,
+    now: float,
+    ttl: float = BG_ACTIVITY_TTL_S,
+    grace_s: float = BG_HEARTBEAT_GRACE_S,
+    stuck_s: float = BG_HEARTBEAT_STUCK_S,
+    max_s: float = BG_ACTIVITY_MAX_S,
+) -> str:
+    """Return 'idle' | 'working' | 'stuck'.
+
+    - idle: no last_at within ttl
+    - working: live and (rich activity recent OR age < grace_s)
+    - stuck: live but heartbeat-only past grace (age >= grace_s without recent rich),
+      including age >= stuck_s / max_s; caller may drop stamps after max_s
+    """
+    if not bg_activity_is_live(last_at, now, ttl):
+        return "idle"
+    start = started_at if started_at is not None else last_at
+    try:
+        age = float(now) - float(start) if start is not None else 0.0
+    except (TypeError, ValueError):
+        age = 0.0
+    if age < 0.0:
+        age = 0.0
+
+    rich_recent = False
+    if rich_at is not None:
+        try:
+            rich_age = float(now) - float(rich_at)
+            rich_recent = rich_age >= 0.0 and rich_age < float(stuck_s)
+        except (TypeError, ValueError):
+            rich_recent = False
+
+    if rich_recent:
+        return "working"
+    if age < float(grace_s):
+        return "working"
+    # Past grace with only heartbeats (or no rich within stuck window) → stuck.
+    # max_s is a hard wall for callers that auto-drop stamps after long orphan heartbeats.
+    if age >= float(max_s) or age >= float(stuck_s) or age >= float(grace_s):
+        return "stuck"
+    return "working"
+
+
+def bg_activity_label(kind: str | None) -> str:
+    """Short UI label for a background/session_notification activity kind."""
+    if kind is None:
+        return "active"
+    k = str(kind).strip().casefold()
+    if not k:
+        return "active"
+    if k == "subagent_progress" or k.startswith("subagent_"):
+        return "subagent running"
+    if k.startswith("goal_"):
+        return "goal active"
+    if k in ("tool_call_delta", "tool_call_delta_chunk"):
+        return "tool active"
+    if k == "hook_execution":
+        return "hook running"
+    if k in ("pending_interaction", "interaction_resolved"):
+        return "interaction"
+    if k.startswith("auto_compact_"):
+        return "compacting"
+    return k.replace("_", " ")
+
+
 def apply_turn_activity(
     meta: dict,
     *,

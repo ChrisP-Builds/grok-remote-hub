@@ -43,3 +43,4 @@ a new ADR.
 | 016 | Quiet-period session/load suppress before re-prompt | Accepted | 2026-07-17 |
 | 017 | Unresumable dead view forces pin (no blank fork) | Accepted | 2026-07-24 |
 | 018 | Cold ensure vs hot path attribution | Accepted | 2026-07-24 |
+| 019 | External hub health watchdog (scheduled watch-hub) | Accepted | 2026-07-26 |

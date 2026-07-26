@@ -1500,6 +1500,26 @@ a {
   border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
 }
 
+.session-pill.status-stuck {
+  background: color-mix(in srgb, var(--danger) 22%, transparent);
+  color: var(--danger);
+  border: 1px solid color-mix(in srgb, var(--danger) 50%, transparent);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  font-size: 0.68em;
+}
+
+.session-row.status-stuck .live-bar {
+  background: var(--danger);
+  animation: pulse-bar 1.2s ease-in-out infinite;
+}
+
+.session-row.status-stuck {
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--danger) 28%, transparent);
+}
+
 .session-pill.status-question {
   background: color-mix(in srgb, var(--accent, #6ea8fe) 32%, transparent);
   color: var(--accent, #6ea8fe);

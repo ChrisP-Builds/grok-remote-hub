@@ -813,6 +813,12 @@
     reconnectTimer: null,
     healthProbeTimer: null,
     hubReachable: null, // null | true | false (from /health while reconnecting)
+    /** Wall ms when hubReachable first became false (for hard recovery). */
+    _hubUnreachableSince: null,
+    /** One location.reload() per page life after reconnect exhaustion + health down. */
+    _didHardReload: false,
+    /** Cooldown wall ms for forced connectWs when health ok but WS still down. */
+    _lastForceConnectAt: 0,
     bootId: null,
     startedAt: null,
     /** Set when noteBootId sees a new process bootId (hub process restarted). */
@@ -2246,7 +2252,10 @@
     if (flags[sessionId] === "question") return "question";
     const turns = state.liveTurns || [];
     for (let i = 0; i < turns.length; i++) {
-      if (turns[i] && turns[i].sessionId === sessionId) return "working";
+      const t = turns[i];
+      if (!t || t.sessionId !== sessionId) continue;
+      if (t.state === "stuck" || t.heartbeatOnly === true) return "stuck";
+      return "working";
     }
     // Legacy single-turn fallback
     if (
@@ -2256,12 +2265,19 @@
     ) {
       return "working";
     }
+    if (flags[sessionId] === "stuck") return "stuck";
     if (flags[sessionId] === "working") return "working";
     // Explicit idle flag wins over stale sessions-list liveStatus (stall clear).
     if (flags[sessionId] === "idle") return "idle";
     // Session payload liveStatus from list scan
     const row = (state.sessions || []).find((s) => s.sessionId === sessionId);
-    if (row && (row.liveStatus === "working" || row.liveStatus === "question" || row.liveStatus === "idle")) {
+    if (
+      row &&
+      (row.liveStatus === "working" ||
+        row.liveStatus === "question" ||
+        row.liveStatus === "stuck" ||
+        row.liveStatus === "idle")
+    ) {
       return row.liveStatus;
     }
     return "idle";
@@ -2269,7 +2285,7 @@
 
   function sessionStatusRank(st) {
     if (st === "question") return 2;
-    if (st === "working") return 1;
+    if (st === "working" || st === "stuck") return 1;
     return 0;
   }
 
@@ -2281,11 +2297,18 @@
   /**
    * Near-streaming pill updates: set live flags without thrashing full list rebuild.
    * @param {string} sessionId
-   * @param {"working"|"question"|"idle"} mode
+   * @param {"working"|"question"|"idle"|"stuck"} mode
    */
   function markSessionActivity(sessionId, mode) {
     if (!sessionId) return;
-    if (mode !== "working" && mode !== "question" && mode !== "idle") return;
+    if (
+      mode !== "working" &&
+      mode !== "question" &&
+      mode !== "idle" &&
+      mode !== "stuck"
+    ) {
+      return;
+    }
     if (!state.sessionFlags) state.sessionFlags = {};
 
     if (mode === "working") {
@@ -2299,6 +2322,28 @@
       if (!state.liveTurns) state.liveTurns = [];
       if (!state.liveTurns.some((t) => t && t.sessionId === sessionId)) {
         state.liveTurns.push({ sessionId: sessionId, state: "running" });
+      }
+    } else if (mode === "stuck") {
+      // Never overwrite question with stuck.
+      if (state.sessionFlags[sessionId] !== "question") {
+        state.sessionFlags[sessionId] = "stuck";
+      }
+      if (!state.liveTurns) state.liveTurns = [];
+      let found = false;
+      for (let i = 0; i < state.liveTurns.length; i++) {
+        const t = state.liveTurns[i];
+        if (t && t.sessionId === sessionId) {
+          t.state = "stuck";
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        state.liveTurns.push({
+          sessionId: sessionId,
+          state: "stuck",
+          background: true,
+        });
       }
     } else if (mode === "question") {
       state.sessionFlags[sessionId] = "question";
@@ -2367,7 +2412,7 @@
     _sessionPillRanks = nextRanks;
   }
 
-  /** In-place Working / Needs reply pill updates (no list rebuild). */
+  /** In-place Working / Needs reply / Stuck pill updates (no list rebuild). */
   function syncVisibleSessionPills() {
     if (!els.sessionList) return;
     const rows = els.sessionList.querySelectorAll(".session-row[data-session-id]");
@@ -2376,23 +2421,38 @@
       const id = btn.getAttribute("data-session-id");
       if (!id) continue;
       const liveStatus = sessionLiveStatus(id);
-      btn.classList.remove("turn-live", "status-working", "status-question");
+      btn.classList.remove(
+        "turn-live",
+        "status-working",
+        "status-question",
+        "status-stuck"
+      );
       if (liveStatus === "working") btn.classList.add("turn-live", "status-working");
       if (liveStatus === "question") btn.classList.add("turn-live", "status-question");
+      if (liveStatus === "stuck") btn.classList.add("turn-live", "status-stuck");
 
       const titleRow = btn.querySelector(".title-row");
       if (titleRow) {
         const stale = titleRow.querySelectorAll(
-          ".session-pill.status-working, .session-pill.status-question"
+          ".session-pill.status-working, .session-pill.status-question, .session-pill.status-stuck"
         );
         for (let j = 0; j < stale.length; j++) stale[j].remove();
-        if (liveStatus === "working" || liveStatus === "question") {
+        if (
+          liveStatus === "working" ||
+          liveStatus === "question" ||
+          liveStatus === "stuck"
+        ) {
           const pill = document.createElement("span");
-          pill.className =
-            liveStatus === "working"
-              ? "session-pill status-working"
-              : "session-pill status-question";
-          pill.textContent = liveStatus === "working" ? "Working" : "Needs reply";
+          if (liveStatus === "stuck") {
+            pill.className = "session-pill status-stuck";
+            pill.textContent = "Stuck";
+          } else if (liveStatus === "working") {
+            pill.className = "session-pill status-working";
+            pill.textContent = "Working";
+          } else {
+            pill.className = "session-pill status-question";
+            pill.textContent = "Needs reply";
+          }
           const title = titleRow.querySelector(".title");
           if (title && title.nextSibling) {
             titleRow.insertBefore(pill, title.nextSibling);
@@ -2407,7 +2467,10 @@
       const meta = btn.querySelector(".meta");
       if (meta) {
         let turnHint = meta.querySelector(".turn-hint");
-        const isLiveTurn = liveStatus === "working" || liveStatus === "question";
+        const isLiveTurn =
+          liveStatus === "working" ||
+          liveStatus === "question" ||
+          liveStatus === "stuck";
         const hint = sessionListProgressHint({
           is_live_turn: isLiveTurn,
           tool: toolTitleForSession(id),
@@ -2428,10 +2491,23 @@
     }
   }
 
+  /**
+   * Strip / Stop / composer "turn running" for the selected session.
+   * Server liveTurns is sole running authority; stale sessionFlags working/stuck
+   * alone must not lock the strip as running · 4000s.
+   */
   function turnRunningOnSelected() {
     if (!state.selectedId) return false;
-    const st = sessionLiveStatus(state.selectedId);
-    return st === "working" || st === "question";
+    const sid = state.selectedId;
+    const turns = state.liveTurns || [];
+    for (let i = 0; i < turns.length; i++) {
+      if (turns[i] && turns[i].sessionId === sid) return true;
+    }
+    const pending = state.pendingQuestionSessions || [];
+    if (pending.indexOf(sid) >= 0) return true;
+    const flags = state.sessionFlags || {};
+    if (flags[sid] === "question") return true;
+    return false;
   }
 
   function hasOtherProjectTurn() {
@@ -2705,6 +2781,8 @@
   function updateTurnStrip() {
     if (!els.turnStrip || !els.turnStripText) return;
     const running = turnRunningOnSelected();
+    // Belt: drop frozen ages when strip is not running for selected.
+    if (!running) state.turnStartedAt = null;
     const model =
       (state.selectedMeta && state.selectedMeta.modelId) ||
       (els.chatModel && !els.chatModel.classList.contains("hidden") ? els.chatModel.textContent : "") ||
@@ -2769,9 +2847,20 @@
     updateCapacityBanner();
   }
 
+  /** Orphan heartbeat-only background turn past grace (server state stuck). */
+  function isBgStuck(turn) {
+    if (!turn) return false;
+    return (
+      turn.state === "stuck" ||
+      turn.heartbeatOnly === true ||
+      turn.phase === "stuck"
+    );
+  }
+
   /**
    * Compact multi-turn capacity strip from status.liveTurns / capacity.
-   * Soft language: "quiet" (not stuck) until silence >= 120s; warn tint then.
+   * Soft language: "quiet" until silence >= 120s; Stuck only for orphan
+   * subagent heartbeat background turns.
    */
   function updateCapacityBanner() {
     if (!els.capacityBanner || !els.capacityBannerText) return;
@@ -2807,6 +2896,7 @@
     if (!turn && turns.length) turn = turns[0];
 
     let silence = turn && turn.silenceSeconds != null ? Number(turn.silenceSeconds) : null;
+    let ageSec = turn && turn.ageSeconds != null ? Number(turn.ageSeconds) : null;
     let sawUpdate = turn ? !!turn.sawUpdate : false;
     if (silence == null && state.turnSilenceSeconds != null) {
       silence = Number(state.turnSilenceSeconds);
@@ -2815,13 +2905,20 @@
       // top-level primary turn may still have sawUpdate via liveTurns only
       sawUpdate = false;
     }
-    // Drift silence from last status so banner ticks between WS broadcasts.
+    // Drift silence/age from last status so banner ticks between WS broadcasts.
     if (silence != null && state._capacityStatusAt) {
       silence = silence + (Date.now() - state._capacityStatusAt) / 1000;
     }
+    if (ageSec != null && state._capacityStatusAt) {
+      ageSec = ageSec + (Date.now() - state._capacityStatusAt) / 1000;
+    }
     if (silence == null || Number.isNaN(silence) || silence < 0) silence = 0;
+    if (ageSec == null || Number.isNaN(ageSec) || ageSec < 0) ageSec = silence;
     const silenceS = Math.floor(silence);
+    const ageS = Math.floor(ageSec);
     const warn = silenceS >= 120;
+    const bg = !!(turn && turn.background === true);
+    const stuck = isBgStuck(turn);
     // Selected pane open tools/plan: mid-tool wait, not bare hang.
     const pane =
       (state.activePane && !state.activePane.hidden && state.activePane) ||
@@ -2833,9 +2930,14 @@
       residual.tool_pending + residual.tool_running > 0 ||
       residual.plan_pending + residual.plan_running > 0;
     // Soft language until warn threshold; still "quiet" (tint carries severity).
-    // When silence high but tools open: "Working · tool open · quiet Ns".
+    // Bg turns: continuous episode age (not waiting first token / silence thrash).
+    // Stuck: orphan subagent heartbeat past grace.
     let detail;
-    if (hasOpenTools && selectedBusy) {
+    if (stuck) {
+      detail = `subagent heartbeat · ${ageS}s`;
+    } else if (bg) {
+      detail = `subagent · ${ageS}s`;
+    } else if (hasOpenTools && selectedBusy) {
       detail = `tool open · quiet ${silenceS}s`;
     } else if (sawUpdate) {
       detail = `quiet ${silenceS}s`;
@@ -2844,11 +2946,13 @@
     }
     const text = onOther
       ? `Busy on other session · ${detail}`
-      : `Working · ${detail}`;
+      : stuck
+        ? `Stuck · ${detail}`
+        : `Working · ${detail}`;
 
     els.capacityBannerText.textContent = text;
     els.capacityBanner.classList.remove("hidden");
-    els.capacityBanner.dataset.state = warn ? "warn" : "working";
+    els.capacityBanner.dataset.state = stuck || warn ? "warn" : "working";
   }
 
   function composerConnected() {
@@ -2977,16 +3081,27 @@
     }
 
     // Server idle for selected: do not leave huge frozen ages on the strip.
+    // Clear unconditionally when !selectedLive (no turnRunningOnSelected guard).
     if (
       selected &&
       !selectedLive &&
       (Array.isArray(s.liveTurns) || s.turnRunning === false)
     ) {
-      if (!turnRunningOnSelected()) {
-        state.turnStartedAt = null;
-        state.lastTermLineAt = null;
-      }
+      state.turnStartedAt = null;
+      state.lastTermLineAt = null;
       return;
+    }
+
+    // Selected liveTurns entry that is background-only (continuous episode age).
+    let selectedBg = false;
+    if (selected) {
+      for (let i = 0; i < liveTurns.length; i++) {
+        const t = liveTurns[i];
+        if (t && t.sessionId === selected && t.background === true) {
+          selectedBg = true;
+          break;
+        }
+      }
     }
 
     const now = Date.now();
@@ -3004,7 +3119,18 @@
     });
     if (age != null) {
       const wall = wallMsFromAgeSeconds(now, age);
-      if (wall != null) state.turnStartedAt = wall;
+      if (wall != null) {
+        // Never move bg turnStartedAt later (age drop on pulse would thrash).
+        if (
+          selectedBg &&
+          state.turnStartedAt != null &&
+          wall > state.turnStartedAt
+        ) {
+          // keep earlier wall = continuous episode age
+        } else {
+          state.turnStartedAt = wall;
+        }
+      }
     }
     if (silence != null) {
       const wall = wallMsFromAgeSeconds(now, silence);
@@ -3795,10 +3921,15 @@
             }
           } catch (_) {}
         }
-        // Server reported no lives: force remaining working flags idle
+        // Server reported no lives: force remaining working/stuck flags idle
         if (opts && opts.forceIdleFlags && state.sessionFlags) {
           for (const k of Object.keys(state.sessionFlags)) {
-            if (state.sessionFlags[k] === "working") state.sessionFlags[k] = "idle";
+            if (
+              state.sessionFlags[k] === "working" ||
+              state.sessionFlags[k] === "stuck"
+            ) {
+              state.sessionFlags[k] = "idle";
+            }
           }
         }
       } else {
@@ -4099,11 +4230,11 @@
         const ap = isPinned(a.sessionId) ? 1 : 0;
         const bp = isPinned(b.sessionId) ? 1 : 0;
         if (ap !== bp) return bp - ap;
-        // Question sessions first (agent waiting), then working, then rest.
+        // Question sessions first (agent waiting), then working/stuck, then rest.
         const rank = (s) => {
           const st = sessionLiveStatus(s.sessionId) || s.liveStatus || "idle";
           if (st === "question") return 2;
-          if (st === "working") return 1;
+          if (st === "working" || st === "stuck") return 1;
           return 0;
         };
         const ar = rank(a);
@@ -4143,9 +4274,13 @@
       if (s.sessionId === state.status.loadedSessionId) btn.classList.add("live");
       const liveStatus = sessionLiveStatus(s.sessionId) || s.liveStatus || "idle";
       nextPillRanks[s.sessionId] = sessionStatusRank(liveStatus);
-      const isLiveTurn = liveStatus === "working" || liveStatus === "question";
+      const isLiveTurn =
+        liveStatus === "working" ||
+        liveStatus === "question" ||
+        liveStatus === "stuck";
       if (liveStatus === "working") btn.classList.add("turn-live", "status-working");
       if (liveStatus === "question") btn.classList.add("turn-live", "status-question");
+      if (liveStatus === "stuck") btn.classList.add("turn-live", "status-stuck");
 
       const bar = document.createElement("span");
       bar.className = "live-bar";
@@ -4160,7 +4295,12 @@
       title.className = "title";
       title.textContent = s.title || "Untitled session";
       titleRow.appendChild(title);
-      if (liveStatus === "working") {
+      if (liveStatus === "stuck") {
+        const pill = document.createElement("span");
+        pill.className = "session-pill status-stuck";
+        pill.textContent = "Stuck";
+        titleRow.appendChild(pill);
+      } else if (liveStatus === "working") {
         const pill = document.createElement("span");
         pill.className = "session-pill status-working";
         pill.textContent = "Working";
@@ -5946,6 +6086,22 @@
     return STREAM_WORKING_KINDS.has(String(kind || ""));
   }
 
+  /**
+   * x.ai session_notification kinds that mean agent is still alive (bg work).
+   * Must paint Working / activity line; must not early-return all notifications.
+   */
+  function isBgActivityKind(kind) {
+    const k = String(kind || "").trim().toLowerCase();
+    if (!k) return false;
+    if (k === "subagent_progress") return true;
+    if (k.startsWith("subagent_")) return true;
+    if (k.startsWith("goal_")) return true;
+    if (k === "tool_call_delta" || k === "tool_call_delta_chunk") return true;
+    if (k === "hook_execution") return true;
+    if (k === "pending_interaction" || k === "interaction_resolved") return true;
+    return false;
+  }
+
   function handleAcpMessage(sessionId, message) {
     const method = message.method || "";
     const isSessionUpdate =
@@ -5956,15 +6112,28 @@
     if (!isSessionUpdate && !isSessionNotification) {
       return;
     }
-    const update = (message.params && message.params.update) || message.params || {};
-    const kind = update.sessionUpdate || update.session_update || "";
+    const params = message.params || {};
+    const update = (params && params.update) || params || {};
+    // x.ai notifications use params.kind; classic ACP uses update.sessionUpdate.
+    const kind =
+      update.sessionUpdate ||
+      update.session_update ||
+      (params.kind != null && String(params.kind).trim()) ||
+      "";
 
     // Compact lifecycle via session_notification (hub also sends type:compact).
     // Do not treat as generic stream "working" forever.
-    if (isSessionNotification || (kind && String(kind).startsWith("auto_compact_"))) {
-      if (String(kind).startsWith("auto_compact_")) {
-        handleCompactNotification(sessionId, update, kind);
-      }
+    if (String(kind).startsWith("auto_compact_")) {
+      handleCompactNotification(sessionId, update, kind);
+      return;
+    }
+
+    // Other session_notifications: only bg activity paints; ignore the rest.
+    if (
+      isSessionNotification &&
+      !isBgActivityKind(kind) &&
+      !isStreamWorkingKind(kind)
+    ) {
       return;
     }
 
@@ -5982,10 +6151,23 @@
     // Child subagent activity → parent turn strip when parent is selected.
     feedParentActivityFromChild(targetId, kind, update);
 
-    // Stream activity → Working pill immediately (including offscreen sessions).
+    // Stream / bg activity → Working pill immediately (including offscreen sessions).
     // markSessionActivity never overwrites question with working.
-    if (isStreamWorkingKind(kind)) {
+    if (isStreamWorkingKind(kind) || isBgActivityKind(kind)) {
       markSessionActivity(targetId, "working");
+    }
+
+    // Bg session_notification (e.g. subagent_progress): activity line only.
+    if (isBgActivityKind(kind) && isSessionNotification) {
+      const label =
+        kind === "subagent_progress" || String(kind).startsWith("subagent_")
+          ? "subagent · progress"
+          : String(kind).replace(/_/g, " ");
+      setSessionActivityLine(targetId, label, {
+        toolTitle: kind === "subagent_progress" ? "subagent" : kind,
+      });
+      scheduleTurnStrip();
+      return;
     }
 
     // Queued user echoes may use view id while selection is live (or vice versa).
@@ -6110,6 +6292,15 @@
         message: data.message || "",
         cwd: data.cwd || cwd || "",
         reason: data.reason || "",
+        loadSettled: !!data.loadSettled,
+        settleMs:
+          typeof data.settleMs === "number" && Number.isFinite(data.settleMs)
+            ? data.settleMs
+            : 0,
+        ensureMs:
+          typeof data.ensureMs === "number" && Number.isFinite(data.ensureMs)
+            ? data.ensureMs
+            : 0,
       };
     } catch (err) {
       if (showFailToast) toast("Attach failed: " + err, "danger");
@@ -6216,50 +6407,76 @@
 
     // Restore live/cached pane without wiping the in-flight stream / replaying history.
     const reusePane = hasCachedContent;
-    if (reusePane) {
-      rebuildToolsFromPane(paneView);
-      state.streamBuffers = paneView.streamBuffers;
-      if (state.stickToBottom) jumpToLatest();
-    } else {
-      // HTTP history only when pane empty / not historyLoaded
+    // Attach-on-open: ensure live hub session for cwd (no foreign session/load).
+    // While a turn is running on another session, attach takes the ACP lock and
+    // hangs openSession for the whole tool run — skip it (history/pane only).
+    const skipAttachMidTurn =
+      !!state.turnRunning &&
+      !isLiveTurnHere &&
+      !!liveKeep &&
+      liveKeep !== viewId;
+    // Parallel history + attach when both needed: paint history first, then
+    // apply attach switch so dead_view does not clear history before paint.
+    const needHist = !reusePane;
+    const needAttach = !skipAttachMidTurn && !(isLiveTurnHere && reusePane);
+
+    async function fetchAndApplyHistory(forViewId) {
       try {
-        const res = await fetch(apiUrl(`/api/sessions/${encodeURIComponent(viewId)}/history`));
+        const res = await fetch(
+          apiUrl(`/api/sessions/${encodeURIComponent(forViewId)}/history`)
+        );
         const data = await res.json();
-        if (state.selectedId !== viewId) {
-          return { ok: false, reason: "cancelled", viewId };
+        if (state.selectedId !== forViewId) {
+          return { cancelled: true };
         }
         const histMsgs = data.messages || [];
         applyHistoryMessages(histMsgs, {
           jump: !!state.stickToBottom,
         });
-        rehydrateGoalFromHistory(viewId, histMsgs);
+        rehydrateGoalFromHistory(forViewId, histMsgs);
+        return { cancelled: false };
       } catch (err) {
-        if (state.selectedId !== viewId) {
-          return { ok: false, reason: "cancelled", viewId };
+        if (state.selectedId !== forViewId) {
+          return { cancelled: true };
         }
         clearTranscript();
         showEmptyMain(false);
-        showSessionPane(viewId);
+        showSessionPane(forViewId);
         appendMessage({ role: "system", text: "Failed to load history: " + err });
         state.historyLoadedFor = null;
         state.historyFingerprint = null;
+        return { cancelled: false, error: err };
       }
+    }
+
+    if (reusePane) {
+      rebuildToolsFromPane(paneView);
+      state.streamBuffers = paneView.streamBuffers;
+      if (state.stickToBottom) jumpToLatest();
+    }
+
+    const histPromise = needHist
+      ? fetchAndApplyHistory(viewId)
+      : Promise.resolve({ cancelled: false });
+    const attachPromise = needAttach
+      ? attachSessionLive(viewId, session.cwd || "", {
+          focusOnFail: true,
+          showFailToast: true,
+        })
+      : Promise.resolve(null);
+
+    // Prefer history paint before attach switch handling.
+    const histResult = await histPromise;
+    if (histResult && histResult.cancelled) {
+      return { ok: false, reason: "cancelled", viewId };
     }
     // Transcript visible: pin sticky user for section under view / live turn.
     scheduleStickyUserFromScroll();
     updateGoalBanner();
     syncGoalTick();
 
-    // Attach-on-open: ensure live hub session for cwd (no foreign session/load).
-    // While a turn is running on another session, attach takes the ACP lock and
-    // hangs openSession for the whole tool run — skip it (history/pane only).
     let liveId = viewId;
     let switched = false;
-    const skipAttachMidTurn =
-      !!state.turnRunning &&
-      !isLiveTurnHere &&
-      !!liveKeep &&
-      liveKeep !== viewId;
     if (skipAttachMidTurn) {
       setSessionMode("history", { attachSwitched: false });
       subscribeSessionIds(viewId, liveKeep);
@@ -6268,12 +6485,9 @@
       forceComposerUnlocked();
       return { ok: true, viewId, liveId: viewId, switched: false, historyOnly: true };
     }
-    if (!(isLiveTurnHere && reusePane)) {
+    if (needAttach) {
       try {
-        const attached = await attachSessionLive(viewId, session.cwd || "", {
-          focusOnFail: true,
-          showFailToast: true,
-        });
+        const attached = await attachPromise;
         if (!attached) {
           subscribeSessionIds(viewId, liveKeep);
           return { ok: false, reason: "attach_failed", viewId };
@@ -6450,6 +6664,55 @@
     if (startedAt != null) state.startedAt = startedAt;
   }
 
+  /**
+   * Hard recovery without CLI: one page reload if WS reconnects keep failing
+   * while /health stays down >30s; if health is ok but WS is still down, force
+   * connectWs (cooldown) so the strip does not sit forever on "Reconnecting".
+   */
+  function maybeHardRecoverFromDeadHub() {
+    const HARD_RECONNECT_ATTEMPTS = 8;
+    const UNREACHABLE_MS = 30000;
+    const FORCE_CONNECT_COOLDOWN_MS = 15000;
+    const wsDown =
+      state.wsState === "reconnecting" || state.wsState === "connecting";
+    if (!wsDown) return;
+
+    if (state.hubReachable === false) {
+      if (state._hubUnreachableSince == null) {
+        state._hubUnreachableSince = Date.now();
+      }
+      const downFor = Date.now() - state._hubUnreachableSince;
+      if (
+        state.reconnectAttempt >= HARD_RECONNECT_ATTEMPTS &&
+        downFor > UNREACHABLE_MS &&
+        !state._didHardReload
+      ) {
+        state._didHardReload = true;
+        try {
+          location.reload();
+        } catch (_) {}
+      }
+      return;
+    }
+
+    if (state.hubReachable === true) {
+      state._hubUnreachableSince = null;
+      // Health ok but WS still not open after several attempts: force connect.
+      if (
+        state.reconnectAttempt >= 3 &&
+        state.wsState !== "open" &&
+        Date.now() - (state._lastForceConnectAt || 0) > FORCE_CONNECT_COOLDOWN_MS
+      ) {
+        state._lastForceConnectAt = Date.now();
+        if (state.reconnectTimer) {
+          clearTimeout(state.reconnectTimer);
+          state.reconnectTimer = null;
+        }
+        connectWs();
+      }
+    }
+  }
+
   function probeHubHealth() {
     fetch("/health", { method: "GET", cache: "no-store" })
       .then((r) => {
@@ -6462,12 +6725,14 @@
         if (state.wsState === "reconnecting" || state.wsState === "connecting") {
           updateStatusPill();
         }
+        maybeHardRecoverFromDeadHub();
       })
       .catch(() => {
         state.hubReachable = false;
         if (state.wsState === "reconnecting" || state.wsState === "connecting") {
           updateStatusPill();
         }
+        maybeHardRecoverFromDeadHub();
       });
   }
 
@@ -6938,6 +7203,8 @@
     if (state.reconnectAttempt >= 3) {
       updateStatusPill();
     }
+    maybeHardRecoverFromDeadHub();
+    if (state._didHardReload) return;
     const delay = Math.min(1000 * Math.pow(1.6, state.reconnectAttempt), 12000);
     state.reconnectTimer = setTimeout(connectWs, delay);
   }
@@ -7187,6 +7454,27 @@
     }
     if (type === "acp") {
       handleAcpMessage(msg.sessionId, msg.message || {});
+      return;
+    }
+    if (type === "activity") {
+      // Lightweight bg pulse (subagent_progress after force-clear).
+      // Refresh silence via noteTermLineActivity; do not reset episode age.
+      const actSid = msg.sessionId || null;
+      if (!actSid) return;
+      noteTermLineActivity();
+      if (msg.phase === "stuck") {
+        markSessionActivity(actSid, "stuck");
+      } else {
+        markSessionActivity(actSid, "working");
+      }
+      const label =
+        (msg.label && String(msg.label).trim()) ||
+        (msg.kind && String(msg.kind).replace(/_/g, " ")) ||
+        "active";
+      setSessionActivityLine(actSid, label, {
+        toolTitle: msg.kind || "subagent",
+      });
+      scheduleTurnStrip();
       return;
     }
     if (type === "compact") {
@@ -8438,8 +8726,60 @@
     if (els.imageLightbox) els.imageLightbox.classList.add("hidden");
   }
 
-  function ensureMermaidReady() {
+  /** Load a script tag once; concurrent callers share the same promise. */
+  const _scriptLoadPromises = Object.create(null);
+  function loadScriptOnce(src) {
+    const url = String(src || "");
+    if (!url) return Promise.reject(new Error("empty script src"));
+    if (_scriptLoadPromises[url]) return _scriptLoadPromises[url];
+    _scriptLoadPromises[url] = new Promise((resolve, reject) => {
+      const existing = document.querySelector('script[src="' + url + '"]');
+      if (existing) {
+        if (existing.dataset.loaded === "1" || existing.getAttribute("data-loaded") === "1") {
+          resolve();
+          return;
+        }
+        existing.addEventListener("load", () => resolve(), { once: true });
+        existing.addEventListener(
+          "error",
+          () => reject(new Error("script load failed: " + url)),
+          { once: true }
+        );
+        return;
+      }
+      const s = document.createElement("script");
+      s.src = url;
+      s.async = true;
+      s.onload = () => {
+        s.dataset.loaded = "1";
+        resolve();
+      };
+      s.onerror = () => reject(new Error("script load failed: " + url));
+      document.head.appendChild(s);
+    });
+    return _scriptLoadPromises[url];
+  }
+
+  let mermaidLoadPromise = null;
+
+  async function ensureMermaidReady() {
     if (state.mermaidReady) return true;
+    if (typeof window.mermaid === "undefined") {
+      if (!mermaidLoadPromise) {
+        mermaidLoadPromise = loadScriptOnce("/vendor/mermaid.min.js").catch(
+          (err) => {
+            mermaidLoadPromise = null;
+            throw err;
+          }
+        );
+      }
+      try {
+        await mermaidLoadPromise;
+      } catch (err) {
+        console.warn("mermaid load failed", err);
+        return false;
+      }
+    }
     if (typeof window.mermaid === "undefined") return false;
     try {
       window.mermaid.initialize({
@@ -8458,7 +8798,7 @@
   }
 
   async function renderMermaidBlocks(root) {
-    if (!root || !ensureMermaidReady()) return;
+    if (!root || !(await ensureMermaidReady())) return;
     const blocks = Array.from(root.querySelectorAll("pre > code.language-mermaid, pre.language-mermaid > code, code.language-mermaid"));
     const seen = new Set();
     const targets = [];
@@ -11419,9 +11759,15 @@
         const savedId = saved && saved.sessionId;
         if (savedId && Array.isArray(state.sessions)) {
           const row = state.sessions.find((s) => s && s.sessionId === savedId);
+          // Cap restore so a hung attach never blocks connectWs forever.
+          const openWithCap = (sess) =>
+            Promise.race([
+              openSession(sess),
+              new Promise((resolve) => setTimeout(resolve, 12000)),
+            ]);
           if (row) {
             try {
-              await openSession(row);
+              await openWithCap(row);
             } catch (_) {
               // Leave empty-main; connectWs still runs below.
             }
@@ -11433,7 +11779,7 @@
               if (hRes.status === 404) {
                 clearSelectedSession();
               } else if (hRes.ok) {
-                await openSession({
+                await openWithCap({
                   sessionId: savedId,
                   title: (saved && saved.title) || "Session",
                   cwd: (saved && saved.cwd) || "",

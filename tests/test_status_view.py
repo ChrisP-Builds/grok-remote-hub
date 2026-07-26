@@ -12,6 +12,9 @@ from hub.status_view import (
     ACP_ZOMBIE_SEND_FAILURES,
     LOAD_SUPPRESS_MAX_S,
     LOAD_SUPPRESS_QUIET_S,
+    LOAD_SUPPRESS_QUIET_SMALL_S,
+    LOAD_SUPPRESS_SMALL_FRAME_MAX,
+    load_suppress_quiet_s_for_count,
     load_suppress_should_release,
     map_acp_quality,
     map_agent_status,
@@ -490,6 +493,60 @@ def test_server_status_exposes_turn_telemetry_and_capacity() -> None:
     assert "first_update_at" in acp
 
 
+def test_server_records_bg_activity_and_activity_event() -> None:
+    """Orphan subagent_progress after force-clear: bg stamp + type:activity + flags."""
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    acp = (ROOT / "hub" / "acp_client.py").read_text(encoding="utf-8")
+    multi = (ROOT / "hub" / "multi_turn.py").read_text(encoding="utf-8")
+    policy = (ROOT / "hub" / "session_policy.py").read_text(encoding="utf-8")
+    assert "note_bg_activity" in acp
+    assert "live_bg_activity_sessions" in acp
+    assert "on_session_activity" in acp
+    assert "_bg_activity_at" in acp
+    assert "_bg_activity_started_at" in acp
+    assert "_bg_activity_kind" in acp
+    assert "_bg_activity_rich_at" in acp
+    assert "def bg_activity_ages" in acp
+    assert "def bg_activity_status_map" in acp
+    assert "def clear_bg_activity" in acp
+    assert "def _on_session_activity" in src
+    assert '"type": "activity"' in src or "'type': 'activity'" in src
+    assert "background_active" in multi
+    assert "background_stuck" in multi
+    assert "STATUS_STUCK" in multi
+    assert "bg_activity_status_map" in src
+    assert "clear_bg_activity" in src
+    assert "bg_activity_ages" in src
+    assert "BG_ACTIVITY_TTL_S" in policy
+    assert "BG_HEARTBEAT_GRACE_S" in policy
+    assert "BG_ACTIVITY_MAX_S" in policy
+    assert "bg_activity_is_live" in policy
+    assert "def bg_activity_phase" in policy
+
+
+def test_live_turns_payload_bg_age_uses_episode_start() -> None:
+    """_live_turns_payload must set continuous age ≠ silence for bg turns.
+
+    Regression: previously ageSeconds = silenceSeconds = now - last stamp,
+    so every subagent_progress pulse reset UI age to ~0.
+    """
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    # Locate background branch of _live_turns_payload
+    idx = src.find("def _live_turns_payload")
+    assert idx >= 0
+    chunk = src[idx : idx + 2800]
+    assert "bg_activity_ages" in chunk
+    assert '"background": True' in chunk or "'background': True" in chunk
+    # Must not assign ageSeconds from silence alone (the old bug).
+    assert "ageSeconds" in chunk
+    assert "silenceSeconds" in chunk
+    # Kind stored for stable UI label
+    assert "bg_activity_kind" in chunk or "kind" in chunk
+    # Stuck heartbeat-only: state stuck + heartbeatOnly
+    assert '"stuck"' in chunk or "'stuck'" in chunk
+    assert "heartbeatOnly" in chunk
+
+
 def test_server_status_no_context_budget_banner() -> None:
     """status/health no longer expose contextBudget; first-byte uses no_output_seconds_for_session."""
     src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
@@ -571,6 +628,21 @@ def test_load_suppress_should_release_matrix() -> None:
     )
 
 
+def test_load_suppress_quiet_s_for_count_matrix() -> None:
+    """Tiny flushes use short quiet; fat flushes keep full LOAD_SUPPRESS_QUIET_S."""
+    assert LOAD_SUPPRESS_QUIET_SMALL_S < LOAD_SUPPRESS_QUIET_S
+    assert LOAD_SUPPRESS_SMALL_FRAME_MAX == 5
+    assert load_suppress_quiet_s_for_count(0) == LOAD_SUPPRESS_QUIET_SMALL_S
+    assert load_suppress_quiet_s_for_count(1) == LOAD_SUPPRESS_QUIET_SMALL_S
+    assert load_suppress_quiet_s_for_count(5) == LOAD_SUPPRESS_QUIET_SMALL_S
+    assert load_suppress_quiet_s_for_count(6) == LOAD_SUPPRESS_QUIET_S
+    assert load_suppress_quiet_s_for_count(100) == LOAD_SUPPRESS_QUIET_S
+    assert load_suppress_quiet_s_for_count(-1) == LOAD_SUPPRESS_QUIET_SMALL_S
+    assert load_suppress_quiet_s_for_count("3") == LOAD_SUPPRESS_QUIET_SMALL_S  # type: ignore[arg-type]
+    assert load_suppress_quiet_s_for_count("nope") == LOAD_SUPPRESS_QUIET_SMALL_S  # type: ignore[arg-type]
+    assert load_suppress_quiet_s_for_count(None) == LOAD_SUPPRESS_QUIET_SMALL_S  # type: ignore[arg-type]
+
+
 def test_acp_client_load_suppress_quiet_period_structural() -> None:
     """session_load uses quiet rearm, not fixed-only call_later(0.3)."""
     acp = (ROOT / "hub" / "acp_client.py").read_text(encoding="utf-8")
@@ -579,14 +651,14 @@ def test_acp_client_load_suppress_quiet_period_structural() -> None:
     assert "_rearm_load_suppress_release" in acp
     assert "_load_suppress_deadline" in acp
     assert "call_later(0.3" not in acp
-    # finally arms quiet timer
-    assert "LOAD_SUPPRESS_QUIET_S, _delayed_release" in acp or (
-        "LOAD_SUPPRESS_QUIET_S" in acp and "call_later" in acp
-    )
+    # Adaptive quiet helper for initial arm + rearm (not hard-coded only).
+    assert "load_suppress_quiet_s_for_count" in acp
+    assert "call_later" in acp
     # suppress branch rearms
     assert "self._rearm_load_suppress_release(key)" in acp
     # release clears deadline
     assert "_load_suppress_deadline.pop" in acp
+    assert "def is_load_suppressing" in acp
 
 
 def test_wait_load_suppress_settled_returns_after_release() -> None:
