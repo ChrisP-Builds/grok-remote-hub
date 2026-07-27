@@ -32,7 +32,20 @@ def test_install_startup_registers_watch_task() -> None:
     assert "GrokRemoteHub" in text
     assert "watch-hub.ps1" in text
     assert "start-hub.ps1" in text
-    assert "-Quiet" in text
+    # Silent launch for shipped UX (no console flash every 2 minutes)
+    assert "watch-hub-hidden.vbs" in text
+    assert "wscript" in text.lower()
+    assert "start-hub-hidden.vbs" in text
+
+
+def test_silent_vbs_launchers_exist() -> None:
+    watch_vbs = (ROOT / "watch-hub-hidden.vbs").read_text(encoding="utf-8", errors="replace")
+    start_vbs = (ROOT / "start-hub-hidden.vbs").read_text(encoding="utf-8", errors="replace")
+    assert "watch-hub.ps1" in watch_vbs
+    assert "WindowStyle" in watch_vbs or ", 0," in watch_vbs or "Run cmd, 0" in watch_vbs
+    assert "sh.Run" in watch_vbs
+    assert "start-hub.ps1" in start_vbs
+    assert "sh.Run" in start_vbs
 
 
 def test_main_has_connection_reset_handler() -> None:

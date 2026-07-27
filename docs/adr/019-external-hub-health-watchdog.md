@@ -21,7 +21,7 @@ In-process self-heal cannot restart a dead hub process. An external poller that 
 
 1. **External scheduled watchdog** — `watch-hub.ps1` polls `http://127.0.0.1:<bind_port>/health` (port from `config.toml`, default 8787). On **N consecutive failures** (default 2) and after a **cooldown** (default 5 minutes since last restart), invoke `restart-hub.ps1 -KeepAgent`. Log to `logs/watch-hub-YYYYMMDD.log`; persist state in `logs/watch-hub-state.json`. Always exit 0 so Task Scheduler does not spam failure history.
 
-2. **Task Scheduler registration** — `install-startup.ps1` keeps logon task `GrokRemoteHub` (`start-hub.ps1`) and adds `GrokRemoteHubWatch` every 2 minutes (`watch-hub.ps1 -Quiet`), same user Interactive Limited, allow on batteries / start when available.
+2. **Task Scheduler registration** — `install-startup.ps1` keeps logon task `GrokRemoteHub` and adds `GrokRemoteHubWatch` every 2 minutes. Both run via **`wscript.exe` + `*-hidden.vbs`** (`WScript.Shell.Run …, 0`) so no PowerShell console flashes for end users. Direct `powershell -WindowStyle Hidden` is insufficient under Interactive logon (still steals focus briefly). Same user Interactive Limited, allow on batteries / start when available.
 
 3. **KeepAgent only from watchdog** — never auto-`-KillAgent` from the watchdog. Agent Auth / ACP zombie recovery remains manual or in-hub restart-agent paths (ADR-014).
 
