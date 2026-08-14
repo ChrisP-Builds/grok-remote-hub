@@ -7,6 +7,7 @@
   --muted: #7d8b9c;
   --accent: #e6b84d;
   --accent-dim: #8a6a20;
+  --accent-ink: #1a1200;
   --user: #5ec8e8;
   --assistant: #6dca8d;
   --danger: #f07178;
@@ -22,6 +23,92 @@
   --safe-t: env(safe-area-inset-top, 0px);
   --vv-offset: 0px;
   --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+  color-scheme: dark;
+
+  --ansi-black: #6b7280;
+  --ansi-red: #f07178;
+  --ansi-green: #6dca8d;
+  --ansi-yellow: #e6b84d;
+  --ansi-blue: #5ec8e8;
+  --ansi-magenta: #c792ea;
+  --ansi-cyan: #56b6c2;
+  --ansi-white: #d6deea;
+  --ansi-bright-black: #8b949e;
+  --ansi-bright-red: #ff8b92;
+  --ansi-bright-green: #8fdfaa;
+  --ansi-bright-yellow: #f0d078;
+  --ansi-bright-blue: #7dd8f0;
+  --ansi-bright-magenta: #d7a6f5;
+  --ansi-bright-cyan: #7ecfd8;
+  --ansi-bright-white: #f0f4f8;
+  --ansi-bg-black: #2d333b;
+  --ansi-bg-red: #5a3034;
+  --ansi-bg-green: #2a4a35;
+  --ansi-bg-yellow: #4a3f20;
+  --ansi-bg-blue: #243a4a;
+  --ansi-bg-magenta: #3d2a4a;
+  --ansi-bg-cyan: #244045;
+  --ansi-bg-white: #4a5568;
+  --ansi-bg-bright-black: #3d4450;
+  --ansi-bg-bright-red: #6e383c;
+  --ansi-bg-bright-green: #355c42;
+  --ansi-bg-bright-yellow: #5c4e28;
+  --ansi-bg-bright-blue: #2e4a5c;
+  --ansi-bg-bright-magenta: #4a3560;
+  --ansi-bg-bright-cyan: #2e5058;
+  --ansi-bg-bright-white: #5c6778;
+}
+
+/* Light theme — opt-in via [data-theme="light"] on <html>, set by app.js */
+:root[data-theme="light"] {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #eef1f5;
+  --border: #d7dce3;
+  --text: #1b222c;
+  --muted: #5b6472;
+  --accent: #9c6b0c;
+  --accent-dim: #c9a35c;
+  --accent-ink: #fff7e6;
+  --user: #0f7fa3;
+  --assistant: #1f8a4c;
+  --danger: #c8353d;
+  --ok: #1f8a4c;
+  --warn: #9c6b0c;
+  color-scheme: light;
+
+  --ansi-black: #6b7280;
+  --ansi-red: #c8353d;
+  --ansi-green: #1f8a4c;
+  --ansi-yellow: #9c6b0c;
+  --ansi-blue: #0f7fa3;
+  --ansi-magenta: #9333a8;
+  --ansi-cyan: #0e7c8a;
+  --ansi-white: #333c48;
+  --ansi-bright-black: #4b5563;
+  --ansi-bright-red: #e2454e;
+  --ansi-bright-green: #2ba061;
+  --ansi-bright-yellow: #b5820f;
+  --ansi-bright-blue: #1f9bc4;
+  --ansi-bright-magenta: #ac4bc4;
+  --ansi-bright-cyan: #17909f;
+  --ansi-bright-white: #1b222c;
+  --ansi-bg-black: #e7e9ec;
+  --ansi-bg-red: #fbdadb;
+  --ansi-bg-green: #d9f0e0;
+  --ansi-bg-yellow: #f6e6bf;
+  --ansi-bg-blue: #d7ecf5;
+  --ansi-bg-magenta: #f0dcf5;
+  --ansi-bg-cyan: #d3edf0;
+  --ansi-bg-white: #f6f7f9;
+  --ansi-bg-bright-black: #dde1e6;
+  --ansi-bg-bright-red: #f6c2c5;
+  --ansi-bg-bright-green: #c3e8cf;
+  --ansi-bg-bright-yellow: #eed89a;
+  --ansi-bg-bright-blue: #c1e0ee;
+  --ansi-bg-bright-magenta: #e6c8ee;
+  --ansi-bg-bright-cyan: #bfe3e8;
+  --ansi-bg-bright-white: #e9ebee;
 }
 
 *,
@@ -2362,132 +2449,132 @@ a {
 
 .tool-detail .ansi-fg-black,
 .term-line.tool .term-body .ansi-fg-black {
-  color: #6b7280;
+  color: var(--ansi-black);
 }
 .tool-detail .ansi-fg-red,
 .term-line.tool .term-body .ansi-fg-red {
-  color: #f07178;
+  color: var(--ansi-red);
 }
 .tool-detail .ansi-fg-green,
 .term-line.tool .term-body .ansi-fg-green {
-  color: #6dca8d;
+  color: var(--ansi-green);
 }
 .tool-detail .ansi-fg-yellow,
 .term-line.tool .term-body .ansi-fg-yellow {
-  color: #e6b84d;
+  color: var(--ansi-yellow);
 }
 .tool-detail .ansi-fg-blue,
 .term-line.tool .term-body .ansi-fg-blue {
-  color: #5ec8e8;
+  color: var(--ansi-blue);
 }
 .tool-detail .ansi-fg-magenta,
 .term-line.tool .term-body .ansi-fg-magenta {
-  color: #c792ea;
+  color: var(--ansi-magenta);
 }
 .tool-detail .ansi-fg-cyan,
 .term-line.tool .term-body .ansi-fg-cyan {
-  color: #56b6c2;
+  color: var(--ansi-cyan);
 }
 .tool-detail .ansi-fg-white,
 .term-line.tool .term-body .ansi-fg-white {
-  color: #d6deea;
+  color: var(--ansi-white);
 }
 .tool-detail .ansi-fg-bright-black,
 .term-line.tool .term-body .ansi-fg-bright-black {
-  color: #8b949e;
+  color: var(--ansi-bright-black);
 }
 .tool-detail .ansi-fg-bright-red,
 .term-line.tool .term-body .ansi-fg-bright-red {
-  color: #ff8b92;
+  color: var(--ansi-bright-red);
 }
 .tool-detail .ansi-fg-bright-green,
 .term-line.tool .term-body .ansi-fg-bright-green {
-  color: #8fdfaa;
+  color: var(--ansi-bright-green);
 }
 .tool-detail .ansi-fg-bright-yellow,
 .term-line.tool .term-body .ansi-fg-bright-yellow {
-  color: #f0d078;
+  color: var(--ansi-bright-yellow);
 }
 .tool-detail .ansi-fg-bright-blue,
 .term-line.tool .term-body .ansi-fg-bright-blue {
-  color: #7dd8f0;
+  color: var(--ansi-bright-blue);
 }
 .tool-detail .ansi-fg-bright-magenta,
 .term-line.tool .term-body .ansi-fg-bright-magenta {
-  color: #d7a6f5;
+  color: var(--ansi-bright-magenta);
 }
 .tool-detail .ansi-fg-bright-cyan,
 .term-line.tool .term-body .ansi-fg-bright-cyan {
-  color: #7ecfd8;
+  color: var(--ansi-bright-cyan);
 }
 .tool-detail .ansi-fg-bright-white,
 .term-line.tool .term-body .ansi-fg-bright-white {
-  color: #f0f4f8;
+  color: var(--ansi-bright-white);
 }
 
 .tool-detail .ansi-bg-black,
 .term-line.tool .term-body .ansi-bg-black {
-  background-color: #2d333b;
+  background-color: var(--ansi-bg-black);
 }
 .tool-detail .ansi-bg-red,
 .term-line.tool .term-body .ansi-bg-red {
-  background-color: #5a3034;
+  background-color: var(--ansi-bg-red);
 }
 .tool-detail .ansi-bg-green,
 .term-line.tool .term-body .ansi-bg-green {
-  background-color: #2a4a35;
+  background-color: var(--ansi-bg-green);
 }
 .tool-detail .ansi-bg-yellow,
 .term-line.tool .term-body .ansi-bg-yellow {
-  background-color: #4a3f20;
+  background-color: var(--ansi-bg-yellow);
 }
 .tool-detail .ansi-bg-blue,
 .term-line.tool .term-body .ansi-bg-blue {
-  background-color: #243a4a;
+  background-color: var(--ansi-bg-blue);
 }
 .tool-detail .ansi-bg-magenta,
 .term-line.tool .term-body .ansi-bg-magenta {
-  background-color: #3d2a4a;
+  background-color: var(--ansi-bg-magenta);
 }
 .tool-detail .ansi-bg-cyan,
 .term-line.tool .term-body .ansi-bg-cyan {
-  background-color: #244045;
+  background-color: var(--ansi-bg-cyan);
 }
 .tool-detail .ansi-bg-white,
 .term-line.tool .term-body .ansi-bg-white {
-  background-color: #4a5568;
+  background-color: var(--ansi-bg-white);
 }
 .tool-detail .ansi-bg-bright-black,
 .term-line.tool .term-body .ansi-bg-bright-black {
-  background-color: #3d4450;
+  background-color: var(--ansi-bg-bright-black);
 }
 .tool-detail .ansi-bg-bright-red,
 .term-line.tool .term-body .ansi-bg-bright-red {
-  background-color: #6e383c;
+  background-color: var(--ansi-bg-bright-red);
 }
 .tool-detail .ansi-bg-bright-green,
 .term-line.tool .term-body .ansi-bg-bright-green {
-  background-color: #355c42;
+  background-color: var(--ansi-bg-bright-green);
 }
 .tool-detail .ansi-bg-bright-yellow,
 .term-line.tool .term-body .ansi-bg-bright-yellow {
-  background-color: #5c4e28;
+  background-color: var(--ansi-bg-bright-yellow);
 }
 .tool-detail .ansi-bg-bright-blue,
 .term-line.tool .term-body .ansi-bg-bright-blue {
-  background-color: #2e4a5c;
+  background-color: var(--ansi-bg-bright-blue);
 }
 .tool-detail .ansi-bg-bright-magenta,
 .term-line.tool .term-body .ansi-bg-bright-magenta {
-  background-color: #4a3560;
+  background-color: var(--ansi-bg-bright-magenta);
 }
 .tool-detail .ansi-bg-bright-cyan,
 .term-line.tool .term-body .ansi-bg-bright-cyan {
-  background-color: #2e5058;
+  background-color: var(--ansi-bg-bright-cyan);
 }
 .tool-detail .ansi-bg-bright-white,
 .term-line.tool .term-body .ansi-bg-bright-white {
-  background-color: #5c6778;
+  background-color: var(--ansi-bg-bright-white);
 }
 
 /* Plan checklist */
@@ -2953,7 +3040,7 @@ a {
 .btn-accent {
   background: var(--accent);
   border-color: var(--accent);
-  color: #1a1200;
+  color: var(--accent-ink);
 }
 
 .btn-accent:hover:not(:disabled) {
@@ -3371,7 +3458,7 @@ a {
 .project-mode-tab.is-active {
   background: var(--accent);
   border-color: var(--accent);
-  color: #1a1200;
+  color: var(--accent-ink);
 }
 
 .project-mode-tab:focus-visible {

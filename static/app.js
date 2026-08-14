@@ -1042,6 +1042,7 @@
     composerHint: $("#composer-hint"),
     slash: $("#slash-palette"),
     btnMenu: $("#btn-menu"),
+    btnThemeToggle: $("#btn-theme-toggle"),
     btnRailCollapse: $("#btn-rail-collapse"),
     btnNew: $("#btn-new"),
     btnEmptySessions: $("#btn-empty-sessions"),
@@ -4105,6 +4106,56 @@
     $$("#btn-empty-sessions").forEach((btn) => {
       btn.classList.toggle("hidden", isRailVisible());
     });
+  }
+
+  const THEME_KEY = "grh.theme";
+  const THEME_COLOR = { dark: "#0a0c10", light: "#f6f7f9" };
+
+  function getTheme() {
+    return document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+  }
+
+  function applyTheme(theme) {
+    document.documentElement.setAttribute("data-theme", theme);
+    const metaThemeColor = document.querySelector('meta[name="theme-color"]');
+    if (metaThemeColor) metaThemeColor.setAttribute("content", THEME_COLOR[theme] || THEME_COLOR.dark);
+    if (els.btnThemeToggle) {
+      const toLight = theme !== "light";
+      els.btnThemeToggle.textContent = theme === "light" ? "☀️" : "🌙";
+      const label = toLight ? "Switch to light theme" : "Switch to dark theme";
+      els.btnThemeToggle.setAttribute("aria-label", label);
+      els.btnThemeToggle.setAttribute("title", label);
+    }
+  }
+
+  function setTheme(theme, persist) {
+    applyTheme(theme === "light" ? "light" : "dark");
+    if (persist) {
+      try {
+        localStorage.setItem(THEME_KEY, theme);
+      } catch (_) {}
+    }
+  }
+
+  function toggleTheme() {
+    setTheme(getTheme() === "light" ? "dark" : "light", true);
+  }
+
+  function initTheme() {
+    // data-theme is already set pre-paint by the inline head script; just sync the toggle UI.
+    applyTheme(getTheme());
+    // Follow OS theme changes live, but only until the user makes an explicit choice.
+    try {
+      if (window.matchMedia && !localStorage.getItem(THEME_KEY)) {
+        const mq = window.matchMedia("(prefers-color-scheme: light)");
+        const onChange = (e) => {
+          if (localStorage.getItem(THEME_KEY)) return;
+          setTheme(e.matches ? "light" : "dark", false);
+        };
+        if (mq.addEventListener) mq.addEventListener("change", onChange);
+        else if (mq.addListener) mq.addListener(onChange);
+      }
+    } catch (_) {}
   }
 
   function setRailCollapsed(collapsed) {
@@ -10845,6 +10896,9 @@
 
 
     els.btnMenu.addEventListener("click", openRail);
+    if (els.btnThemeToggle) {
+      els.btnThemeToggle.addEventListener("click", toggleTheme);
+    }
     els.backdrop.addEventListener("click", closeRail);
     if (els.btnRailCollapse) {
       els.btnRailCollapse.addEventListener("click", closeRail);
@@ -11728,6 +11782,7 @@
     startHistoryPoll();
     startUsagePoll();
 
+    initTheme();
     try {
       if (localStorage.getItem("grh.railCollapsed") === "1" && !isMobile()) {
         const app = els.app || document.getElementById("app");

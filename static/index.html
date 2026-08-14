@@ -2,6 +2,20 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <script>
+    // Apply the saved/preferred color theme before first paint to avoid a flash.
+    (function () {
+      try {
+        var t = localStorage.getItem("grh.theme");
+        if (t !== "light" && t !== "dark") {
+          t = (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark";
+        }
+        document.documentElement.setAttribute("data-theme", t);
+      } catch (e) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    })();
+  </script>
   <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
   <meta name="theme-color" content="#0a0c10" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -12,9 +26,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/app.css?v=20260726a" />
+  <link rel="stylesheet" href="/app.css?v=20260814a" />
 </head>
-<body style="background:#0a0c10;color:#d6deea">
+<body>
   <div id="app">
     <aside id="rail" class="rail" aria-label="Sidebar">
       <div class="rail-header">
@@ -23,6 +37,7 @@
           <span class="brand-text">Grok Hub</span>
         </div>
         <div class="rail-header-actions">
+          <button type="button" id="btn-theme-toggle" class="btn btn-ghost btn-sm btn-icon" aria-label="Switch to light theme" title="Switch to light theme">🌙</button>
           <button type="button" id="btn-rail-collapse" class="btn btn-ghost btn-sm btn-icon" aria-label="Collapse sidebar" title="Collapse sidebar">‹</button>
           <button type="button" id="btn-new" class="btn btn-accent btn-sm">New</button>
         </div>
@@ -357,6 +372,6 @@
   <script src="/vendor/marked.min.js"></script>
   <script src="/vendor/purify.min.js"></script>
   <!-- cache-bust: blank-page fix; mermaid loads on demand from app.js when needed -->
-  <script src="/app.js?v=20260726a"></script>
+  <script src="/app.js?v=20260814a"></script>
 </body>
 </html>
