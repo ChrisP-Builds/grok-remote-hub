@@ -47,7 +47,8 @@ a new ADR.
 | 020 | Process-local ops metrics and unified diagnostics | Accepted | 2026-07-26 |
 | 021 | Flag-gated leader multi-client experiment | Proposed / Experimental | 2026-07-30 |
 | 022 | Private agent serve remains default; stock CLI stays independent | Accepted | 2026-08-08 |
-| 023 | Always-approve remote risk and CLI resume handoff | Accepted | 2026-08-08 |
+| 023 | Always-approve remote risk and CLI resume handoff | Accepted (risk reduced by 027) | 2026-08-08 |
 | 024 | Stop cancels the turn then clears hub bg activity honesty | Accepted | 2026-08-08 |
 | 025 | Mobile plan copy/mermaid and session search/recap continuity | Accepted | 2026-08-08 |
 | 026 | Guard Host and Origin, and serve previews as sandboxed capability URLs | Accepted | 2026-10-31 |
+| 027 | Approve risky agent actions from the phone via a hub-owned Grok hook | Accepted | 2026-10-31 |

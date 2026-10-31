@@ -1,6 +1,6 @@
 # ADR-023: Always-approve remote risk and CLI resume handoff
 
-- **Status:** Accepted
+- **Status:** Accepted (risk reduced by ADR-027: phone approval gate)
 - **Date:** 2026-08-08
 - **Deciders:** project owner, Grok Remote Hub session
 - **Tags:** security, permissions, always-approve, resume, cli, handoff
