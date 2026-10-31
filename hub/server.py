@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import mimetypes
 import os
 import re
 import secrets
@@ -23,9 +22,9 @@ from hub.harden_policy import (
     agent_recycle_reconnect_plan,
     heal_exhaust_operator_fields,
     health_response_body,
-    is_public_unauthenticated_path,
     should_auto_restart_agent_on_heal_exhaust,
 )
+from hub.http_guard import GuardPolicy, install_guard, request_has_token
 from hub.ops_metrics import OpsMetrics
 from hub.fs_browser import (
     RAW_MAX_BYTES,
@@ -33,6 +32,7 @@ from hub.fs_browser import (
     content_disposition_attachment,
     content_type_for,
     list_dir as fs_list_dir,
+    raw_response_headers,
     read_text as fs_read_text,
     resolve_file_for_read,
     write_text as fs_write_text,
@@ -42,6 +42,7 @@ from hub.site_preview import (
     SitePreviewError,
     SitePreviewManager,
     build_preview_plan,
+    serve_preview,
 )
 from hub.history import load_session_history
 from hub.plan_view import PlanViewError, apply_plan_action, read_session_plan
@@ -167,6 +168,32 @@ def _looks_like_tailscale(host: str) -> bool:
     return bool(re.match(r"^100\.\d+\.\d+\.\d+$", host))
 
 
+def tailscale_self_dns_names(status: Any) -> list[str]:
+    self_node = status.get("Self") if isinstance(status, dict) else None
+    name = self_node.get("DNSName") if isinstance(self_node, dict) else None
+    return [str(name)] if name else []
+
+
+def tailscale_dns_names() -> list[str]:
+    for exe in (str(TAILSCALE_EXE), "tailscale"):
+        try:
+            proc = subprocess.run(
+                [exe, "status", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+        if proc.returncode == 0:
+            try:
+                return tailscale_self_dns_names(json.loads(proc.stdout))
+            except ValueError:
+                return []
+    return []
+
+
 def _tailscale_ip() -> str | None:
     candidates = [str(TAILSCALE_EXE), "tailscale"]
     for exe in candidates:
@@ -198,6 +225,12 @@ class Hub:
         self.bind_hosts: list[str] = ["127.0.0.1"]
         self.bind_mode = "local"
         self.tailscale_ip: str | None = None
+        self.guard = GuardPolicy(
+            token=config.hub_token,
+            allowed_origins=frozenset(
+                o.strip().casefold().rstrip("/") for o in config.allowed_origins
+            ),
+        )
         self.agent_status = "down"
         self.acp_connected = False
         # ACP self-heal: reconnect when process is up but WebSocket is down.
@@ -1141,15 +1174,7 @@ class Hub:
         # lines written while the socket was down (offsets stay mid-file).
 
     def check_auth(self, request: web.Request) -> bool:
-        token = self.config.hub_token
-        if not token:
-            return True
-        auth = request.headers.get("Authorization") or ""
-        if auth.lower().startswith("bearer ") and auth[7:].strip() == token:
-            return True
-        if request.rel_url.query.get("token") == token:
-            return True
-        return False
+        return request_has_token(request, self.config.hub_token)
 
     @staticmethod
     def _cwd_key(cwd: str) -> str:
@@ -1647,7 +1672,8 @@ class Hub:
         return agent_sid, switched, switch_reason, ensure_action
 
     def build_app(self) -> web.Application:
-        app = web.Application(middlewares=[self._auth_middleware])
+        app = web.Application()
+        install_guard(app, self.guard)
         app["hub"] = self
         app.router.add_get("/health", self.handle_health)
         app.router.add_get("/api/compat", self.handle_compat)
@@ -1682,8 +1708,6 @@ class Hub:
         app.router.add_post("/api/preview/stop", self.handle_preview_stop)
         app.router.add_get("/api/preview/status", self.handle_preview_status)
         # Register before static / so preview paths are not swallowed.
-        app.router.add_get("/preview-site", self.handle_preview_site)
-        app.router.add_get("/preview-site/", self.handle_preview_site)
         app.router.add_get("/preview-site/{path:.*}", self.handle_preview_site)
         app.router.add_get("/ws", self.handle_ws)
         static_dir = Path(self.config.static_dir)
@@ -1694,16 +1718,6 @@ class Hub:
         app.on_cleanup.append(self._on_cleanup)
         self._app = app
         return app
-
-    @web.middleware
-    async def _auth_middleware(self, request: web.Request, handler):
-        # SPA shell/static assets + /health load without token so ?token= document
-        # navigation can fetch /app.js etc. API, WS, and preview stay gated.
-        if is_public_unauthenticated_path(request.method, request.path):
-            return await handler(request)
-        if not self.check_auth(request):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        return await handler(request)
 
     async def _on_startup(self, app: web.Application) -> None:
         # CLI version is cheap and useful even if agent is slow
@@ -2823,12 +2837,7 @@ class Hub:
             size = file_path.stat().st_size
             if size > RAW_MAX_BYTES:
                 return web.json_response({"error": "file too large"}, status=413)
-            ctype = content_type_for(file_path)
-            headers = {
-                "Content-Type": ctype,
-                "Cache-Control": "private, max-age=60",
-                "X-Content-Type-Options": "nosniff",
-            }
+            headers = raw_response_headers(content_type_for(file_path))
             download = (request.query.get("download") or "").strip().lower()
             if download in ("1", "true", "yes"):
                 headers["Content-Disposition"] = content_disposition_attachment(
@@ -2960,14 +2969,14 @@ class Hub:
         except Exception:
             log.exception("preview start failed")
             return web.json_response({"error": "internal error"}, status=500)
-        entry = plan["entry_url_path"]
+        preview_url = self.site_preview.preview_url() or ""
         return web.json_response(
             {
                 "ok": True,
                 "siteRoot": str(plan["site_root"]),
-                "entryPath": entry,
-                "previewUrl": f"/preview-site/{entry}",
-                "hubUrl": "/preview-site/",
+                "entryPath": plan["entry_url_path"],
+                "previewUrl": preview_url,
+                "hubUrl": preview_url.rsplit("/", 1)[0] + "/",
             }
         )
 
@@ -2978,45 +2987,8 @@ class Hub:
     async def handle_preview_status(self, request: web.Request) -> web.Response:
         return web.json_response(self.site_preview.status())
 
-    async def handle_preview_site(self, request: web.Request) -> web.Response:
-        if not self.site_preview.active:
-            return web.Response(
-                text="no active preview",
-                status=404,
-                content_type="text/plain",
-                headers={"Cache-Control": "no-store"},
-            )
-        # Prefer named path param; fall back to path after /preview-site/
-        url_path = request.match_info.get("path")
-        if url_path is None:
-            raw = request.path or ""
-            prefix = "/preview-site"
-            if raw.startswith(prefix):
-                url_path = raw[len(prefix) :].lstrip("/")
-            else:
-                url_path = ""
-        file_path = self.site_preview.resolve_file(url_path or "")
-        if file_path is None:
-            return web.Response(
-                text="not found",
-                status=404,
-                content_type="text/plain",
-                headers={"Cache-Control": "no-store"},
-            )
-        ctype, _ = mimetypes.guess_type(str(file_path))
-        if not ctype:
-            ctype = "application/octet-stream"
-        # HTML: charset so scripts/CSS parse reliably
-        if ctype == "text/html":
-            ctype = "text/html; charset=utf-8"
-        return web.FileResponse(
-            path=file_path,
-            headers={
-                "Content-Type": ctype,
-                "Cache-Control": "no-store",
-                "X-Content-Type-Options": "nosniff",
-            },
-        )
+    async def handle_preview_site(self, request: web.Request) -> web.StreamResponse:
+        return await serve_preview(self.site_preview, request)
 
     async def handle_new_session(self, request: web.Request) -> web.Response:
         try:

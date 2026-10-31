@@ -34,3 +34,24 @@ def test_load_config_without_bom(tmp_path: Path) -> None:
     loaded = load_config(cfg_path)
     assert loaded.hub_token == "plain-token"
     assert loaded.bind_port == 8788
+
+
+def test_load_config_allowed_hosts_and_origins(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        "[hub]\n"
+        'allowed_hosts = ["hub.example", "desk"]\n'
+        'allowed_origins = ["https://desk.tailnet.ts.net"]\n',
+        encoding="utf-8",
+    )
+    loaded = load_config(cfg_path)
+    assert loaded.allowed_hosts == ["hub.example", "desk"]
+    assert loaded.allowed_origins == ["https://desk.tailnet.ts.net"]
+
+
+def test_load_config_allowed_lists_default_empty(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text("[hub]\nbind_port = 8787\n", encoding="utf-8")
+    loaded = load_config(cfg_path)
+    assert loaded.allowed_hosts == []
+    assert loaded.allowed_origins == []

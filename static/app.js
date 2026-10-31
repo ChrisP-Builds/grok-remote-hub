@@ -8534,8 +8534,8 @@
         toast(data.error || `Preview failed (HTTP ${res.status})`, "danger");
         return;
       }
-      const previewUrl = data.previewUrl || "/preview-site/";
-      sitePreviewUrl = apiUrl(previewUrl);
+      // Capability URL: subresources need no hub token (ADR-026).
+      sitePreviewUrl = data.previewUrl || "";
       if (els.sitePreviewFrame) {
         els.sitePreviewFrame.src = sitePreviewUrl;
       }

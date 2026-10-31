@@ -15,12 +15,13 @@ If someone can open your hub URL without a token, they can drive that agent.
 1. **Do not bind `0.0.0.0`.** Defaults dual-bind localhost + Tailscale IPv4 only.
 2. Set **`hub_token`** in `config.toml` and open the UI with `?token=…` or `Authorization: Bearer …`.
    - **Empty `hub_token` is refused at startup** when any bind host is non-loopback (including Tailscale dual-bind). Loopback-only binds still allow tokenless local dev.
-   - With a token set, unauthenticated `GET /health` returns **liveness only** (`ok`, `bootId`, `uptimeSeconds`, `pid`, `port`, `hubVersion`) so the external watchdog can still probe without secrets. The **static SPA shell** (`/`, `/app.js`, `/app.css`, `/vendor/*`, favicons, similar static assets) is also public so the UI can load after `?token=` document navigation; **API**, **WebSocket**, and **preview** still require the token when configured.
+   - With a token set, unauthenticated `GET /health` returns **liveness only** (`ok`, `bootId`, `uptimeSeconds`, `pid`, `port`, `hubVersion`) so the external watchdog can still probe without secrets. The **static SPA shell** (`/`, `/app.js`, `/app.css`, `/vendor/*`, favicons, similar static assets) is also public so the UI can load after `?token=` document navigation; **API** and **WebSocket** still require the token when configured. **Preview** uses a per-start random URL instead (see item 7).
    - Full diagnostics: authenticated `/health` (Bearer or `?token=`) or `GET /api/admin/diagnostics`.
 3. Keep the agent on **`127.0.0.1`** (default). The agent secret file `data/agent.secret` is gitignored.
 4. Run the hub only on a machine you trust; treat Tailscale membership like physical access.
 5. Never commit `config.toml`, `data/`, `logs/`, or `~/.grok/auth.json`.
 6. Binary uploads (`POST /api/fs/upload`) are sandboxed to the session cwd, extension-allowlisted (image/video), and size-capped; treat the hub token as write access to that project tree.
+7. **Browser trust boundary (ADR-026).** Every request must name this hub in `Host` (loopback, bind hosts, this machine's Tailscale name, or `hub.allowed_hosts`), and `/ws` plus every mutating request must come from the hub's own origin when the browser sends `Origin`. This blocks drive-by pages and DNS rebinding, including against a tokenless loopback hub. Site preview is served at a random per-start URL inside a CSP sandbox (opaque origin), so previewed HTML cannot read the hub token or call the API.
 
 ## Always-approve remote risk
 

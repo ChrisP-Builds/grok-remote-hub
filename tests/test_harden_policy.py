@@ -273,7 +273,6 @@ def test_server_wires_harden_policy() -> None:
     assert "heal_exhaust_operator_fields" in src
     assert "health_response_body" in src
     assert "should_auto_restart_agent_on_heal_exhaust" in src
-    assert "is_public_unauthenticated_path" in src
     assert "acpHealExhausted" in src
     assert "_acp_heal_auto_restarts_used" in src
     assert "auto_restart_agent_on_heal_exhaust" in src
@@ -284,12 +283,7 @@ def test_server_wires_harden_policy() -> None:
     chunk = src[idx : idx + 500]
     assert "check_auth" in chunk
     assert "health_response_body" in chunk
-    # middleware uses public path helper before check_auth
-    mid = src.find("async def _auth_middleware")
-    assert mid > 0
-    mid_chunk = src[mid : mid + 600]
-    assert "is_public_unauthenticated_path" in mid_chunk
-    assert "check_auth" in mid_chunk
+    assert "install_guard(app, self.guard)" in src
 
 
 def test_main_requires_hub_token_gate() -> None:

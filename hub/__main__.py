@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import socket
 import sys
 from pathlib import Path
 
@@ -10,7 +11,8 @@ from aiohttp import web
 
 from hub.config import load_config
 from hub.harden_policy import require_hub_token
-from hub.server import Hub, resolve_bind_hosts
+from hub.http_guard import build_allowed_hosts
+from hub.server import Hub, resolve_bind_hosts, tailscale_dns_names
 
 
 def _setup_logging(log_dir: Path) -> None:
@@ -111,6 +113,13 @@ def main(argv: list[str] | None = None) -> int:
     hub.bind_host = ts_ip if ts_ip and ts_ip in hosts else hosts[0]
     hub.bind_mode = mode
     hub.tailscale_ip = ts_ip
+    hub.guard.allowed_hosts = build_allowed_hosts(
+        hosts,
+        ts_ip,
+        tailscale_dns_names() if ts_ip else [],
+        [*config.allowed_hosts, socket.gethostname()],
+    )
+    log.info("Accepted Host names: %s", ", ".join(sorted(hub.guard.allowed_hosts)))
 
     log.info(
         "Starting Grok Remote Hub on %s (%s)",

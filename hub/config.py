@@ -78,6 +78,9 @@ class Config:
     sessions_root: Path = field(default_factory=lambda: DEFAULT_SESSIONS_ROOT)
     projects_root: Path = field(default_factory=lambda: DEFAULT_PROJECTS_ROOT)
     hub_token: str = ""
+    # Extra Host names / exact origins the HTTP guard accepts (ADR-026).
+    allowed_hosts: list[str] = field(default_factory=list)
+    allowed_origins: list[str] = field(default_factory=list)
     # When True, after ACP heal attempts exhaust with process up / ACP down and
     # no live turn, call KillAgent-style restart once per process (config-gated).
     auto_restart_agent_on_heal_exhaust: bool = False
@@ -122,6 +125,12 @@ def _as_path(value: object, default: Path) -> Path:
     return Path(str(value)).expanduser()
 
 
+def _str_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
 def load_config(path: Path | None = None) -> Config:
     cfg_path = path or DEFAULT_CONFIG_PATH
     data: dict = {}
@@ -149,6 +158,8 @@ def load_config(path: Path | None = None) -> Config:
         sessions_root=_as_path(hub.get("sessions_root"), DEFAULT_SESSIONS_ROOT),
         projects_root=_as_path(hub.get("projects_root"), DEFAULT_PROJECTS_ROOT),
         hub_token=str(hub.get("hub_token", "") or ""),
+        allowed_hosts=_str_list(hub.get("allowed_hosts")),
+        allowed_origins=_str_list(hub.get("allowed_origins")),
         auto_restart_agent_on_heal_exhaust=bool(
             hub.get("auto_restart_agent_on_heal_exhaust", False)
         ),

@@ -10,6 +10,11 @@ bind_port = 8787
 # Required when binding non-loopback / Tailscale; empty allowed for loopback-only.
 hub_token = ""
 
+# Requests must name this hub: Host must be loopback, a bind host, or this
+# machine's Tailscale name; browser Origin must match Host. Add extras here.
+# allowed_hosts = ["my-reverse-proxy.example"]
+# allowed_origins = ["https://desk.tailnet-name.ts.net"]
+
 # Optional: after ACP heal attempts exhaust (process up, ACP down, no live turn),
 # KillAgent-style restart once per hub process. Default off (manual pill / admin).
 # auto_restart_agent_on_heal_exhaust = false

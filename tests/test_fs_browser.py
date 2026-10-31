@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from hub.fs_browser import (
+    raw_response_headers,
     RAW_MAX_BYTES,
     UPLOAD_MAX_IMAGE_BYTES,
     UPLOAD_MAX_VIDEO_BYTES,
@@ -432,3 +433,16 @@ def test_write_upload_heic_allowed(tmp_path: Path) -> None:
 def test_upload_max_constants() -> None:
     assert UPLOAD_MAX_IMAGE_BYTES == 40_000_000
     assert UPLOAD_MAX_VIDEO_BYTES == 150_000_000
+
+
+@pytest.mark.parametrize("ctype", ["text/html", "image/svg+xml", "application/xhtml+xml", "text/xml"])
+def test_raw_headers_sandbox_script_capable_types(ctype: str) -> None:
+    """Opening a raw HTML/SVG file must not run its script on the hub origin."""
+    assert raw_response_headers(ctype)["Content-Security-Policy"] == "sandbox"
+
+
+@pytest.mark.parametrize("ctype", ["image/png", "video/mp4", "application/pdf", "text/plain"])
+def test_raw_headers_leave_inert_types_alone(ctype: str) -> None:
+    headers = raw_response_headers(ctype)
+    assert headers["Content-Type"] == ctype
+    assert "Content-Security-Policy" not in headers

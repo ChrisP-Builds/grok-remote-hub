@@ -9,18 +9,16 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from hub.harden_policy import is_public_unauthenticated_path
+from hub.http_guard import GuardPolicy, install_guard
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_server_imports_and_uses_public_path_helper() -> None:
-    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
-    assert "is_public_unauthenticated_path" in src
-    assert "from hub.harden_policy import" in src
-    mid = src.find("async def _auth_middleware")
-    assert mid > 0
-    chunk = src[mid : mid + 500]
-    assert "is_public_unauthenticated_path(request.method, request.path)" in chunk
+def test_server_installs_guard_which_uses_public_path_helper() -> None:
+    server = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    assert "install_guard(app, self.guard)" in server
+    guard = (ROOT / "hub" / "http_guard.py").read_text(encoding="utf-8")
+    assert "is_public_unauthenticated_path(request.method, request.path)" in guard
 
 
 def test_unauth_api_sessions_requires_auth_policy() -> None:
@@ -29,19 +27,7 @@ def test_unauth_api_sessions_requires_auth_policy() -> None:
 
 
 def test_middleware_static_public_api_gated() -> None:
-    """aiohttp middleware mirrors Hub._auth_middleware (no full Hub start)."""
-
-    @web.middleware
-    async def token_gate(request: web.Request, handler):
-        if is_public_unauthenticated_path(request.method, request.path):
-            return await handler(request)
-        auth = request.headers.get("Authorization") or ""
-        token = "secret"
-        if auth.lower().startswith("bearer ") and auth[7:].strip() == token:
-            return await handler(request)
-        if request.rel_url.query.get("token") == token:
-            return await handler(request)
-        return web.json_response({"error": "unauthorized"}, status=401)
+    """Real hub guard: static shell public, API gated by token."""
 
     async def ok(_request: web.Request) -> web.Response:
         return web.Response(text="ok", content_type="text/plain")
@@ -50,7 +36,8 @@ def test_middleware_static_public_api_gated() -> None:
         return web.json_response({"sessions": []})
 
     async def run() -> None:
-        app = web.Application(middlewares=[token_gate])
+        app = web.Application()
+        install_guard(app, GuardPolicy(token="secret"))
         app.router.add_get("/app.js", ok)
         app.router.add_get("/app.css", ok)
         app.router.add_get("/favicon.svg", ok)

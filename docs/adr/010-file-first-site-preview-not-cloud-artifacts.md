@@ -1,6 +1,6 @@
 # ADR-010: File-first site preview, not cloud or chat artifacts
 
-- **Status:** Accepted
+- **Status:** Accepted (serving detail amended by ADR-026: sandboxed capability URL, not same-origin)
 - **Date:** 2026-07-12
 - **Deciders:** project owner, Grok Remote Hub session
 - **Tags:** preview, files, product-scope, security

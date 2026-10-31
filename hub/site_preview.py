@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import mimetypes
 import os
+import secrets
 import time
 from pathlib import Path
 from typing import Any
 
+from aiohttp import web
+
 from hub.fs_browser import FsBrowserError, resolve_file_for_read
 
 HTML_EXTS = {".html", ".htm"}
+PREVIEW_URL_PREFIX = "/preview-site/"
+# Opaque origin: previewed pages cannot read hub storage or call the hub API (ADR-026).
+PREVIEW_CSP = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads"
 
 
 class SitePreviewError(Exception):
@@ -74,6 +81,7 @@ class SitePreviewManager:
         if not entry_rel or ".." in Path(entry_rel).parts:
             raise SitePreviewError("invalid entry", 400)
         self.active = {
+            "key": secrets.token_urlsafe(18),
             "site_root": site_root,
             "entry_rel": entry_rel,
             "session_root": str(plan.get("session_root") or ""),
@@ -83,6 +91,20 @@ class SitePreviewManager:
 
     def stop(self) -> None:
         self.active = None
+
+    def preview_url(self) -> str | None:
+        if not self.active:
+            return None
+        return f"{PREVIEW_URL_PREFIX}{self.active['key']}/{self.active['entry_rel']}"
+
+    def resolve_keyed(self, url_path: str) -> Path | None:
+        """Resolve ``<key>/<path>``; None unless the key matches the active preview."""
+        if not self.active:
+            return None
+        key, _, rest = str(url_path or "").lstrip("/").partition("/")
+        if not secrets.compare_digest(key.encode(), str(self.active["key"]).encode()):
+            return None
+        return self.resolve_file(rest)
 
     def status(self) -> dict[str, Any]:
         if not self.active:
@@ -133,3 +155,31 @@ class SitePreviewManager:
         if candidate.is_file():
             return candidate
         return None
+
+
+async def serve_preview(manager: SitePreviewManager, request: web.Request) -> web.StreamResponse:
+    file_path = manager.resolve_keyed(request.match_info.get("path") or "")
+    if file_path is None:
+        return web.Response(
+            text="not found",
+            status=404,
+            content_type="text/plain",
+            headers={"Cache-Control": "no-store"},
+        )
+    ctype, _ = mimetypes.guess_type(str(file_path))
+    if not ctype:
+        ctype = "application/octet-stream"
+    if ctype == "text/html":
+        ctype = "text/html; charset=utf-8"
+    return web.FileResponse(
+        path=file_path,
+        headers={
+            "Content-Type": ctype,
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": PREVIEW_CSP,
+            # Sandboxed documents send Origin: null; module scripts, fonts and
+            # fetch() of sibling files need CORS. Safe: content is key-gated.
+            "Access-Control-Allow-Origin": "*",
+        },
+    )

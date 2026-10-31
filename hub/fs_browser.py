@@ -59,6 +59,26 @@ def content_type_for(path: Path) -> str:
     return "application/octet-stream"
 
 
+_SCRIPT_CAPABLE_TYPES = frozenset({
+    "text/html",
+    "image/svg+xml",
+    "application/xhtml+xml",
+    "text/xml",
+    "application/xml",
+})
+
+
+def raw_response_headers(ctype: str) -> dict[str, str]:
+    headers = {
+        "Content-Type": ctype,
+        "Cache-Control": "private, max-age=60",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if ctype.split(";", 1)[0].strip().lower() in _SCRIPT_CAPABLE_TYPES:
+        headers["Content-Security-Policy"] = "sandbox"
+    return headers
+
+
 def content_disposition_attachment(filename: str) -> str:
     """Build Content-Disposition attachment header; basename only, no path segments."""
     base = Path(str(filename or "")).name

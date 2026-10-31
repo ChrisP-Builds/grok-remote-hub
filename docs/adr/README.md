@@ -34,7 +34,7 @@ a new ADR.
 | 007 | Classify subagent sessions via session_kind | Accepted | 2026-07-11 |
 | 008 | Persist hub renames as hub_title in summary.json | Accepted | 2026-07-11 |
 | 009 | KeepAgent default + view-first continuity (no no-output fork) | Accepted | 2026-07-12 |
-| 010 | File-first site preview, not cloud or chat artifacts | Accepted | 2026-07-12 |
+| 010 | File-first site preview, not cloud or chat artifacts | Accepted (amended by 026) | 2026-07-12 |
 | 011 | Separate agent process health from ACP connection | Accepted | 2026-07-13 |
 | 012 | Durable Hub plan-mode approval via plan_mode.json | Accepted | 2026-07-14 |
 | 013 | ACP quality beyond process-up and connected boolean | Accepted | 2026-07-14 |
@@ -50,3 +50,4 @@ a new ADR.
 | 023 | Always-approve remote risk and CLI resume handoff | Accepted | 2026-08-08 |
 | 024 | Stop cancels the turn then clears hub bg activity honesty | Accepted | 2026-08-08 |
 | 025 | Mobile plan copy/mermaid and session search/recap continuity | Accepted | 2026-08-08 |
+| 026 | Guard Host and Origin, and serve previews as sandboxed capability URLs | Accepted | 2026-10-31 |
