@@ -96,3 +96,13 @@ them. Revisit with cookie auth once the hub is served over HTTPS.
 
 - ADR-010 file-first site preview
 - ADR-023 always-approve remote risk
+
+## Amendment (2026-10-31): redact agent messages at the browser boundary
+
+A permission probe showed the agent broadcasts `_x.ai/mcp/servers_updated`
+with MCP server `env` values (API keys) in plain text, and `terminal/create`
+carries an `env` block. Agent messages without a `sessionId` are fanned out
+to every browser. `_emit_acp` now sends `redact_for_browser(msg)`: values in
+`env` / `headers` name-value lists and string fields with secret-like names
+become `[redacted]`. Numbers pass, so token counts for the usage bars survive.
+Validation: `tests/test_harden_policy.py` redaction tests.

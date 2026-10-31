@@ -275,3 +275,36 @@ def agent_recycle_reconnect_plan(
         "settle_after_port_s": max(0.0, float(settle_after_port_s)),
         "reset_maintain_loop": True,
     }
+
+_SECRET_KEY_PARTS = (
+    "secret", "password", "passwd", "authorization", "credential",
+    "apikey", "api_key", "api-key", "private_key",
+)
+_SECRET_KEY_SUFFIXES = ("_token", "-token", "accesstoken", "refreshtoken")
+_NAME_VALUE_LIST_KEYS = frozenset({"env", "headers"})
+REDACTED = "[redacted]"
+
+
+def _is_secret_key(key: str) -> bool:
+    k = key.lower()
+    return any(p in k for p in _SECRET_KEY_PARTS) or k == "token" or k.endswith(_SECRET_KEY_SUFFIXES)
+
+
+def redact_for_browser(value: Any, _parent_key: str = "") -> Any:
+    """Copy of an agent message safe to send to browsers (ADR-026 amendment).
+
+    Blanks env/header values and secret-named string fields; numbers (token counts) pass.
+    """
+    if isinstance(value, dict):
+        if _parent_key in _NAME_VALUE_LIST_KEYS and "value" in value:
+            return {**value, "value": REDACTED}
+        out = {}
+        for k, v in value.items():
+            if isinstance(v, str) and _is_secret_key(str(k)):
+                out[k] = REDACTED
+            else:
+                out[k] = redact_for_browser(v, str(k).lower())
+        return out
+    if isinstance(value, list):
+        return [redact_for_browser(v, _parent_key) for v in value]
+    return value

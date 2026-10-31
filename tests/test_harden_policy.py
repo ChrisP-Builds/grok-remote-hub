@@ -13,6 +13,7 @@ from hub.harden_policy import (
     is_loopback_host,
     is_public_unauthenticated_path,
     public_liveness_body,
+    redact_for_browser,
     require_hub_token,
     should_auto_restart_agent_on_heal_exhaust,
 )
@@ -317,3 +318,39 @@ def test_app_js_hub_token_persist_keys() -> None:
     assert "grh.hubToken" in js
     assert "hubToken" in js
     assert "replaceState" in js
+
+
+def test_redact_for_browser_strips_mcp_env_and_headers() -> None:
+    """Agent broadcasts MCP config (with env secrets) without a sessionId."""
+    msg = {
+        "jsonrpc": "2.0",
+        "method": "_x.ai/mcp/servers_updated",
+        "params": {"mcpServers": [{
+            "name": "firecrawl-mcp",
+            "command": "npx",
+            "env": [{"name": "FIRECRAWL_API_KEY", "value": "fc-not-a-real-key"}],
+            "headers": [{"name": "Authorization", "value": "Bearer abc"}],
+        }]},
+    }
+    out = redact_for_browser(msg)
+    server = out["params"]["mcpServers"][0]
+    assert server["env"] == [{"name": "FIRECRAWL_API_KEY", "value": "[redacted]"}]
+    assert server["headers"] == [{"name": "Authorization", "value": "[redacted]"}]
+    assert server["command"] == "npx"
+    assert msg["params"]["mcpServers"][0]["env"][0]["value"] == "fc-not-a-real-key", "input untouched"
+
+
+def test_redact_for_browser_secret_keys_but_not_token_counts() -> None:
+    out = redact_for_browser({
+        "apiKey": "k", "client_secret": "s", "password": "p", "access_token": "t",
+        "usage": {"input_tokens": 1202, "totalTokens": 29870, "tokensBefore": 5},
+        "text": "a token of thanks",
+    })
+    assert out["apiKey"] == out["client_secret"] == out["password"] == out["access_token"] == "[redacted]"
+    assert out["usage"] == {"input_tokens": 1202, "totalTokens": 29870, "tokensBefore": 5}
+    assert out["text"] == "a token of thanks"
+
+
+def test_server_redacts_acp_messages_before_broadcast() -> None:
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    assert '"message": redact_for_browser(msg)' in src

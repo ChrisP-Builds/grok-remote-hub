@@ -13,6 +13,7 @@ This file is the **public narrative**. Session chat context is not required to u
 - **Host and Origin guard (ADR-026)**: every request must name this hub in `Host` (blocks DNS rebinding); `/ws` and mutating requests must be same-origin when the browser sends `Origin` (blocks cross-site WebSocket hijacking and CSRF, including against a tokenless loopback hub). New `hub.allowed_hosts` / `hub.allowed_origins` for proxies. Constant-time token compare; `Referrer-Policy`, `nosniff`, `frame-ancestors 'self'` on responses.
 - **Sandboxed site preview**: served at a random per-start `/preview-site/<key>/` URL with `Content-Security-Policy: sandbox` (opaque origin), so previewed HTML cannot read the hub token or call the API. Iframe no longer combines `allow-scripts` with `allow-same-origin`. Fixes preview CSS/JS returning 401 in token mode. Apps that need `localStorage` should use `tools/preview-hub`.
 - **Raw HTML/SVG/XML file responses** carry `Content-Security-Policy: sandbox`.
+- **Agent secrets no longer reach browsers**: MCP server `env`/`headers` values (e.g. API keys in `_x.ai/mcp/servers_updated`) and secret-named fields are redacted before WebSocket fan-out.
 
 ### Added
 - **Stop honesty (bg stamps)** — `AcpClient.end_turn` pops per-session (or clears all) bg activity after cancel+clear so Working/Stuck does not linger after Stop; residual documented (parent sessionId cancel; nested subagents depend on agent ACP). WS Stop rebroadcasts status; soft notice when agent does not confirm cancel after local clear.

@@ -22,6 +22,7 @@ from hub.harden_policy import (
     agent_recycle_reconnect_plan,
     heal_exhaust_operator_fields,
     health_response_body,
+    redact_for_browser,
     should_auto_restart_agent_on_heal_exhaust,
 )
 from hub.http_guard import GuardPolicy, install_guard, request_has_token
@@ -913,7 +914,7 @@ class Hub:
             return
 
         await self.broadcast(
-            {"type": "acp", "sessionId": session_id, "message": msg},
+            {"type": "acp", "sessionId": session_id, "message": redact_for_browser(msg)},
             session_id=session_id,
         )
 
