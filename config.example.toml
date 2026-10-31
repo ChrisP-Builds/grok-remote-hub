@@ -19,6 +19,10 @@ hub_token = ""
 # KillAgent-style restart once per hub process. Default off (manual pill / admin).
 # auto_restart_agent_on_heal_exhaust = false
 
+# Phone approvals (ADR-027): balanced asks before risky steps, strict also asks about
+# anything not routine, trusted never asks. Switchable per session in the UI.
+# approval_mode = "balanced"
+
 sessions_root = "~/.grok/sessions"
 # Folder that contains your project directories (New Session picker).
 projects_root = "~/Projects"

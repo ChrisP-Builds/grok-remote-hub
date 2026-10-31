@@ -738,13 +738,20 @@ class AgentSupervisor:
             log_f.close()
             raise
 
+    def _agent_options(self) -> list[str]:
+        """`grok agent` options that precede the mode. Gate plugin: ADR-027."""
+        opts = ["--always-approve"]
+        plugin_dir = Path(self.config.gate_plugin_dir)
+        if (plugin_dir / "hooks" / "hooks.json").is_file():
+            opts += ["--plugin-dir", str(plugin_dir)]
+        return opts
+
     async def _spawn(self) -> None:
         bind = f"{self.config.agent_bind}:{self.config.agent_port}"
-        # --always-approve is a `grok agent` option (before mode), not a serve flag
         cmd = [
             self.config.grok_bin,
             "agent",
-            "--always-approve",
+            *self._agent_options(),
             "serve",
             "--bind",
             bind,
@@ -752,8 +759,9 @@ class AgentSupervisor:
             self.secret,
         ]
         log.info(
-            "Starting agent: %s agent --always-approve serve --bind %s --secret <redacted>",
+            "Starting agent: %s agent %s serve --bind %s --secret <redacted>",
             self.config.grok_bin,
+            " ".join(cmd[2 : cmd.index("serve")]),
             bind,
         )
         await self._spawn_detached(cmd, "Agent")
@@ -766,7 +774,7 @@ class AgentSupervisor:
         cmd = [
             self.config.grok_bin,
             "agent",
-            "--always-approve",
+            *self._agent_options(),
             "leader",
             "--no-exit-on-disconnect",
             "--relay-on-demand",
@@ -774,9 +782,10 @@ class AgentSupervisor:
             str(debug_file),
         ]
         log.info(
-            "Starting leader: %s agent --always-approve leader "
+            "Starting leader: %s agent %s leader "
             "--no-exit-on-disconnect --relay-on-demand --debug-file %s",
             self.config.grok_bin,
+            " ".join(cmd[2 : cmd.index("leader")]),
             debug_file.name,
         )
         self._log_path = self.config.log_dir / f"agent-{day}.log"

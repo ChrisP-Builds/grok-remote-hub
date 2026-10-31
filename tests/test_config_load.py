@@ -55,3 +55,15 @@ def test_load_config_allowed_lists_default_empty(tmp_path: Path) -> None:
     loaded = load_config(cfg_path)
     assert loaded.allowed_hosts == []
     assert loaded.allowed_origins == []
+
+
+def test_load_config_approval_mode(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[hub]\napproval_mode = "Strict"\n', encoding="utf-8")
+    assert load_config(cfg_path).approval_mode == "strict"
+    cfg_path.write_text('[hub]\napproval_mode = "yolo"\n', encoding="utf-8")
+    assert load_config(cfg_path).approval_mode == "balanced"
+    cfg_path.write_text("[hub]\n", encoding="utf-8")
+    loaded = load_config(cfg_path)
+    assert loaded.approval_mode == "balanced"
+    assert loaded.gate_plugin_dir.name == "grok-approval-gate"

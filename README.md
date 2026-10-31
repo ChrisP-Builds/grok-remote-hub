@@ -200,6 +200,8 @@ Without Tailscale the hub binds **localhost only** and the UI shows **Local only
 
 3. Agent listens on **`127.0.0.1` only**; secret file `data/agent.secret` is gitignored.
 
+**Phone approvals (ADR-027):** risky steps pause and show an Allow / Deny card on every connected browser: pushes and history rewrites, recursive deletes, package installs, network transfers, system changes, and file writes outside the session folder. No answer within 5 minutes means deny. Each session has a Balanced (default) / Strict / Trusted switch; "Allow similar" rules are saved per project in `data/approval-rules.json`, which you can edit. Built-in web search runs on xAI's side and is not gated. After upgrading, restart once with `.\restart-hub.ps1 -KillAgent` so the agent loads the gate.
+
 **Desktop handoff:** continue a hub session in stock CLI with `grok --resume <session-id>` (copy id from the UI). Default topology does not dual-live CLI + hub on the same serve process.
 
 Full policy: **[SECURITY.md](SECURITY.md)** · ADR-023.
@@ -216,6 +218,7 @@ Full policy: **[SECURITY.md](SECURITY.md)** · ADR-023.
 | `hub.projects_root` | `~/Projects` | Project folders for New Session |
 | `hub.sessions_root` | `~/.grok/sessions` | On-disk session index |
 | `agent.bind` / `port` | `127.0.0.1:2419` | Local `grok agent serve` |
+| `hub.approval_mode` | `balanced` | Default phone-approval mode for sessions: `balanced`, `strict` or `trusted` (ADR-027) |
 | `agent.backend` | `serve` | **`serve` (default)** or experimental `leader` (shared leader + stdio ACP). Enabling leader means shared outage with CLI `grok --leader` clients; default keep serve so normal CLI stays independent. See [docs/exp-leader-lab.md](docs/exp-leader-lab.md). |
 
 Copy `config.example.toml` → `config.toml` for local overrides.

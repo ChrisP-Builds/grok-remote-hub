@@ -16,6 +16,7 @@ from aiohttp import WSMsgType, web
 
 from hub.acp_client import AcpClient
 from hub.agent_supervisor import AgentSupervisor
+from hub.approvals import ApprovalBroker, make_pre_tool_use_handler, write_gate_plugin
 from hub.config import Config, PROJECT_ROOT, TAILSCALE_EXE
 from hub.harden_policy import (
     agent_recycle_complete,
@@ -114,6 +115,7 @@ log = logging.getLogger("hub.server")
 
 LAST_REMOTE_SESSION_FILE = PROJECT_ROOT / "logs" / "last-remote-session.txt"
 REMOTE_SESSIONS_FILE = PROJECT_ROOT / "data" / "remote-sessions.json"
+APPROVAL_RULES_FILE = PROJECT_ROOT / "data" / "approval-rules.json"
 REMOTE_SESSION_SYSTEM_NOTE = (
     "Live remote session for this project. Desktop TUI history is separate."
 )
@@ -259,6 +261,15 @@ class Hub:
         self.acp.on_terminal_out = self._on_terminal_out
         self.acp.on_session_activity = self._on_session_activity
         self.acp.on_force_clear = self._on_force_clear
+        self.hook_key = config.ensure_hook_secret()
+        self._session_cwds: dict[str, str] = {}
+        self.approvals = ApprovalBroker(
+            APPROVAL_RULES_FILE,
+            self.broadcast,
+            session_root_for=self._session_root_for,
+            default_mode=config.approval_mode,
+        )
+        self.acp.exec_gate = self.approvals.exec_refusal
         # Process-local ops counters + event ring (never external backends).
         self.ops = OpsMetrics(log_dir=getattr(config, "log_dir", None))
         # Debounce status broadcasts from high-rate bg activity (e.g. 8s subagent_progress).
@@ -572,6 +583,9 @@ class Hub:
             "turnSilenceSeconds": primary_tel["silenceSeconds"],
             "liveTurns": live_turns,
             "pendingQuestionSessions": pending_q,
+            "pendingApprovals": self.approvals.pending_payload(),
+            "approvalModes": self.approvals.modes_payload(),
+            "approvalDefaultMode": self.approvals.default_mode,
             "sessionFlags": session_flags,
             "maxConcurrentTurns": self._max_concurrent_turns,
             "activeTurnCount": capacity["activeTurnCount"],
@@ -1129,6 +1143,8 @@ class Hub:
             "queue",
             "user_question",
             "user_question_resolved",
+            "approval_request",
+            "approval_resolved",
         )
         scoped = (
             "acp",
@@ -1253,6 +1269,7 @@ class Hub:
         sid = str(session_id)
         self.acp_created_sessions.add(sid)
         self.hub_owned_session_ids.add(sid)
+        self._session_cwds[sid] = cwd
         key = self._cwd_key(cwd)
         if key:
             self.remote_agent_session[key] = sid
@@ -1263,6 +1280,11 @@ class Hub:
             path.write_text(sid + "\n", encoding="utf-8")
         except OSError as exc:
             log.debug("failed to write last-remote-session.txt: %s", exc)
+
+    def _session_root_for(self, session_id: str) -> str | None:
+        if session_id in self._session_cwds:
+            return self._session_cwds[session_id]
+        return next((key for key, sid in self.remote_agent_session.items() if sid == session_id), None)
 
     def _hub_remote_ids(self) -> set[str]:
         return set(self.remote_agent_session.values()) | set(self.hub_owned_session_ids)
@@ -1711,6 +1733,7 @@ class Hub:
         # Register before static / so preview paths are not swallowed.
         app.router.add_get("/preview-site/{path:.*}", self.handle_preview_site)
         app.router.add_get("/ws", self.handle_ws)
+        app.router.add_post("/internal/pre-tool-use", make_pre_tool_use_handler(self.approvals, self.hook_key))
         static_dir = Path(self.config.static_dir)
         if static_dir.is_dir():
             app.router.add_get("/", self.handle_index)
@@ -1723,6 +1746,10 @@ class Hub:
     async def _on_startup(self, app: web.Application) -> None:
         # CLI version is cheap and useful even if agent is slow
         self.cli_version = await asyncio.to_thread(get_cli_version, self.config.grok_bin)
+        write_gate_plugin(
+            self.config.gate_plugin_dir,
+            f"http://127.0.0.1:{self.config.bind_port}/internal/pre-tool-use?key={self.hook_key}",
+        )
         await self.supervisor.start()
         await self.supervisor.wait_until_up(timeout=25.0)
         await self.acp.start()
@@ -3308,6 +3335,21 @@ class Hub:
         if typ == "user_question_answer":
             await self._ws_user_question_answer(ws, payload)
             return
+        if typ == "approval_answer":
+            answered = self.approvals.answer(
+                str(payload.get("id") or ""),
+                str(payload.get("decision") or ""),
+                str(payload.get("scope") or "once"),
+            )
+            if not answered:
+                await self._emit_error("approval is no longer pending", ws=ws)
+            return
+        if typ == "set_approval_mode":
+            sid = str(payload.get("sessionId") or "")
+            if sid:
+                self.approvals.set_mode(sid, str(payload.get("mode") or ""))
+                await self.broadcast(self.status_payload())
+            return
         await self._emit_error(f"unknown type: {typ}", ws=ws)
 
     async def _ws_prompt_safe(self, ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
@@ -4328,6 +4370,7 @@ class Hub:
         session_id = str(payload.get("sessionId") or "")
         if not session_id:
             return
+        self.approvals.cancel_session(session_id)
         # Stop cancels only this session's turn + its project queue.
         _, cwd_key = self._resolve_prompt_cwd_key(session_id, "")
         # Also match by remote map reverse lookup

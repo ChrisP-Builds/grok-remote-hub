@@ -270,6 +270,8 @@ class AcpClient:
         ) = None
         # Hub ops: (reason, session_id_or_None) when a force-clear actually clears.
         self.on_force_clear: Callable[[str, str | None], None] | None = None
+        # (kind "shell"|"file", session_id, command|path) -> refusal reason or None. ADR-027.
+        self.exec_gate: Callable[[str, str, str], str | None] | None = None
         # session_id -> monotonic last notification activity (orphan/bg work).
         self._bg_activity_at: dict[str, float] = {}
         # session_id -> monotonic first stamp of current bg episode (continuous age).
@@ -1431,6 +1433,16 @@ class AcpClient:
             err["data"] = data
         await self._send({"jsonrpc": "2.0", "id": msg_id, "error": err})
 
+    def _exec_refusal(self, kind: str, params: dict[str, Any], value: str) -> str | None:
+        if self.exec_gate is None:
+            return None
+        sid = str(params.get("sessionId") or params.get("session_id") or "")
+        try:
+            return self.exec_gate(kind, sid, value)
+        except Exception:
+            log.exception("exec gate failed; refusing %s", kind)
+            return "Blocked by Grok Remote Hub: approval check failed."
+
     async def _handle_client_request(self, msg: dict[str, Any]) -> None:
         """Respond to agent-initiated JSON-RPC requests (fs, terminal, permission)."""
         msg_id = msg.get("id")
@@ -1464,11 +1476,21 @@ class AcpClient:
                 return
 
             if method in ("fs/write_text_file", "fs/writeTextFile"):
+                refusal = self._exec_refusal("file", params, str(params.get("path") or ""))
+                if refusal:
+                    await self._reply_error(msg_id, -32000, refusal)
+                    return
                 result = await asyncio.to_thread(write_text_file, params)
                 await self._reply_result(msg_id, result)
                 return
 
             if method in ("terminal/create", "terminal/create_terminal"):
+                args = [str(a) for a in params.get("args") or []]
+                command = " ".join([str(params.get("command") or ""), *args]).strip()
+                refusal = self._exec_refusal("shell", params, command)
+                if refusal:
+                    await self._reply_error(msg_id, -32000, refusal)
+                    return
                 result = await self._terminals.create(params)
                 await self._reply_result(msg_id, result)
                 return

@@ -19,6 +19,7 @@ log = logging.getLogger("hub.guard")
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 PREVIEW_PREFIX = "/preview-site/"
+GROK_HOOK_PATH = "/internal/pre-tool-use"
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_PORT_SUFFIXES = (":80", ":443")
 
@@ -112,6 +113,9 @@ def request_has_token(request: web.Request, token: str) -> bool:
 
 
 def _is_capability_path(method: str, path: str) -> bool:
+    """Paths whose handler checks its own key instead of the browser token."""
+    if method == "POST" and path == GROK_HOOK_PATH:
+        return True
     return method in ("GET", "HEAD") and path.startswith(PREVIEW_PREFIX)
 
 

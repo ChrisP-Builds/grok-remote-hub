@@ -30,6 +30,8 @@ The hub starts the agent with **`--always-approve`** so remote turns can run wit
 - A caller who can authenticate to the hub (or who can reach a tokenless non-loopback bind) can run shell, read/write project files, and use network tools **with the same power as you at the keyboard**.
 - Treat the hub token like a root-of-trust for that machine’s agent. Prefer Tailscale membership + strong token; never bind `0.0.0.0` without a token; do not share hub URLs in chat logs.
 
+Since ADR-027 the hub gates tool calls through a Grok `PreToolUse` hook it injects into its own agent process: in the default Balanced mode, risky shell commands and file writes outside the session folder wait for your Allow / Deny on the phone and are denied after 5 minutes without an answer. The hub also refuses to execute an unapproved risky shell command or outside write itself, so the gate does not fail open on those two. Command patterns catch mistakes, not a determined attacker, and web search is not gated; treat the token as full access regardless.
+
 This is not a limited “chat only” surface. See [ADR-023](docs/adr/023-permissions-always-approve-and-cli-resume-handoff.md).
 
 ## Desktop handoff (`grok --resume`)

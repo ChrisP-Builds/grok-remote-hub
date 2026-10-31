@@ -16,6 +16,7 @@ This file is the **public narrative**. Session chat context is not required to u
 - **Agent secrets no longer reach browsers**: MCP server `env`/`headers` values (e.g. API keys in `_x.ai/mcp/servers_updated`) and secret-named fields are redacted before WebSocket fan-out.
 
 ### Added
+- **Phone approvals (ADR-027)**: the hub injects a Grok `PreToolUse` HTTP hook into its agent (`--plugin-dir`) and holds risky steps (push/history rewrite, recursive delete, package install, network transfer, system change, writes outside the session folder) until you Allow or Deny from any connected browser; no answer in 5 minutes denies. Balanced / Strict / Trusted per session (`hub.approval_mode` default), "Allow similar" rules per project in `data/approval-rules.json`, and an executor backstop that refuses unapproved shell commands and outside writes. Requires one `restart-hub.ps1 -KillAgent` after upgrade.
 - **Stop honesty (bg stamps)** — `AcpClient.end_turn` pops per-session (or clears all) bg activity after cancel+clear so Working/Stuck does not linger after Stop; residual documented (parent sessionId cancel; nested subagents depend on agent ACP). WS Stop rebroadcasts status; soft notice when agent does not confirm cancel after local clear.
 - **Session search `?q=`** — pure `session_matches_query` (title / session id / cwd basename) on `GET /api/sessions`; SPA filter matches session id substring.
 - **Catch up recap** — `GET /api/sessions/{id}/recap` + topbar **Catch up** control (last user + assistant, bounded).

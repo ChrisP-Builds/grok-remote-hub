@@ -92,6 +92,7 @@ def _app(policy: GuardPolicy) -> web.Application:
     app.router.add_get("/api/sessions", ok)
     app.router.add_post("/api/sessions", ok)
     app.router.add_get("/preview-site/{path:.*}", ok)
+    app.router.add_post("/internal/pre-tool-use", ok)
     return app
 
 
@@ -178,3 +179,15 @@ def test_tailscale_self_dns_names_parses_status_json() -> None:
     assert tailscale_self_dns_names(status) == ["desk.tailnet.ts.net."]
     assert tailscale_self_dns_names({}) == []
     assert tailscale_self_dns_names({"Self": None}) == []
+
+
+def test_grok_hook_path_skips_token_but_not_host_check() -> None:
+    """Grok's HTTP hook cannot send the browser token; the handler checks its own key."""
+
+    async def scenario(client: TestClient) -> None:
+        assert (await client.post("/internal/pre-tool-use?key=x")).status == 200
+        foreign = {"Host": "attacker.example:8787"}
+        assert (await client.post("/internal/pre-tool-use?key=x", headers=foreign)).status == 403
+        assert (await client.get("/internal/pre-tool-use")).status in (401, 405)
+
+    _run(_loopback_policy(token="s3cret"), scenario)
