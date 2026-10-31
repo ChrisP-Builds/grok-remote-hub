@@ -3342,7 +3342,7 @@ class Hub:
                 str(payload.get("scope") or "once"),
             )
             if not answered:
-                await self._emit_error("approval is no longer pending", ws=ws)
+                log.info("approval answer ignored; no longer pending id=%s", payload.get("id"))
             return
         if typ == "set_approval_mode":
             sid = str(payload.get("sessionId") or "")

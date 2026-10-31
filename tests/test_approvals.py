@@ -266,3 +266,26 @@ def test_server_wires_approvals() -> None:
         "write_gate_plugin(",
     ):
         assert needle in src, needle
+
+def test_payload_marks_invisible_unicode_and_carries_server_clock(tmp_path: Path) -> None:
+    """A prompt-injected agent must not disguise a command with bidi or zero-width characters."""
+    published: list = []
+    broker = _broker(tmp_path, published)
+    snapshot: list = []
+
+    async def run() -> None:
+        task = asyncio.create_task(broker.decide(_event("rm -rf \u202e/dliub\u202c\u200b")))
+        for _ in range(200):
+            if broker.pending_payload():
+                snapshot.extend(broker.pending_payload())
+                break
+            await asyncio.sleep(0.005)
+        await _answer_when_requested(broker, published, "deny")
+        await task
+
+    asyncio.run(run())
+    req = published[0]
+    assert "\u202e" not in req["summary"] and "\u200b" not in req["summary"]
+    assert "<U+202E>" in req["summary"] and "<U+200B>" in req["summary"]
+    assert req["createdAt"] <= req["serverNow"] <= req["expiresAt"]
+    assert snapshot and snapshot[0]["serverNow"] >= req["createdAt"]

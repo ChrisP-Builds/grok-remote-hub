@@ -7,6 +7,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
@@ -53,19 +54,28 @@ class _Pending:
     expires_at: float
     future: asyncio.Future = field(repr=False)
 
-    def payload(self) -> dict[str, Any]:
+    def payload(self, now: float) -> dict[str, Any]:
         return {
             "id": self.id,
             "sessionId": self.session_id or None,
             "tool": self.tool,
             "kind": self.verdict.kind,
-            "summary": self.verdict.summary,
-            "cwd": self.root,
+            "summary": _visible(self.verdict.summary),
+            "cwd": _visible(self.root),
             "category": self.verdict.category,
-            "similarRule": self.verdict.similar_rule,
+            "similarRule": _visible(self.verdict.similar_rule),
             "createdAt": self.created_at,
             "expiresAt": self.expires_at,
+            "serverNow": now,
         }
+
+
+_INVISIBLE = re.compile("[​-‏‪-‮⁦-⁩﻿]")
+
+
+def _visible(text: str | None) -> str | None:
+    """Show bidi and zero-width characters as markers so a command cannot be disguised."""
+    return _INVISIBLE.sub(lambda m: f"<U+{ord(m.group()):04X}>", text) if text else text
 
 
 class ApprovalBroker:
@@ -101,7 +111,8 @@ class ApprovalBroker:
         return dict(self._modes)
 
     def pending_payload(self) -> list[dict[str, Any]]:
-        return [p.payload() for p in sorted(self._pending.values(), key=lambda p: p.created_at)]
+        now = self._clock()
+        return [p.payload(now) for p in sorted(self._pending.values(), key=lambda p: p.created_at)]
 
     def _root(self, session_id: str) -> str | None:
         return self._known_root(session_id) or self._event_roots.get(session_id)
@@ -159,7 +170,7 @@ class ApprovalBroker:
             asyncio.get_running_loop().create_future(),
         )
         self._pending[pending.id] = pending
-        await self._emit({"type": "approval_request", **pending.payload()})
+        await self._emit({"type": "approval_request", **pending.payload(self._clock())})
         try:
             decision, scope, by = await asyncio.wait_for(pending.future, self._timeout)
         except asyncio.TimeoutError:

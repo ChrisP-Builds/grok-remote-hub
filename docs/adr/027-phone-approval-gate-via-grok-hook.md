@@ -86,3 +86,9 @@ risky actions. Probes against `grok agent serve` (2026-10-31) showed:
 
 - ADR-023 always-approve remote risk (risk reduced by this ADR)
 - ADR-026 Host/Origin guard and capability paths
+
+## Notes (2026-10-31)
+
+Review hardening: approval payloads show bidi and zero-width characters as
+visible `<U+XXXX>` markers so a command cannot be disguised on the card, and
+carry `serverNow` so the phone's countdown ignores its own clock skew.
