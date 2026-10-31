@@ -945,6 +945,18 @@
     /** Current folder browser payload from /api/projects/browse */
     projectBrowse: null,
     pendingUserQuestion: null, // { requestId, sessionId, questions, toolCallId }
+    /** @type {Map<string, object>} approval id -> normalized approval_request */
+    pendingApprovals: new Map(),
+    /** Approval ids whose answer was sent and await approval_resolved. */
+    approvalAnswering: new Set(),
+    /** Approval ids already handled by notifyApproval (toasted or on screen). */
+    approvalNotified: new Set(),
+    /** @type {Map<string, number>} approval id -> no-confirmation watchdog timer */
+    approvalAnswerTimers: new Map(),
+    /** @type {Record<string, string>} sessionId -> balanced | strict | trusted */
+    approvalModes: {},
+    approvalDefaultMode: "balanced",
+    approvalTick: null,
     turnStartedAt: 0,
     lastTermLineAt: 0,
     stallTimer: null,
@@ -1047,6 +1059,8 @@
     btnSend: $("#btn-send"),
     btnStop: $("#btn-stop"),
     composerHint: $("#composer-hint"),
+    approvalStack: $("#approval-stack"),
+    approvalMode: $("#approval-mode"),
     slash: $("#slash-palette"),
     btnMenu: $("#btn-menu"),
     btnRailCollapse: $("#btn-rail-collapse"),
@@ -1216,6 +1230,7 @@
     } else {
       el.textContent = message;
     }
+    if (typeof opts.onTap === "function") makeToastTappable(el, opts.onTap);
     els.toastHost.appendChild(el);
     const ms =
       typeof durationMs === "number"
@@ -1226,6 +1241,25 @@
     setTimeout(() => {
       if (el.parentNode) el.remove();
     }, ms);
+  }
+
+  function makeToastTappable(el, onTap) {
+    el.classList.add("toast-tappable");
+    el.setAttribute("role", "button");
+    el.tabIndex = 0;
+    const tap = () => {
+      el.remove();
+      try {
+        onTap();
+      } catch (_) {}
+    };
+    el.addEventListener("click", tap);
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        tap();
+      }
+    });
   }
 
   /** Recoverable turn-clear notices (stall / max duration / no output / auto-retry) — not hard failures. */
@@ -1430,9 +1464,11 @@
     if (state.metaPopoverPinned || (els.metaPopover && !els.metaPopover.classList.contains("hidden"))) {
       refreshMetaPopoverContent();
     }
+    renderApprovals();
   }
 
   function clearTopbarSessionMeta() {
+    renderApprovals();
     if (els.chatTitle) els.chatTitle.textContent = "Select a session";
     if (els.btnRenameSession) els.btnRenameSession.classList.add("hidden");
     if (els.btnCatchUp) els.btnCatchUp.classList.add("hidden");
@@ -2130,6 +2166,11 @@
     return state.selectedId;
   }
 
+  function setLivePromptSessionId(sessionId) {
+    state.livePromptSessionId = sessionId;
+    renderApprovals();
+  }
+
   function isHubCreatedSession(sessionId) {
     if (!sessionId) return false;
     const ids = state.hubSessionIds || [];
@@ -2579,6 +2620,7 @@
         }
       }
     }
+    syncApprovalBadges();
   }
 
   /**
@@ -4076,7 +4118,7 @@
       reason !== "resume_failed" &&
       reason !== "dead_view"
     ) {
-      state.livePromptSessionId = toId;
+      setLivePromptSessionId(toId);
       setSessionMode("live-remote", { attachSwitched: true });
       subscribeSessionIds(state.selectedId, toId, liveTurnId());
       toast(message || "Live hub session ready — still showing this session’s history", "");
@@ -4086,7 +4128,7 @@
     }
     // Already on a different session than the switch source — only record live id.
     if (state.selectedId && from && state.selectedId !== from && state.selectedId !== toId) {
-      state.livePromptSessionId = toId;
+      setLivePromptSessionId(toId);
       subscribeSessionIds(state.selectedId, toId, liveTurnId());
       return;
     }
@@ -4113,7 +4155,7 @@
     state.selectedId = toId;
     if (meta && !meta.sessionId) meta.sessionId = toId;
     state.selectedMeta = meta;
-    state.livePromptSessionId = toId;
+    setLivePromptSessionId(toId);
     saveSelectedSession(toId, meta);
     // Keep prior commands until agent sends a fresh list; builtins fill gaps.
     const v = showSessionPane(toId);
@@ -4529,6 +4571,7 @@
       els.sessionList.appendChild(btn);
     }
     _sessionPillRanks = nextPillRanks;
+    syncApprovalBadges();
   }
 
   function emptyStreamBuffers() {
@@ -6453,7 +6496,7 @@
       if (state.hubSessionIds.indexOf(viewId) < 0) {
         state.hubSessionIds = [viewId, ...state.hubSessionIds].slice(0, 50);
       }
-      state.livePromptSessionId = liveId;
+      setLivePromptSessionId(liveId);
       if (!switched) {
         setSessionMode("live-remote", { attachSwitched: false });
       }
@@ -6527,7 +6570,7 @@
     }
     updateLatencyHintBanner();
     // Reset live prompt target until attach reports (or same-id hub session).
-    state.livePromptSessionId = isHubCreatedSession(viewId) ? viewId : null;
+    setLivePromptSessionId(isHubCreatedSession(viewId) ? viewId : null);
     if (!(state.turnRunning && viewId === liveKeep)) {
       state.promptQueueLength = 0;
     }
@@ -6674,7 +6717,7 @@
         const attachReason = String(attached.reason || "").trim();
 
         // Always remember where prompts should go
-        state.livePromptSessionId = liveId;
+        setLivePromptSessionId(liveId);
 
         if (switched) {
           // Dead view (resume_failed / dead_view): force UI + pin onto liveId so
@@ -6708,7 +6751,7 @@
           }
         } else {
           setSessionMode("live-remote", { attachSwitched: false });
-          state.livePromptSessionId = liveId;
+          setLivePromptSessionId(liveId);
         }
       } catch (err) {
         toast("Attach failed: " + err, "danger");
@@ -7153,7 +7196,7 @@
               const liveId = attached.liveId;
               const attachReason = String(attached.reason || "").trim();
               const switched = !!attached.switched && liveId !== viewWas;
-              state.livePromptSessionId = liveId;
+              setLivePromptSessionId(liveId);
               if (
                 switched &&
                 (attachReason === "resume_failed" ||
@@ -7356,6 +7399,7 @@
     ws.addEventListener("close", () => {
       state.wsState = "reconnecting";
       if (state.subscribedSessions) state.subscribedSessions.clear();
+      releaseApprovalAnswers();
       startHealthProbe();
       updateStatusPill();
       setComposerEnabled(false);
@@ -7583,6 +7627,7 @@
           updateTurnStrip();
         }
       }
+      applyStatusApprovals(msg);
       updateVersionBadge();
       updateStatusPill();
       scheduleSessionPills();
@@ -7683,7 +7728,7 @@
         if (state.hubSessionIds.indexOf(toId) < 0) {
           state.hubSessionIds = [toId, ...state.hubSessionIds].slice(0, 50);
         }
-        state.livePromptSessionId = toId;
+        setLivePromptSessionId(toId);
         setSessionMode("live-remote", {
           attachSwitched: !!(fromId && fromId !== toId),
         });
@@ -7696,7 +7741,7 @@
       if (!state.selectedId) {
         applySessionSwitch(fromId, toId, msg.reason || "", msg.message || "");
       } else {
-        state.livePromptSessionId = state.livePromptSessionId || toId;
+        setLivePromptSessionId(state.livePromptSessionId || toId);
         subscribeSessionIds(state.selectedId, toId, liveTurnId());
       }
       return;
@@ -7864,6 +7909,14 @@
     }
     if (type === "user_question_resolved") {
       onUserQuestionResolved(msg);
+      return;
+    }
+    if (type === "approval_request") {
+      onApprovalRequest(msg);
+      return;
+    }
+    if (type === "approval_resolved") {
+      onApprovalResolved(msg);
       return;
     }
     if (type === "terminal_out") {
@@ -8131,6 +8184,456 @@
     }
     closeAskUserModal();
   }
+
+  // Approvals (ADR-027): card above the composer, rail badge, per-session mode.
+  const APPROVAL_MODES = ["balanced", "strict", "trusted"];
+  const APPROVAL_KIND_LABELS = {
+    shell: "Shell command",
+    file: "File change",
+    tool: "Tool",
+  };
+  const APPROVAL_OFFLINE_TEXT = "Not connected; answer not sent";
+  const APPROVAL_ANSWER_TIMEOUT_MS = 10000;
+  const APPROVAL_SUMMARY_LINES = 6;
+  const APPROVAL_CHARS_PER_LINE = 36;
+  const APPROVAL_TRUSTED_CONFIRM =
+    "Trusted mode never asks before running commands, changing files outside " +
+    "the project, or using tools. Switch this session to Trusted?";
+
+  function normalizeApproval(raw) {
+    if (!raw || !raw.id) return null;
+    const expiresAt = Number(raw.expiresAt) || 0;
+    const serverNow = Number(raw.serverNow);
+    const skew = Number.isFinite(serverNow) ? serverNow - Date.now() / 1000 : 0;
+    return {
+      deadline: expiresAt ? expiresAt - skew : 0,
+      id: String(raw.id),
+      sessionId: raw.sessionId ? String(raw.sessionId) : null,
+      kind: APPROVAL_KIND_LABELS[raw.kind] ? raw.kind : "tool",
+      summary: String(raw.summary || ""),
+      cwd: raw.cwd ? String(raw.cwd) : "",
+      category: String(raw.category || ""),
+      similarRule: raw.similarRule ? String(raw.similarRule) : null,
+      createdAt: Number(raw.createdAt) || 0,
+      expiresAt,
+    };
+  }
+
+  function approvalSessionId() {
+    return promptSessionId();
+  }
+
+  function isApprovalOnScreen(req) {
+    if (!req.sessionId) return true;
+    return (
+      req.sessionId === state.selectedId ||
+      (!!state.selectedId && req.sessionId === state.livePromptSessionId)
+    );
+  }
+
+  function onApprovalRequest(msg) {
+    const req = normalizeApproval(msg);
+    if (!req) return;
+    state.pendingApprovals.set(req.id, req);
+    notifyApproval(req);
+    renderApprovals();
+  }
+
+  function applyStatusApprovals(msg) {
+    if (msg.approvalModes && typeof msg.approvalModes === "object") {
+      state.approvalModes = msg.approvalModes;
+    }
+    if (APPROVAL_MODES.indexOf(msg.approvalDefaultMode) >= 0) {
+      state.approvalDefaultMode = msg.approvalDefaultMode;
+    }
+    if (Array.isArray(msg.pendingApprovals)) {
+      const next = new Map();
+      for (const raw of msg.pendingApprovals) {
+        const req = normalizeApproval(raw);
+        if (req) next.set(req.id, req);
+      }
+      state.pendingApprovals = next;
+      Array.from(state.approvalAnswering).forEach((id) => {
+        if (!next.has(id)) stopAnswering(id);
+      });
+      pruneApprovalIds(state.approvalNotified, next);
+      next.forEach((req) => notifyApproval(req));
+    }
+    renderApprovals();
+  }
+
+  function pruneApprovalIds(ids, live) {
+    Array.from(ids).forEach((id) => {
+      if (!live.has(id)) ids.delete(id);
+    });
+  }
+
+  function onApprovalResolved(msg) {
+    const id = String(msg.id || "");
+    if (!id) return;
+    const req = state.pendingApprovals.get(id);
+    state.pendingApprovals.delete(id);
+    stopAnswering(id);
+    state.approvalNotified.delete(id);
+    renderApprovals();
+    if (!req) return;
+    const sid = (msg.sessionId && String(msg.sessionId)) || req.sessionId;
+    appendApprovalNote(sid, approvalOutcomeText(msg, req));
+  }
+
+  function approvalOutcomeText(msg, req) {
+    const summary = req.summary || "request";
+    if (msg.decision === "allow") {
+      if (msg.scope === "project" && req.similarRule) {
+        return "Allowed for this project: " + req.similarRule;
+      }
+      return "Allowed by you: " + summary;
+    }
+    if (msg.by === "timeout") return "Timed out, denied: " + summary;
+    if (msg.by === "cancelled") return "Cancelled: " + summary;
+    return "Denied: " + summary;
+  }
+
+  function appendApprovalNote(sessionId, text) {
+    const write = () => appendMessage({ role: "system", text });
+    if (!sessionId || sessionId === state.selectedId) {
+      if (state.selectedId) write();
+    } else if (shouldApplyAcpToSession(sessionId)) {
+      withSessionTarget(sessionId, write);
+    }
+  }
+
+  function notifyApproval(req) {
+    if (state.approvalNotified.has(req.id)) return;
+    state.approvalNotified.add(req.id);
+    if (isApprovalOnScreen(req) && state.mainMode === "chat") return;
+    const sid = req.sessionId || state.selectedId;
+    toast("Approval needed: " + approvalSessionTitle(sid), "", 15000, {
+      onTap: () => focusApprovalSession(sid),
+    });
+  }
+
+  function approvalSessionTitle(sessionId) {
+    const row = (state.sessions || []).find((s) => s && s.sessionId === sessionId);
+    return (row && row.title) || shortSessionId(sessionId) || "this session";
+  }
+
+  async function focusApprovalSession(sessionId) {
+    if (sessionId && sessionId !== state.selectedId) {
+      const row = (state.sessions || []).find((s) => s && s.sessionId === sessionId);
+      await openSession(row || { sessionId });
+    }
+    if (state.mainMode === "file") closeFileMode({ force: false });
+    renderApprovalStack();
+  }
+
+  function stopAnswering(id) {
+    state.approvalAnswering.delete(id);
+    const timer = state.approvalAnswerTimers.get(id);
+    if (timer) clearTimeout(timer);
+    state.approvalAnswerTimers.delete(id);
+  }
+
+  function releaseApprovalAnswers() {
+    if (!state.approvalAnswering.size) return;
+    Array.from(state.approvalAnswering).forEach(stopAnswering);
+    renderApprovalStack();
+  }
+
+  function startAnswerWatchdog(id) {
+    const timer = setTimeout(() => {
+      state.approvalAnswerTimers.delete(id);
+      if (!state.approvalAnswering.has(id)) return;
+      stopAnswering(id);
+      renderApprovalStack();
+      if (state.pendingApprovals.has(id)) {
+        toast("No confirmation from the hub; tap again", "danger");
+      }
+    }, APPROVAL_ANSWER_TIMEOUT_MS);
+    state.approvalAnswerTimers.set(id, timer);
+  }
+
+  function answerApproval(id, decision, scope) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      toast(APPROVAL_OFFLINE_TEXT, "danger");
+      return;
+    }
+    stopAnswering(id);
+    state.approvalAnswering.add(id);
+    sendWs({ type: "approval_answer", id, decision, scope });
+    startAnswerWatchdog(id);
+    renderApprovalStack();
+  }
+
+  function renderApprovals() {
+    renderApprovalStack();
+    renderApprovalMode();
+    syncApprovalBadges();
+  }
+
+  function visibleApprovals() {
+    return Array.from(state.pendingApprovals.values())
+      .filter(isApprovalOnScreen)
+      .sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  function renderApprovalStack() {
+    const host = els.approvalStack;
+    if (!host) return;
+    const existing = new Map();
+    host.querySelectorAll(".approval-card").forEach((card) => {
+      existing.set(card.dataset.approvalId, card);
+    });
+    const cards = visibleApprovals().map(
+      (req) => existing.get(req.id) || buildApprovalCard(req)
+    );
+    existing.forEach((card) => {
+      if (cards.indexOf(card) < 0) card.remove();
+    });
+    cards.forEach((card, i) => {
+      if (host.children[i] !== card) host.insertBefore(card, host.children[i] || null);
+      setApprovalCardBusy(card, state.approvalAnswering.has(card.dataset.approvalId));
+    });
+    const wasHidden = host.classList.contains("hidden");
+    host.classList.toggle("hidden", cards.length === 0);
+    cards.forEach(syncApprovalSummary);
+    updateApprovalCountdowns();
+    syncApprovalTicker(cards.length > 0);
+    if (cards.length && wasHidden) scrollIfSticky();
+  }
+
+  function buildApprovalCard(req) {
+    const card = document.createElement("section");
+    card.className = "approval-card";
+    card.dataset.approvalId = req.id;
+    card.dataset.kind = req.kind;
+    card.setAttribute("aria-label", "Approval needed: " + APPROVAL_KIND_LABELS[req.kind]);
+    card.append(
+      buildApprovalHead(req),
+      buildApprovalSummary(req),
+      buildApprovalMeta(req),
+      buildApprovalActions(req)
+    );
+    return card;
+  }
+
+  function buildApprovalHead(req) {
+    const head = document.createElement("div");
+    head.className = "approval-head";
+    const kind = document.createElement("span");
+    kind.className = "approval-kind";
+    kind.textContent = APPROVAL_KIND_LABELS[req.kind];
+    const countdown = document.createElement("span");
+    countdown.className = "approval-countdown";
+    // Ticks every second; keep the assertive stack from announcing each tick.
+    countdown.setAttribute("aria-live", "off");
+    head.append(kind, countdown);
+    return head;
+  }
+
+  function buildApprovalSummary(req) {
+    const wrap = document.createElement("div");
+    wrap.className = "approval-summary-wrap";
+    const summary = document.createElement("div");
+    summary.className = "approval-summary collapsed";
+    summary.textContent = req.summary;
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "approval-more hidden";
+    more.addEventListener("click", () => {
+      summary.classList.toggle("collapsed");
+      syncApprovalSummary(wrap);
+    });
+    wrap.append(summary, more);
+    return wrap;
+  }
+
+  function syncApprovalSummary(container) {
+    const summary = container.querySelector(".approval-summary");
+    const more = container.querySelector(".approval-more");
+    if (!summary || !more) return;
+    if (!summary.classList.contains("collapsed")) {
+      more.classList.remove("hidden");
+      more.textContent = "Show less";
+      return;
+    }
+    const hidden = hiddenSummaryLines(summary);
+    more.classList.toggle("hidden", hidden <= 0);
+    more.textContent = "+" + hidden + (hidden === 1 ? " more line" : " more lines");
+  }
+
+  // Cards built while #chat-panel is hidden have no layout, so estimate from text.
+  function hiddenSummaryLines(summary) {
+    if (summary.clientHeight > 0) {
+      const cs = getComputedStyle(summary);
+      const lineH = parseFloat(cs.lineHeight) || 18;
+      const pad = parseFloat(cs.paddingBottom) || 0;
+      return Math.max(0, Math.round((summary.scrollHeight - summary.clientHeight - pad) / lineH));
+    }
+    const lines = summary.textContent.split("\n").reduce(
+      (n, line) => n + Math.max(1, Math.ceil(line.length / APPROVAL_CHARS_PER_LINE)),
+      0
+    );
+    return lines - APPROVAL_SUMMARY_LINES;
+  }
+
+  function buildApprovalMeta(req) {
+    const meta = document.createElement("div");
+    meta.className = "approval-meta";
+    if (req.cwd) {
+      const folder = document.createElement("button");
+      folder.type = "button";
+      folder.className = "approval-folder";
+      folder.title = req.cwd;
+      folder.textContent = basename(req.cwd);
+      folder.setAttribute("aria-label", "Folder " + req.cwd);
+      folder.addEventListener("click", () => {
+        const full = folder.textContent === req.cwd;
+        folder.textContent = full ? basename(req.cwd) : req.cwd;
+        folder.classList.toggle("expanded", !full);
+      });
+      meta.appendChild(folder);
+    }
+    if (req.category) {
+      const category = document.createElement("span");
+      category.className = "approval-category";
+      category.textContent = req.category;
+      meta.appendChild(category);
+    }
+    return meta;
+  }
+
+  function buildApprovalActions(req) {
+    const actions = document.createElement("div");
+    actions.className = "approval-actions";
+    actions.append(
+      approvalButton("Deny", "btn btn-ghost approval-deny", () =>
+        answerApproval(req.id, "deny", "once")
+      ),
+      approvalButton("Allow", "btn btn-accent approval-allow", () =>
+        answerApproval(req.id, "allow", "once")
+      )
+    );
+    if (req.similarRule) {
+      actions.appendChild(
+        approvalButton(
+          "Always allow " + req.similarRule + " in this project",
+          "btn btn-ghost approval-always",
+          () => answerApproval(req.id, "allow", "project")
+        )
+      );
+    }
+    return actions;
+  }
+
+  function approvalButton(label, className, onClick) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = className;
+    btn.textContent = label;
+    btn.addEventListener("click", onClick);
+    return btn;
+  }
+
+  function setApprovalCardBusy(card, busy) {
+    card.classList.toggle("busy", busy);
+    card.querySelectorAll(".approval-actions .btn").forEach((btn) => {
+      btn.disabled = busy;
+    });
+  }
+
+  function formatApprovalCountdown(deadline, nowMs) {
+    const left = Math.max(0, Math.ceil(deadline - nowMs / 1000));
+    const secs = String(left % 60).padStart(2, "0");
+    return "Auto-deny in " + Math.floor(left / 60) + ":" + secs;
+  }
+
+  function updateApprovalCountdowns() {
+    if (!els.approvalStack) return;
+    const now = Date.now();
+    els.approvalStack.querySelectorAll(".approval-card").forEach((card) => {
+      const req = state.pendingApprovals.get(card.dataset.approvalId);
+      const node = card.querySelector(".approval-countdown");
+      if (!req || !node || !req.deadline) return;
+      node.textContent = formatApprovalCountdown(req.deadline, now);
+      node.classList.toggle("urgent", req.deadline - now / 1000 < 60);
+    });
+  }
+
+  function tickApprovals() {
+    updateApprovalCountdowns();
+    if (els.approvalStack) {
+      els.approvalStack.querySelectorAll(".approval-card").forEach(syncApprovalSummary);
+    }
+  }
+
+  function syncApprovalTicker(on) {
+    if (on && !state.approvalTick) {
+      state.approvalTick = setInterval(tickApprovals, 1000);
+    } else if (!on && state.approvalTick) {
+      clearInterval(state.approvalTick);
+      state.approvalTick = null;
+    }
+  }
+
+  function sessionHasApproval(sessionId) {
+    for (const req of state.pendingApprovals.values()) {
+      if (req.sessionId === sessionId) return true;
+    }
+    return false;
+  }
+
+  function syncApprovalBadges() {
+    if (!els.sessionList) return;
+    els.sessionList.querySelectorAll(".session-row[data-session-id]").forEach((row) => {
+      const has = sessionHasApproval(row.getAttribute("data-session-id"));
+      row.classList.toggle("has-approval", has);
+      const titleRow = row.querySelector(".title-row");
+      if (!titleRow) return;
+      const pill = titleRow.querySelector(".session-pill.status-approval");
+      if (has && !pill) titleRow.insertBefore(approvalPill(), titleRow.children[1] || null);
+      else if (!has && pill) pill.remove();
+    });
+  }
+
+  function approvalPill() {
+    const pill = document.createElement("span");
+    pill.className = "session-pill status-approval";
+    pill.textContent = "Approve";
+    return pill;
+  }
+
+  function currentApprovalMode() {
+    const sid = approvalSessionId();
+    const mode = sid ? state.approvalModes[sid] : null;
+    return APPROVAL_MODES.indexOf(mode) >= 0 ? mode : state.approvalDefaultMode;
+  }
+
+  function renderApprovalMode() {
+    const box = els.approvalMode;
+    if (!box) return;
+    box.classList.toggle("hidden", !state.selectedId);
+    const mode = currentApprovalMode();
+    box.dataset.mode = mode;
+    box.querySelectorAll("[data-mode]").forEach((opt) => {
+      opt.setAttribute("aria-pressed", opt.dataset.mode === mode ? "true" : "false");
+    });
+  }
+
+  function setApprovalMode(mode) {
+    const sid = approvalSessionId();
+    if (!sid || APPROVAL_MODES.indexOf(mode) < 0) return;
+    if (mode === currentApprovalMode()) return;
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      toast("Not connected; mode not changed", "danger");
+      return;
+    }
+    if (mode === "trusted" && !window.confirm(APPROVAL_TRUSTED_CONFIRM)) return;
+    sendWs({ type: "set_approval_mode", sessionId: approvalSessionId(), mode });
+    state.approvalModes = Object.assign({}, state.approvalModes, { [sid]: mode });
+    renderApprovalMode();
+  }
+  // End approvals
 
   function updateComposerPlaceholder() {
     const ta = els.input;
@@ -10971,6 +11474,12 @@
     if (els.btnAttach) {
       els.btnAttach.addEventListener("click", () => {
         openUploadPicker();
+      });
+    }
+    if (els.approvalMode) {
+      els.approvalMode.addEventListener("click", (e) => {
+        const opt = e.target && e.target.closest && e.target.closest("[data-mode]");
+        if (opt) setApprovalMode(opt.dataset.mode);
       });
     }
     if (els.composerFileInput) {

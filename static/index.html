@@ -12,7 +12,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/app.css?v=20260812a" />
+  <link rel="stylesheet" href="/app.css?v=20261031a" />
 </head>
 <body style="background:#0a0c10;color:#d6deea">
   <div id="app">
@@ -73,6 +73,11 @@
             <button type="button" id="btn-catch-up" class="btn btn-ghost btn-sm topbar-catch-up hidden" title="Catch up: last user + assistant" aria-label="Catch up">Catch up</button>
           </div>
           <div class="chat-sub" id="chat-sub">
+            <div id="approval-mode" class="approval-mode hidden" role="group" aria-label="Approval mode">
+              <button type="button" class="approval-mode-opt" data-mode="balanced" aria-pressed="false" title="Asks before risky commands and file changes outside the project">Balanced</button>
+              <button type="button" class="approval-mode-opt" data-mode="strict" aria-pressed="false" title="Asks unless a command is routine">Strict</button>
+              <button type="button" class="approval-mode-opt" data-mode="trusted" aria-pressed="false" title="Never asks (commands, file changes, tools)">Trusted</button>
+            </div>
             <span id="chat-project" class="chip chip-project meta-chip hidden" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Project details"></span>
             <span id="chat-model" class="chip meta-chip hidden" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Model details"></span>
             <span id="chat-cwd" class="cwd muted meta-chip" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Project path"></span>
@@ -175,6 +180,7 @@
             <span id="turn-strip-cursor" class="term-cursor hidden" aria-hidden="true">▋</span>
           </div>
           <div id="slash-palette" class="slash-palette hidden" role="listbox" aria-label="Slash commands"></div>
+          <div id="approval-stack" class="approval-stack hidden" role="region" aria-label="Approvals needed" aria-live="assertive"></div>
           <form id="composer-form" class="composer">
             <span class="composer-prompt" aria-hidden="true">&gt;</span>
             <textarea
@@ -370,6 +376,6 @@
   <script src="/vendor/marked.min.js"></script>
   <script src="/vendor/purify.min.js"></script>
   <!-- cache-bust: blank-page fix; mermaid loads on demand from app.js when needed -->
-  <script src="/app.js?v=20260812a"></script>
+  <script src="/app.js?v=20261031a"></script>
 </body>
 </html>
