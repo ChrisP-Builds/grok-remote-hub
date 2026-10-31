@@ -45,6 +45,12 @@ Hub and CLI must share the same mental model for a turn: **one owner**, interrup
 - Unit tests: `should_clear_turn_on_wake` matrix in `tests/test_session_policy.py`.
 - Structural: `static/app.js` defines `reconcileTurnAfterWake` / `shouldClearTurnOnWake`; visibilitychange and online wire them.
 
+## Notes (2026-08-08)
+
+Stop honesty extension recorded in **ADR-024**: after cancel-before-clear, hub
+clears bg activity stamps for the session so Working/Stuck does not outlive Stop;
+nested subagent residual is agent-ACP bounded.
+
 ## Related
 
 - ADR-001: Hub session lifecycle and sole-writer model

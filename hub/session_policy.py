@@ -357,7 +357,7 @@ def should_clear_turn_on_wake(
     turn_running: bool,
     silence_seconds: float | None,
     acp_quality: str | None,
-    silence_threshold_s: float = 120.0,
+    silence_threshold_s: float = CLIENT_STALL_WARN_SECONDS,
     has_open_tools: bool = False,
 ) -> bool:
     """True when wake/resume should cancel+clear like CLI interrupt of a dead turn.

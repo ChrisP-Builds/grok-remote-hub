@@ -6,8 +6,13 @@
 bind_host = ""
 bind_port = 8787
 
-# Optional shared secret for HTTP/WS (Authorization: Bearer or ?token=)
+# Shared secret for HTTP/WS (Authorization: Bearer or ?token=).
+# Required when binding non-loopback / Tailscale; empty allowed for loopback-only.
 hub_token = ""
+
+# Optional: after ACP heal attempts exhaust (process up, ACP down, no live turn),
+# KillAgent-style restart once per hub process. Default off (manual pill / admin).
+# auto_restart_agent_on_heal_exhaust = false
 
 sessions_root = "~/.grok/sessions"
 # Folder that contains your project directories (New Session picker).
@@ -22,3 +27,6 @@ projects_root = "~/Projects"
 bind = "127.0.0.1"
 port = 2419
 # secret_path = "data/agent.secret"
+# EXPERIMENT only. Default serve. leader = hub attaches via stdio to grok agent leader.
+# Desktop CLI can use: grok --leader  (same leader). Do not enable for normal use.
+# backend = "serve"

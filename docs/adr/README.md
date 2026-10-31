@@ -43,5 +43,10 @@ a new ADR.
 | 016 | Quiet-period session/load suppress before re-prompt | Accepted | 2026-07-17 |
 | 017 | Unresumable dead view forces pin (no blank fork) | Accepted | 2026-07-24 |
 | 018 | Cold ensure vs hot path attribution | Accepted | 2026-07-24 |
-| 019 | External hub health watchdog (scheduled watch-hub) | Accepted | 2026-07-26 |
+| 019 | External hub health watchdog (long-lived pythonw daemon) | Accepted | 2026-07-26 |
 | 020 | Process-local ops metrics and unified diagnostics | Accepted | 2026-07-26 |
+| 021 | Flag-gated leader multi-client experiment | Proposed / Experimental | 2026-07-30 |
+| 022 | Private agent serve remains default; stock CLI stays independent | Accepted | 2026-08-08 |
+| 023 | Always-approve remote risk and CLI resume handoff | Accepted | 2026-08-08 |
+| 024 | Stop cancels the turn then clears hub bg activity honesty | Accepted | 2026-08-08 |
+| 025 | Mobile plan copy/mermaid and session search/recap continuity | Accepted | 2026-08-08 |

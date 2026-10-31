@@ -1,16 +1,17 @@
-# Register logon start + recurring health watchdog for Grok Remote Hub.
-# Watch runs via wscript + VBS (window style 0) so no console flash for end users.
+# Register logon start + long-lived silent health watchdog for Grok Remote Hub.
+# GrokRemoteHub: start-hub at logon (silent via start-hub-hidden.vbs).
+# GrokRemoteHubWatch: AtLogOn only — launches watchdog-hidden.vbs which starts
+# a long-lived pythonw -m hub.watchdog daemon (not a every-2-minute PS poll).
+# Both use wscript + VBS (window style 0) so no console flash for end users.
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $StartScript = Join-Path $Root "start-hub.ps1"
-$WatchScript = Join-Path $Root "watch-hub.ps1"
 $StartVbs = Join-Path $Root "start-hub-hidden.vbs"
-$WatchVbs = Join-Path $Root "watch-hub-hidden.vbs"
+$WatchVbs = Join-Path $Root "watchdog-hidden.vbs"
 $TaskNameStart = "GrokRemoteHub"
 $TaskNameWatch = "GrokRemoteHubWatch"
 
 if (-not (Test-Path $StartScript)) { throw "Missing $StartScript" }
-if (-not (Test-Path $WatchScript)) { throw "Missing $WatchScript" }
 if (-not (Test-Path $StartVbs)) { throw "Missing $StartVbs" }
 if (-not (Test-Path $WatchVbs)) { throw "Missing $WatchVbs" }
 
@@ -41,20 +42,19 @@ try {
     Write-Host "WARN: could not register '$TaskNameStart': $($_.Exception.Message)"
 }
 
-# --- Every 2 minutes: watch-hub (silent via VBS) ---
+# --- Logon: long-lived pythonw watchdog (silent via VBS; not periodic PowerShell) ---
 $actionWatch = New-ScheduledTaskAction -Execute $wscript `
     -Argument "//B //Nologo `"$WatchVbs`"" `
     -WorkingDirectory $Root
-$triggerWatch = New-ScheduledTaskTrigger -Once -At (Get-Date).Date `
-    -RepetitionInterval (New-TimeSpan -Minutes 2) `
-    -RepetitionDuration (New-TimeSpan -Days 9999)
+$triggerWatchLogon = New-ScheduledTaskTrigger -AtLogOn
 try {
     Register-ScheduledTask -TaskName $TaskNameWatch -Action $actionWatch `
-        -Trigger $triggerWatch -Settings $settings -Principal $principal -Force | Out-Null
-    Write-Host "Scheduled task '$TaskNameWatch' registered (every 2 minutes, silent)."
-    Write-Host "  Launcher: $WatchVbs -> watch-hub.ps1 -Quiet (no console flash)"
+        -Trigger $triggerWatchLogon -Settings $settings -Principal $principal -Force | Out-Null
+    Write-Host "Scheduled task '$TaskNameWatch' registered (AtLogOn, silent long-lived watchdog)."
+    Write-Host "  Launcher: $WatchVbs -> pythonw -m hub.watchdog (no console, 60s poll daemon)"
 } catch {
     Write-Host "WARN: could not register '$TaskNameWatch': $($_.Exception.Message)"
 }
 Write-Host "Task names: $TaskNameStart , $TaskNameWatch"
+Write-Host "Watchdog is a long-lived pythonw process (not every-2-minute PowerShell)."
 Write-Host "Desktop buttons (visible window on purpose): .\install-desktop-shortcuts.ps1"

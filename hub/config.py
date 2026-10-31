@@ -78,6 +78,9 @@ class Config:
     sessions_root: Path = field(default_factory=lambda: DEFAULT_SESSIONS_ROOT)
     projects_root: Path = field(default_factory=lambda: DEFAULT_PROJECTS_ROOT)
     hub_token: str = ""
+    # When True, after ACP heal attempts exhaust with process up / ACP down and
+    # no live turn, call KillAgent-style restart once per process (config-gated).
+    auto_restart_agent_on_heal_exhaust: bool = False
     agent_secret_path: Path = field(default_factory=lambda: DEFAULT_AGENT_SECRET_PATH)
     log_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "logs")
     static_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "static")
@@ -85,10 +88,17 @@ class Config:
     max_history_messages: int = 800
     # Concurrent live turns across different project cwds (default 3).
     max_concurrent_turns: int = 3
+    # EXPERIMENT only: "serve" (default WS agent serve) | "leader" (stdio attach).
+    # Do not set leader for normal use; CLI without --leader stays independent.
+    agent_backend: str = "serve"
 
     @property
     def agent_ws_url(self) -> str:
         return f"ws://{self.agent_bind}:{self.agent_port}/ws"
+
+    @property
+    def uses_leader_backend(self) -> bool:
+        return str(self.agent_backend or "serve").strip().lower() == "leader"
 
     def ensure_agent_secret(self) -> str:
         path = self.agent_secret_path
@@ -116,11 +126,19 @@ def load_config(path: Path | None = None) -> Config:
     cfg_path = path or DEFAULT_CONFIG_PATH
     data: dict = {}
     if cfg_path.is_file():
-        with cfg_path.open("rb") as f:
-            data = tomllib.load(f) or {}
+        # utf-8-sig strips BOM (PowerShell Set-Content -Encoding utf8 writes one;
+        # tomllib binary load fails with "Invalid statement at line 1").
+        with cfg_path.open("r", encoding="utf-8-sig") as f:
+            data = tomllib.loads(f.read()) or {}
 
     hub = data.get("hub", data)
     agent = data.get("agent", {})
+
+    raw_backend = str(
+        agent.get("backend", hub.get("agent_backend", "serve")) or "serve"
+    ).strip().lower()
+    if raw_backend not in ("serve", "leader"):
+        raw_backend = "serve"
 
     return Config(
         bind_host=str(hub.get("bind_host", "")),
@@ -131,6 +149,9 @@ def load_config(path: Path | None = None) -> Config:
         sessions_root=_as_path(hub.get("sessions_root"), DEFAULT_SESSIONS_ROOT),
         projects_root=_as_path(hub.get("projects_root"), DEFAULT_PROJECTS_ROOT),
         hub_token=str(hub.get("hub_token", "") or ""),
+        auto_restart_agent_on_heal_exhaust=bool(
+            hub.get("auto_restart_agent_on_heal_exhaust", False)
+        ),
         agent_secret_path=_as_path(
             hub.get("agent_secret_path", agent.get("secret_path")),
             DEFAULT_AGENT_SECRET_PATH,
@@ -140,4 +161,5 @@ def load_config(path: Path | None = None) -> Config:
         max_sessions=int(hub.get("max_sessions", 80)),
         max_history_messages=int(hub.get("max_history_messages", 800)),
         max_concurrent_turns=int(hub.get("max_concurrent_turns", 3)),
+        agent_backend=raw_backend,
     )

@@ -53,3 +53,8 @@ ADR-011 split agent process health from ACP connected. That still allowed **fals
 In-hub **Restart agent** (POST `/api/admin/restart-agent`) is the user-facing hard recovery when heal exhausts; see ADR-014.
 
 Stale threshold is 90s (must exceed `NO_OUTPUT_SECONDS`); heal skips `stale` while a turn is active so reconnect does not kill live `session/prompt` (stall watchdog owns silent prompts).
+
+### Amendment (heal exhaust visibility + optional auto restart)
+
+- Status and full `/health` expose durable **`acpHealExhausted`** (and `acpHealError` when exhausted) via pure `heal_exhaust_operator_fields` in `hub/harden_policy.py`.
+- Optional config `hub.auto_restart_agent_on_heal_exhaust` (default **false**): after heal attempts exhaust, process up, ACP not chat-ready, and **no live turn**, call KillAgent-style `_restart_agent_process` once per process (`should_auto_restart_agent_on_heal_exhaust`). Mid-turn must never auto-restart.

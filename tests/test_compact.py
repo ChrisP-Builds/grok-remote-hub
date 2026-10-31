@@ -18,6 +18,7 @@ from hub.compact import (
     hub_compact_gate_set_inflight,
     hub_compact_gate_suppresses_notification,
     normalize_compact_notification,
+    parse_compact_rpc_tokens,
     parse_compact_slash,
     resolve_compact_outcome,
     sanitize_compact_tokens,
@@ -312,6 +313,76 @@ def test_resolve_compact_outcome_still_full() -> None:
     assert "84%" in out["message"]
 
 
+def test_resolve_compact_outcome_agent_reduced_signals_stale() -> None:
+    """Signals flat/high but agent claims shrink → stale meter, not 'already minimal'."""
+    out = resolve_compact_outcome(
+        signals_before_used=322_750,
+        signals_after_used=322_750,
+        signals_window=500_000,
+        agent_before=322_750,
+        agent_after=48_000,
+    )
+    assert out["reduced"] is False
+    assert out["feedback"] == "agent_reduced_signals_stale"
+    assert out["tokensBefore"] == 322_750
+    assert out["tokensAfter"] == 322_750
+    assert "already minimal" not in out["message"].lower()
+    assert "did not free" not in out["message"].lower()
+    assert "agent" in out["message"].lower()
+    assert "meter" in out["message"].lower()
+    assert "→" in out["message"] or "->" in out["message"]
+    st = compact_user_outcome_state(
+        reduced=out["reduced"],
+        feedback=out["feedback"],
+        signals_after_used=out["tokensAfter"],
+        signals_window=out["windowTokens"],
+    )
+    assert st == "completed"
+
+
+def test_resolve_compact_outcome_still_full_without_agent_tokens() -> None:
+    """Flat signals + no agent reduction data remains no_change_still_full → failed."""
+    out = resolve_compact_outcome(
+        signals_before_used=322_750,
+        signals_after_used=322_750,
+        signals_window=500_000,
+        agent_before=None,
+        agent_after=None,
+    )
+    assert out["feedback"] == "no_change_still_full"
+    assert out["reduced"] is False
+    assert (
+        compact_user_outcome_state(
+            reduced=False,
+            feedback="no_change_still_full",
+            signals_after_used=322_750,
+            signals_window=500_000,
+        )
+        == "failed"
+    )
+
+
+def test_parse_compact_rpc_tokens() -> None:
+    assert parse_compact_rpc_tokens(None) == (None, None)
+    assert parse_compact_rpc_tokens("ok") == (None, None)
+    assert parse_compact_rpc_tokens(
+        {"tokensBefore": 100_000, "tokensAfter": 40_000}
+    ) == (100_000, 40_000)
+    assert parse_compact_rpc_tokens(
+        {"tokens_before": 10, "tokens_after": 5}
+    ) == (10, 5)
+    assert parse_compact_rpc_tokens(
+        {"pre_tokens": 9, "post_tokens": 3}
+    ) == (9, 3)
+    assert parse_compact_rpc_tokens(
+        {"result": {"tokensBefore": 50, "tokensAfter": 20}}
+    ) == (50, 20)
+    # Absurd rejected
+    assert parse_compact_rpc_tokens(
+        {"tokensBefore": 99_999_999, "tokensAfter": 1}
+    ) == (None, 1)
+
+
 def test_resolve_compact_outcome_low() -> None:
     out = resolve_compact_outcome(
         signals_before_used=40_000,
@@ -395,6 +466,8 @@ def test_ui_has_compact_handlers() -> None:
     """Contract: UI listens for compact/usage and session_notification."""
     root = Path(__file__).resolve().parents[1]
     js = (root / "static" / "app.js").read_text(encoding="utf-8")
+    html = (root / "static" / "index.html").read_text(encoding="utf-8")
+    css = (root / "static" / "app.css").read_text(encoding="utf-8")
     assert "type === \"compact\"" in js or "type === 'compact'" in js
     assert "type === \"usage\"" in js or "type === 'usage'" in js
     assert "handleCompactEvent" in js
@@ -405,6 +478,13 @@ def test_ui_has_compact_handlers() -> None:
     assert "COMPACT_TOKEN_ABSURD_MAX" in js
     assert "allowCompactSystemLine" in js
     assert "COMPACT_FEEDBACK_COOLDOWN_MS" in js
+    # Compact progress status strip
+    assert 'id="compact-status-bar"' in html
+    assert "compact-status-bar" in css
+    assert "showCompactStatusBar" in js
+    assert "hideCompactStatusBar" in js
+    assert "usage-seg-compacting" in js
+    assert "usage-seg-compacting" in css
     # Hub message is authority for completed compact copy.
     assert "msg.message" in js
     # Scope to handleCompactEvent (other st===completed exist for plan counts).
@@ -425,6 +505,9 @@ def test_ui_has_compact_handlers() -> None:
     assert "1000" in completed_block or "1_000" in completed_block
     assert "did not free context" in completed_block
     assert "reportError" in completed_block
+    # Status bar show/hide wired from handleCompactEvent
+    assert "showCompactStatusBar" in js[hce : completed_idx + 200]
+    assert "hideCompactStatusBar" in js[hce:completed_idx]
 
 
 def test_server_broadcast_usage_prefers_signals() -> None:
@@ -462,13 +545,19 @@ def test_server_execute_compact_reads_signals_and_resolves() -> None:
     assert "compact_user_outcome_state" in block
     assert "signals_before_used" in block
     assert "signals_after_used" in block
+    assert "agent_before" in block
+    assert "agent_after" in block
+    assert "parse_compact_rpc_tokens" in block
+    assert "_agent_compact_tokens" in block
     assert '"message"' in block or "'message'" in block
     assert "state" in block and "completed" in block
     assert '"failed"' in block or "'failed'" in block
     assert "range(10)" in block
     assert "0.5" in block
+    assert "2.5" in block
     assert "method=_x.ai/compact_conversation" in block
     assert "compact outcome reduced=" in block
+    assert "agent_before=%s" in block
 
 
 def test_acp_client_has_session_compact() -> None:
@@ -503,6 +592,15 @@ def test_compact_user_outcome_state_matrix() -> None:
             signals_window=500_000,
         )
         == "failed"
+    )
+    assert (
+        compact_user_outcome_state(
+            reduced=False,
+            feedback="agent_reduced_signals_stale",
+            signals_after_used=322_750,
+            signals_window=500_000,
+        )
+        == "completed"
     )
     assert (
         compact_user_outcome_state(
@@ -686,6 +784,9 @@ def test_server_hub_compact_gate_suppresses_notification_terminal() -> None:
     assert "hub_compact_gate_suppresses_notification" in emit_block
     assert "_hub_compact_gate" in emit_block
     assert "time.monotonic()" in emit_block
+    # Stash agent tokens even when gate suppresses broadcast.
+    assert "_agent_compact_tokens" in emit_block
+    assert '"completed", "failed"' in emit_block or "'completed', 'failed'" in emit_block
     # While gate active: still refresh usage on completed, do not broadcast compact.
     assert 'body["state"] == "completed"' in emit_block
     assert "await self._broadcast_usage_after_compact(sid)" in emit_block

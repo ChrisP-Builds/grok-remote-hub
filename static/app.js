@@ -841,6 +841,7 @@
       acpConnected: false,
       acpHealAttempts: 0,
       acpHealError: null,
+      acpHealExhausted: false,
       bind: "local",
       tailscaleIp: null,
       loadedSessionId: null,
@@ -1006,6 +1007,7 @@
     emptyMain: $("#empty-main"),
     chatTitle: $("#chat-title"),
     btnRenameSession: $("#btn-rename-session"),
+    btnCatchUp: $("#btn-catch-up"),
     btnViewPlan: $("#btn-view-plan"),
     modalPlan: $("#modal-plan"),
     planBody: $("#plan-body"),
@@ -1013,6 +1015,7 @@
     btnPlanApprove: $("#btn-plan-approve"),
     btnPlanRequestChanges: $("#btn-plan-request-changes"),
     btnPlanQuit: $("#btn-plan-quit"),
+    btnPlanCopy: $("#btn-plan-copy"),
     btnPlanClose: $("#btn-plan-close"),
     planAwaitBanner: $("#plan-await-banner"),
     planAwaitBannerText: $("#plan-await-banner-text"),
@@ -1032,6 +1035,10 @@
     latencyHintBanner: $("#latency-hint-banner"),
     latencyHintBannerText: $("#latency-hint-banner-text"),
     btnLatencyHintDismiss: $("#btn-latency-hint-dismiss"),
+    compactStatusBar: $("#compact-status-bar"),
+    compactStatusLabel: $("#compact-status-label"),
+    compactStatusElapsed: $("#compact-status-elapsed"),
+    compactStatusDetail: $("#compact-status-detail"),
     form: $("#composer-form"),
     input: $("#composer-input"),
     composerFileInput: $("#composer-file-input"),
@@ -1098,6 +1105,8 @@
     compatDot: $("#compat-dot"),
     sessionBanner: $("#session-banner"),
     sessionBannerText: $("#session-banner-text"),
+    authTokenBanner: $("#auth-token-banner"),
+    authTokenBannerText: $("#auth-token-banner-text"),
     usageBar: $("#usage-bar"),
     usageBarFill: $("#usage-bar-fill"),
     usageBarFillPlan: $("#usage-bar-fill-plan"),
@@ -1111,13 +1120,44 @@
     metaPopover: $("#meta-popover"),
   };
 
+  const HUB_TOKEN_KEY = "grh.hubToken";
+  let _resolvedHubToken = null;
+
   function tokenFromQuery() {
     const u = new URL(location.href);
     return u.searchParams.get("token") || "";
   }
 
+  function hubToken() {
+    if (_resolvedHubToken !== null) return _resolvedHubToken;
+    let t = tokenFromQuery();
+    if (t) {
+      try {
+        localStorage.setItem(HUB_TOKEN_KEY, t);
+      } catch (_) {}
+    } else {
+      try {
+        t = localStorage.getItem(HUB_TOKEN_KEY) || "";
+      } catch (_) {
+        t = "";
+      }
+    }
+    t = t || "";
+    if (t) {
+      try {
+        const u = new URL(location.href);
+        if (u.searchParams.get("token") !== t) {
+          u.searchParams.set("token", t);
+          history.replaceState(history.state, "", u.pathname + u.search + u.hash);
+        }
+      } catch (_) {}
+    }
+    _resolvedHubToken = t;
+    return t;
+  }
+
   function apiUrl(path) {
-    const t = tokenFromQuery();
+    const t = hubToken();
     if (!t) return path;
     const join = path.includes("?") ? "&" : "?";
     return `${path}${join}token=${encodeURIComponent(t)}`;
@@ -1125,10 +1165,27 @@
 
   function wsUrl() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const t = tokenFromQuery();
+    const t = hubToken();
     const q = t ? `?token=${encodeURIComponent(t)}` : "";
     return `${proto}//${location.host}/ws${q}`;
   }
+
+  function updateAuthTokenBanner() {
+    if (!els.authTokenBanner) return;
+    if (hubToken()) {
+      els.authTokenBanner.classList.add("hidden");
+      if (els.authTokenBannerText) els.authTokenBannerText.textContent = "";
+      return;
+    }
+    els.authTokenBanner.classList.remove("hidden");
+    if (els.authTokenBannerText) {
+      els.authTokenBannerText.textContent =
+        "Add ?token= to this URL to see sessions. The token is required for API and WebSocket access.";
+    }
+  }
+
+  hubToken();
+  updateAuthTokenBanner();
 
   function toast(message, kind = "", durationMs, opts) {
     if (durationMs && typeof durationMs === "object") {
@@ -1328,6 +1385,10 @@
       if (state.selectedId) els.btnRenameSession.classList.remove("hidden");
       else els.btnRenameSession.classList.add("hidden");
     }
+    if (els.btnCatchUp) {
+      if (state.selectedId) els.btnCatchUp.classList.remove("hidden");
+      else els.btnCatchUp.classList.add("hidden");
+    }
     // View plan visibility is driven by refreshSessionPlan (plan.md exists)
 
     const cwd = meta.cwd || "";
@@ -1374,6 +1435,7 @@
   function clearTopbarSessionMeta() {
     if (els.chatTitle) els.chatTitle.textContent = "Select a session";
     if (els.btnRenameSession) els.btnRenameSession.classList.add("hidden");
+    if (els.btnCatchUp) els.btnCatchUp.classList.add("hidden");
     setViewPlanVisible(false);
     state.sessionPlan = null;
     if (els.chatProject) {
@@ -2129,7 +2191,9 @@
         // After heal exhaustion, stop implying a silent reconnect is still running.
         const healAttempts = Number(state.status.acpHealAttempts) || 0;
         const healExhausted =
-          !!state.status.acpHealError || healAttempts >= 3;
+          !!state.status.acpHealExhausted ||
+          !!state.status.acpHealError ||
+          healAttempts >= 3;
         if (healExhausted) {
           stateKey = "acp-hung";
           text = "Agent hung — restart";
@@ -4243,10 +4307,12 @@
         // "standard" legacy storage maps to working in init
         if (state.sessionKindFilter === "standard" && !isWorkingSession(s)) return false;
         if (!q) return true;
+        const sid = (s.sessionId || "").toLowerCase();
         return (
           (s.title || "").toLowerCase().includes(q) ||
           (s.cwd || "").toLowerCase().includes(q) ||
-          (s.sessionId || "").toLowerCase().startsWith(q) ||
+          sid.includes(q) ||
+          sid.startsWith(q) ||
           basename(s.cwd).toLowerCase().includes(q) ||
           (s.agentName || "").toLowerCase().includes(q)
         );
@@ -5936,6 +6002,69 @@
     return true;
   }
 
+  let _compactStatusTimer = null;
+  let _compactStatusStartedAt = 0;
+  let _compactStatusSessionId = null;
+
+  function setUsageSegCompacting(active) {
+    const seg = document.querySelector(".usage-seg-context");
+    if (!seg) return;
+    seg.classList.toggle("usage-seg-compacting", !!active);
+  }
+
+  function hideCompactStatusBar() {
+    if (_compactStatusTimer != null) {
+      clearInterval(_compactStatusTimer);
+      _compactStatusTimer = null;
+    }
+    _compactStatusStartedAt = 0;
+    _compactStatusSessionId = null;
+    setUsageSegCompacting(false);
+    const bar = els.compactStatusBar;
+    if (!bar) return;
+    bar.classList.add("hidden");
+    bar.setAttribute("aria-busy", "false");
+    if (els.compactStatusElapsed) els.compactStatusElapsed.textContent = "";
+    if (els.compactStatusDetail) els.compactStatusDetail.textContent = "";
+  }
+
+  function tickCompactStatusElapsed() {
+    if (!_compactStatusStartedAt || !els.compactStatusElapsed) return;
+    const sec = Math.max(0, Math.floor((Date.now() - _compactStatusStartedAt) / 1000));
+    els.compactStatusElapsed.textContent = sec + "s";
+  }
+
+  function showCompactStatusBar(msg) {
+    const bar = els.compactStatusBar;
+    if (!bar) return;
+    const sid = msg && msg.sessionId ? String(msg.sessionId) : null;
+    const before = sanitizeCompactToken(msg && msg.tokensBefore);
+    // Restart timer only when newly started (or different session).
+    if (
+      _compactStatusTimer == null ||
+      (sid && _compactStatusSessionId && sid !== _compactStatusSessionId)
+    ) {
+      if (_compactStatusTimer != null) {
+        clearInterval(_compactStatusTimer);
+        _compactStatusTimer = null;
+      }
+      _compactStatusStartedAt = Date.now();
+      _compactStatusSessionId = sid;
+      _compactStatusTimer = setInterval(tickCompactStatusElapsed, 1000);
+    }
+    bar.classList.remove("hidden");
+    bar.setAttribute("aria-busy", "true");
+    if (els.compactStatusLabel) {
+      els.compactStatusLabel.textContent = "Compacting conversation…";
+    }
+    tickCompactStatusElapsed();
+    if (els.compactStatusDetail) {
+      els.compactStatusDetail.textContent =
+        before != null ? "from " + formatTokenCompact(before) : "";
+    }
+    setUsageSegCompacting(true);
+  }
+
   function handleCompactEvent(msg) {
     const sid = msg.sessionId || null;
     const st = String(msg.state || "");
@@ -5953,7 +6082,10 @@
       : String(sid || "") + ":" + st + ":" + String(before) + ":" + String(after);
     // Prefer one "Compacting…" line; ignore duplicate started for same session.
     if (st === "started" && state._lastCompactKey === dedupeKey) {
-      return;
+      // Keep status bar visible if a second started arrives while active.
+      if (els.compactStatusBar && !els.compactStatusBar.classList.contains("hidden")) {
+        return;
+      }
     }
     // Full-event dedupe (replay spam / dual emit with same terminal text).
     if (state._lastCompactKey === dedupeKey && st !== "started") {
@@ -5978,6 +6110,9 @@
     };
 
     if (st === "started") {
+      if (applyToSelected) {
+        showCompactStatusBar(msg);
+      }
       if (applyToSelected && allowCompactSystemLine(sid, "started")) {
         reportInfo("Compacting conversation…", {
           sessionId: sid,
@@ -5986,6 +6121,16 @@
         appendSys("Compacting conversation…");
       }
       return;
+    }
+
+    // Any terminal compact outcome for the active strip session ends it.
+    if (
+      isTerminal &&
+      (!_compactStatusSessionId ||
+        !sid ||
+        String(sid) === String(_compactStatusSessionId))
+    ) {
+      hideCompactStatusBar();
     }
 
     if (st === "completed") {
@@ -6740,7 +6885,7 @@
   }
 
   function probeHubHealth() {
-    fetch("/health", { method: "GET", cache: "no-store" })
+    fetch(apiUrl("/health"), { method: "GET", cache: "no-store" })
       .then((r) => {
         if (!r.ok) throw new Error("health " + r.status);
         return r.json();
@@ -6896,7 +7041,7 @@
   /** Merge server-truth live state from /health before multi-session resume. */
   async function mergeHealthIntoState() {
     try {
-      const r = await fetch("/health", { method: "GET", cache: "no-store" });
+      const r = await fetch(apiUrl("/health"), { method: "GET", cache: "no-store" });
       if (!r.ok) return null;
       const j = await r.json();
       if (!j) return null;
@@ -7247,6 +7392,7 @@
         acpHealAttempts:
           msg.acpHealAttempts != null ? Number(msg.acpHealAttempts) || 0 : 0,
         acpHealError: msg.acpHealError || null,
+        acpHealExhausted: !!msg.acpHealExhausted,
         bind: msg.bind || "local",
         tailscaleIp: msg.tailscaleIp || null,
         loadedSessionId: msg.loadedSessionId || null,
@@ -8499,6 +8645,7 @@
   function renderPlanMarkdown(source) {
     if (!els.planBody) return;
     const text = source || "";
+    state._lastPlanMarkdown = text;
     if (typeof window.marked === "undefined" || typeof window.DOMPurify === "undefined") {
       els.planBody.textContent = text || "(empty plan)";
       return;
@@ -8518,6 +8665,74 @@
     } catch (err) {
       els.planBody.textContent = "Preview failed: " + err + "\n\n" + text;
     }
+  }
+
+  async function copyPlanMarkdown() {
+    const fromState =
+      (state.sessionPlan && state.sessionPlan.markdown) ||
+      state._lastPlanMarkdown ||
+      "";
+    let text = String(fromState || "");
+    if (!text.trim() && els.planBody) {
+      text = els.planBody.innerText || els.planBody.textContent || "";
+    }
+    if (!text.trim()) {
+      toast("Nothing to copy", "danger");
+      return;
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        toast("Plan copied", "");
+        return;
+      }
+    } catch (_) {}
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      toast("Plan copied", "");
+    } catch (err) {
+      toast("Could not copy plan", "danger");
+    }
+  }
+
+  async function fetchSessionRecap(sessionId) {
+    const sid = String(sessionId || state.selectedId || "").trim();
+    if (!sid) {
+      toast("Select a session first", "danger");
+      return null;
+    }
+    try {
+      const res = await fetch(
+        apiUrl(`/api/sessions/${encodeURIComponent(sid)}/recap`)
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(data.error || "Catch up failed", "danger");
+        return null;
+      }
+      return data;
+    } catch (err) {
+      toast("Catch up failed: " + err, "danger");
+      return null;
+    }
+  }
+
+  async function showCatchUp() {
+    const data = await fetchSessionRecap(state.selectedId);
+    if (!data) return;
+    if (data.empty || !data.summary) {
+      toast("No recent messages to catch up on", "");
+      return;
+    }
+    toast(String(data.summary), "", 12000);
   }
 
   function updatePlanStatusChip(plan) {
@@ -8591,6 +8806,12 @@
     renderPlanMarkdown(plan.markdown || "");
     updatePlanStatusChip(plan);
     if (els.modalPlan) els.modalPlan.classList.remove("hidden");
+    // Render mermaid after plan body is filled and modal is visible.
+    try {
+      if (els.planBody) await renderMermaidBlocks(els.planBody);
+    } catch (err) {
+      console.warn("plan mermaid render failed", err);
+    }
   }
 
   function injectPlanComposerText(text) {
@@ -10076,7 +10297,10 @@
     try {
       let health = null;
       try {
-        const r = await fetch("/health", { method: "GET", cache: "no-store" });
+        const r = await fetch(apiUrl("/health"), {
+          method: "GET",
+          cache: "no-store",
+        });
         if (r.ok) health = await r.json();
       } catch (_) {
         health = null;
@@ -10864,11 +11088,24 @@
         startRenameSession(state.selectedId, title, els.chatTitle);
       });
     }
+    if (els.btnCatchUp) {
+      els.btnCatchUp.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void showCatchUp();
+      });
+    }
     if (els.btnViewPlan) {
       els.btnViewPlan.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
         openPlanModal();
+      });
+    }
+    if (els.btnPlanCopy) {
+      els.btnPlanCopy.addEventListener("click", (e) => {
+        e.preventDefault();
+        void copyPlanMarkdown();
       });
     }
     if (els.btnPlanApprove) {
@@ -11721,6 +11958,7 @@
     }
     updateStatusPill();
     updateVersionBadge();
+    updateAuthTokenBanner();
     updateSessionBanner();
     setComposerEnabled(false);
     updateTurnStrip();

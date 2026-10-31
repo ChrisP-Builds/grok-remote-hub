@@ -186,10 +186,10 @@ Without Tailscale the hub binds **localhost only** and the UI shows **Local only
 
 ## Security
 
-**This hub auto-approves agent tools** (`grok agent --always-approve serve`). Treat network access like handing someone your keyboard.
+**This hub auto-approves agent tools** (`grok agent --always-approve serve`). Treat network access like handing someone your keyboard. Anyone who can open your hub URL with a valid token can drive shell, files, and network on the host.
 
 1. Prefer **Tailscale only** (default never binds `0.0.0.0`).
-2. Set optional **`hub_token`** in `config.toml`:
+2. Set **`hub_token`** in `config.toml` (required when any bind host is non-loopback):
 
    ```toml
    [hub]
@@ -200,7 +200,9 @@ Without Tailscale the hub binds **localhost only** and the UI shows **Local only
 
 3. Agent listens on **`127.0.0.1` only**; secret file `data/agent.secret` is gitignored.
 
-Full policy: **[SECURITY.md](SECURITY.md)**.
+**Desktop handoff:** continue a hub session in stock CLI with `grok --resume <session-id>` (copy id from the UI). Default topology does not dual-live CLI + hub on the same serve process.
+
+Full policy: **[SECURITY.md](SECURITY.md)** · ADR-023.
 
 ---
 
@@ -214,6 +216,7 @@ Full policy: **[SECURITY.md](SECURITY.md)**.
 | `hub.projects_root` | `~/Projects` | Project folders for New Session |
 | `hub.sessions_root` | `~/.grok/sessions` | On-disk session index |
 | `agent.bind` / `port` | `127.0.0.1:2419` | Local `grok agent serve` |
+| `agent.backend` | `serve` | **`serve` (default)** or experimental `leader` (shared leader + stdio ACP). Enabling leader means shared outage with CLI `grok --leader` clients; default keep serve so normal CLI stays independent. See [docs/exp-leader-lab.md](docs/exp-leader-lab.md). |
 
 Copy `config.example.toml` → `config.toml` for local overrides.
 

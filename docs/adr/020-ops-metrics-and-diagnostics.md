@@ -35,6 +35,14 @@ endpoint that joins health + ops + ACP trace + watch state.
    `opsRecent` (10). WS `status` stays leaner: counters + uptime, no ops
    event dump.
 
+   **Public liveness vs authenticated diagnostics:** when `hub_token` is set,
+   unauthenticated `GET /health` returns only public liveness keys
+   (`ok`, `bootId`, `uptimeSeconds`, `pid`, `port`, `hubVersion`) via
+   `hub.harden_policy.health_response_body`. Full rich body (ops, liveTurns,
+   hosts, traces, heal detail) requires auth. Tokenless loopback dev still
+   gets the full body. Empty `hub_token` is refused at startup for
+   non-loopback / Tailscale binds.
+
 4. **`GET /api/admin/diagnostics`** (same auth as other admin routes) —
    one JSON snapshot: health summary, ops counters+events (`?n=`), ACP trace
    (`?trace=`), watch-hub-state.json if present (no secrets), log file path

@@ -9,6 +9,7 @@ from pathlib import Path
 from aiohttp import web
 
 from hub.config import load_config
+from hub.harden_policy import require_hub_token
 from hub.server import Hub, resolve_bind_hosts
 
 
@@ -96,6 +97,15 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         log.error("%s", exc)
         return 2
+
+    token_ok, token_err = require_hub_token(hosts, config.hub_token or "")
+    if not token_ok:
+        log.error("%s", token_err)
+        return 2
+    if str(config.hub_token or "").strip():
+        log.info("hub_token configured (remote auth required)")
+    else:
+        log.warning("hub_token empty; allowed for loopback-only bind")
 
     hub.bind_hosts = hosts
     hub.bind_host = ts_ip if ts_ip and ts_ip in hosts else hosts[0]

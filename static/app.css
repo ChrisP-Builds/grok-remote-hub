@@ -596,6 +596,17 @@ a {
   display: none;
 }
 
+.topbar-catch-up {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 2px 8px;
+  opacity: 0.8;
+}
+
+.topbar-catch-up.hidden {
+  display: none;
+}
+
 .topbar-title-row .session-rename-input {
   font-size: 13px;
   max-width: min(100%, 420px);
@@ -679,6 +690,33 @@ a {
 }
 
 #session-banner-text {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.4;
+}
+
+.auth-token-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 14px;
+  border-bottom: 1px solid rgba(230, 184, 77, 0.35);
+  background: rgba(230, 184, 77, 0.08);
+  font-family: var(--font);
+  font-size: 11.5px;
+  color: var(--warn);
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  flex-shrink: 0;
+}
+
+.auth-token-banner.hidden {
+  display: none !important;
+}
+
+#auth-token-banner-text {
   min-width: 0;
   overflow-wrap: anywhere;
   word-break: break-word;
@@ -1844,6 +1882,79 @@ a {
   font-size: 11px;
   padding: 0 6px;
   min-height: 20px;
+}
+
+/* Compact lifecycle strip (indeterminate; agent has no mid-run %) */
+.compact-status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 22px;
+  padding: 3px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--muted);
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: hidden;
+  flex-shrink: 0;
+}
+
+.compact-status-bar.hidden {
+  display: none !important;
+}
+
+.compact-status-track {
+  flex: 0 0 48px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  position: relative;
+}
+
+.compact-status-pulse {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 40%;
+  border-radius: 1px;
+  background: var(--accent, var(--ok));
+  opacity: 0.85;
+  animation: compact-status-indeterminate 1.2s ease-in-out infinite;
+}
+
+@keyframes compact-status-indeterminate {
+  0% {
+    transform: translateX(-120%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
+}
+
+.compact-status-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--text, var(--muted));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.compact-status-elapsed,
+.compact-status-detail {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle CTX fill pulse while compact is running */
+.usage-seg-context.usage-seg-compacting .usage-bar-fill {
+  animation: pulse-bar 1.4s ease-in-out infinite;
 }
 
 /* Live turn status strip (display-only; never intercept composer clicks) */

@@ -283,12 +283,45 @@ def test_server_has_acp_heal_hook() -> None:
     assert "_on_acp_connection" in src
     # Successful connect resets heal attempts
     on_conn = src[src.find("async def _on_acp_connection") :]
-    on_conn = on_conn[:1200]
+    on_conn = on_conn[:1600]
     assert "_acp_heal_attempts = 0" in on_conn
     assert "ACP heal" in on_conn or "heal" in on_conn.lower()
+    assert "_acp_heal_auto_restarts_used = 0" in on_conn
     acp = (ROOT / "hub" / "acp_client.py").read_text(encoding="utf-8")
     assert "async def maybe_probe_liveness" in acp
     assert "AcpTrace" in acp
+
+
+def test_heal_exhaust_operator_fields_and_auto_restart_policy() -> None:
+    from hub.harden_policy import (
+        heal_exhaust_operator_fields,
+        should_auto_restart_agent_on_heal_exhaust,
+    )
+
+    fields = heal_exhaust_operator_fields(
+        heal_attempts=3,
+        max_attempts=3,
+        agent_process_up=True,
+        acp_connected=False,
+        last_error="x",
+    )
+    assert fields["acpHealExhausted"] is True
+    assert fields["acpHealError"] == "x"
+    assert (
+        should_auto_restart_agent_on_heal_exhaust(
+            enabled=True,
+            agent_process_up=True,
+            acp_connected=False,
+            heal_attempts=3,
+            max_attempts=3,
+            turn_active=True,
+            auto_restarts_used=0,
+        )
+        is False
+    )
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    assert "acpHealExhausted" in src
+    assert "should_auto_restart_agent_on_heal_exhaust" in src
 
 
 def test_suppress_tool_call_during_load() -> None:

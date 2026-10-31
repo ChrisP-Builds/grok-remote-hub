@@ -9,6 +9,30 @@ This file is the **public narrative**. Session chat context is not required to u
 
 ## [Unreleased]
 
+### Added
+- **Stop honesty (bg stamps)** — `AcpClient.end_turn` pops per-session (or clears all) bg activity after cancel+clear so Working/Stuck does not linger after Stop; residual documented (parent sessionId cancel; nested subagents depend on agent ACP). WS Stop rebroadcasts status; soft notice when agent does not confirm cancel after local clear.
+- **Session search `?q=`** — pure `session_matches_query` (title / session id / cwd basename) on `GET /api/sessions`; SPA filter matches session id substring.
+- **Catch up recap** — `GET /api/sessions/{id}/recap` + topbar **Catch up** control (last user + assistant, bounded).
+- **Plan Copy** — plan modal **Copy plan** + mermaid render when opening the plan viewer.
+- **ADR-023** — always-approve remote risk + `grok --resume <session-id>` desktop handoff; SECURITY.md / README updated. Topology default tests (ADR-022) in `tests/test_topology_default.py`.
+- **Experimental `agent.backend=leader` (opt-in only)** — hub can attach ACP via `grok agent --leader stdio` to a shared `grok agent leader` process (NDJSON); default remains `serve` so normal CLI without `--leader` is untouched. Health/status expose `agentBackend`. See ADR-021 and `docs/exp-leader-lab.md`.
+- **Startup hub_token gate** — empty `hub_token` is refused when any bind host is non-loopback (Tailscale dual-bind); loopback-only still allows tokenless local dev (`hub.harden_policy.require_hub_token`).
+- **Public liveness `/health`** — with `hub_token` set, unauthenticated clients get only `ok` / `bootId` / `uptimeSeconds` / `pid` / `port` / `hubVersion` (watchdog-safe); full diagnostics via authenticated `/health` or `/api/admin/diagnostics`.
+- **Heal exhaust signal** — durable `acpHealExhausted` on status/health; optional config `hub.auto_restart_agent_on_heal_exhaust` (default off) for one KillAgent-style restart after exhaust when not mid-turn.
+- **Policy lockstep test** — `tests/test_policy_lockstep.py` asserts SPA wake/stall constants match `CLIENT_STALL_WARN_SECONDS` and wake-clear quality gates.
+- **Compact status bar** — slim `#compact-status-bar` while compacting (pulse track + elapsed seconds); CTX segment subtle pulse via `usage-seg-compacting`.
+
+### Fixed
+- **Compact honesty when signals lag** — hub stashes agent compact tokens under the hub gate, merges them into `/compact` outcome, and reports `agent_reduced_signals_stale` (completed, not “already minimal”) when the agent shrank but `signals.json` is still flat; CTX bar remains signals SoT.
+- **Agent recycle → ACP reconnect reliability** — restart-agent no longer treats TCP port-up as success; multi-attempt reconnect with `reset_maintain=True` cancels maintain backoff sleep after kill; success only when process up **and** ACP chat-connected; heal budget left at 0 after partial recycle so auto-heal remains usable (ADR-014).
+
+### Changed
+- **SPA static assets exempt from hub_token** — GET/HEAD for `/`, `/app.js`, `/app.css`, `/vendor/*`, favicons, and similar static extensions load without token so remote UI works after `?token=` navigation; API/WS/preview remain protected (`is_public_unauthenticated_path`).
+- **Long-lived silent health watchdog** — primary external watchdog is `python -m hub.watchdog` via `pythonw` (logon task `GrokRemoteHubWatch` + `watchdog-hidden.vbs`), not every-2-minute PowerShell. Same `logs/watch-hub-state.json` keys and `restart-hub.ps1 -KeepAgent` policy; `start-hub.ps1` ensures the daemon is running; full `stop-hub` stops the watchdog so the hub stays down, while `-KeepAgent` (restart path) leaves it running. Optional `watch-hub.ps1` is a thin `--once` wrapper (ADR-019 amendment).
+- **`stop-hub.ps1` bind_port** — listener kill uses `bind_port` from `config.toml` (default 8787), not a hardcoded sole path.
+- **SPA `/health` fetches** — `probeHubHealth` / `mergeHealthIntoState` / wake reconcile use `apiUrl("/health")` so token query param unlocks rich health when configured.
+- **config.toml UTF-8 BOM** — `load_config` uses `utf-8-sig` so PowerShell-edited configs no longer fail tomllib at start.
+
 ---
 
 ## [0.4.0] — 2026-07-19

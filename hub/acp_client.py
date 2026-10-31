@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import time
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
@@ -55,6 +56,7 @@ MessageCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 # Re-export for callers/tests that still import from acp_client.
 __all__ = (
     "AcpClient",
+    "StdioJsonRpcTransport",
     "NO_OUTPUT_SECONDS",
     "MID_TURN_STALL_SECONDS",
     "MAX_TURN_SECONDS",
@@ -65,8 +67,130 @@ __all__ = (
 )
 
 
+class StdioJsonRpcTransport:
+    """NDJSON JSON-RPC over a subprocess stdin/stdout (leader --leader stdio).
+
+    Compatible with AcpClient wire usage: ``send(str)``, async-iterate lines,
+    ``close()``, and a process-alive ``ping()`` for liveness probes.
+    """
+
+    def __init__(self, proc: asyncio.subprocess.Process) -> None:
+        self._proc = proc
+        self._closed = False
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._reader_task: asyncio.Task | None = None
+
+    @property
+    def process(self) -> asyncio.subprocess.Process:
+        return self._proc
+
+    def start_reader(self) -> None:
+        if self._reader_task is None:
+            self._reader_task = asyncio.create_task(
+                self._read_stdout(), name="acp-stdio-reader"
+            )
+
+    async def _read_stdout(self) -> None:
+        stdout = self._proc.stdout
+        if stdout is None:
+            await self._queue.put(None)
+            return
+        try:
+            while True:
+                line = await stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if text:
+                    await self._queue.put(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("stdio reader ended: %s", exc)
+        finally:
+            try:
+                await self._queue.put(None)
+            except Exception:
+                pass
+
+    async def send(self, data: str) -> None:
+        if self._closed or self._proc.stdin is None:
+            raise ConnectionError("ACP stdio closed")
+        if self._proc.returncode is not None:
+            raise ConnectionError("ACP stdio process exited")
+        payload = data if data.endswith("\n") else data + "\n"
+        self._proc.stdin.write(payload.encode("utf-8"))
+        await self._proc.stdin.drain()
+
+    def __aiter__(self) -> "StdioJsonRpcTransport":
+        return self
+
+    async def __anext__(self) -> str:
+        item = await self._queue.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+    async def ping(self) -> asyncio.Future:
+        """Process-alive stand-in for WebSocket ping (returns resolved future)."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        if self._closed or self._proc.returncode is not None:
+            fut.set_exception(ConnectionError("ACP stdio process not alive"))
+        else:
+            fut.set_result(None)
+        return fut
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._proc.stdin is not None:
+                try:
+                    self._proc.stdin.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if self._reader_task is not None and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        self._reader_task = None
+        try:
+            if self._proc.returncode is None:
+                self._proc.terminate()
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    try:
+                        self._proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await self._proc.wait()
+                    except Exception:
+                        pass
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            log.debug("stdio transport close: %s", exc)
+        try:
+            await self._queue.put(None)
+        except Exception:
+            pass
+
+
 class AcpClient:
-    """Sole ACP WebSocket client to grok agent serve.
+    """Sole ACP client to the agent backend (serve WS or leader stdio).
+
+    Default: WebSocket to ``grok agent serve``. Opt-in ``agent_backend=leader``:
+    long-lived ``grok agent --always-approve --leader stdio`` NDJSON.
 
     Multi-session concurrent turns: the hub does not globally block one project
     because another is mid-turn. Concurrent session/prompt awaits share one
@@ -174,6 +298,9 @@ class AcpClient:
             if resolved_log is None:
                 resolved_log = getattr(config, "log_dir", None)
             self.trace = AcpTrace(log_dir=resolved_log)
+
+    def _is_leader_backend(self) -> bool:
+        return bool(getattr(self.config, "uses_leader_backend", False))
 
     def _trace(self, event: str, **fields: Any) -> None:
         tr = getattr(self, "trace", None)
@@ -877,30 +1004,67 @@ class AcpClient:
             self._maintain_task = None
         await self._close_ws()
 
-    async def reconnect(self, timeout: float = 10.0) -> None:
+    async def reconnect(
+        self, timeout: float = 10.0, *, reset_maintain: bool = False
+    ) -> None:
         """Close the current ACP WebSocket so the maintain loop reconnects.
 
         Waits until connected (and initialized) or raises TimeoutError.
-        Used by no-output heal; does not session/new.
+        Used by no-output heal and agent recycle; does not session/new.
+
+        When ``reset_maintain`` is True (restart-agent path): cancel any
+        in-flight maintain task (including backoff sleep) and start a fresh
+        loop so exponential backoff does not block reconnect after kill.
+        When False: only revive maintain if the task is missing or done.
         """
         was_connected = self.connected
-        log.info("ACP reconnect requested (was_connected=%s)", was_connected)
-        self._trace("disconnect", reason="reconnect_requested", was_connected=was_connected)
+        log.info(
+            "ACP reconnect requested (was_connected=%s reset_maintain=%s)",
+            was_connected,
+            reset_maintain,
+        )
+        self._trace(
+            "disconnect",
+            reason="reconnect_requested",
+            was_connected=was_connected,
+            reset_maintain=reset_maintain,
+        )
         try:
             await self._close_ws()
         except Exception as exc:
             log.warning("ACP reconnect close failed: %s", exc)
-        # If maintain died (e.g. prior cancel race) or was never started, revive it.
-        if self._maintain_task is None or self._maintain_task.done():
+
+        if reset_maintain:
+            # Cancel stalled maintain (e.g. mid exponential backoff after kill)
+            # and start a fresh loop so backoff resets to 1.0s.
+            old = self._maintain_task
+            if old is not None and not old.done():
+                old.cancel()
+                try:
+                    await old
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    log.warning("ACP maintain cancel after reset: %s", exc)
+            self._maintain_task = None
             if not self._stop.is_set():
-                log.warning(
-                    "ACP maintain not running; restarting loop for reconnect"
-                )
+                log.info("ACP maintain reset; starting fresh loop for reconnect")
                 self._maintain_task = asyncio.create_task(
                     self._maintain(), name="acp-client"
                 )
+        else:
+            # If maintain died (e.g. prior cancel race) or was never started, revive it.
+            if self._maintain_task is None or self._maintain_task.done():
+                if not self._stop.is_set():
+                    log.warning(
+                        "ACP maintain not running; restarting loop for reconnect"
+                    )
+                    self._maintain_task = asyncio.create_task(
+                        self._maintain(), name="acp-client"
+                    )
+
         deadline = time.monotonic() + max(0.5, float(timeout))
-        # If already mid-reconnect, wait for the next connected edge.
+        # Wait for connected + initialize done (self.connected set after initialize).
         while time.monotonic() < deadline:
             if self.connected and self._ws is not None:
                 log.info("ACP reconnect complete")
@@ -964,6 +1128,64 @@ class AcpClient:
             self._cancel_all_pending_user_questions()
 
     async def _maintain(self) -> None:
+        """Dispatch: leader uses stdio; default serve uses WebSocket."""
+        if self._is_leader_backend():
+            await self._maintain_stdio_leader()
+            return
+        await self._maintain_ws()
+
+    async def _maintain_session_cleanup(self, *, disconnect_reason: str) -> None:
+        """Shared post-session cleanup for WS and stdio maintain loops."""
+        self._ws = None
+        self.loaded_session_id = None
+        self._warm_sessions.clear()
+        for _fut in self._load_inflight.values():
+            if not _fut.done():
+                _fut.set_exception(ConnectionError("ACP disconnected"))
+        self._load_inflight.clear()
+        # Cancel method may no longer apply after reconnect.
+        self._cancel_method = None
+        if (
+            self.active_turns
+            or self._pending
+            or self._pending_user_questions
+        ):
+            # Wire already dead: cancel RPC cannot work; unlock locally.
+            self.force_clear_turn("acp disconnected")
+        else:
+            self.active_turns.clear()
+            self._cancel_all_stall_watchdogs()
+        if self._recv_task and not self._recv_task.done():
+            self._recv_task.cancel()
+            try:
+                await self._recv_task
+            except asyncio.CancelledError:
+                pass
+        self._recv_task = None
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(ConnectionError("ACP connection closed"))
+        self._pending.clear()
+        self._pending_session.clear()
+        self._cancel_all_pending_user_questions()
+        if self.connected:
+            self._trace("disconnect", reason=disconnect_reason)
+            await self._set_connected(False)
+
+    def _maintain_cancelled_should_reraise(self) -> bool:
+        """True when CancelledError means this maintain task is stopping."""
+        if self._stop.is_set():
+            return True
+        cur = asyncio.current_task()
+        cancelling = 0
+        if cur is not None and hasattr(cur, "cancelling"):
+            try:
+                cancelling = int(cur.cancelling())  # type: ignore[attr-defined]
+            except Exception:
+                cancelling = 0
+        return bool(cancelling)
+
+    async def _maintain_ws(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
             try:
@@ -987,57 +1209,84 @@ class AcpClient:
             except asyncio.CancelledError:
                 # Re-raise only when this task is stopping/cancelled.
                 # Awaiting a cancelled recv (reconnect path) must not kill maintain.
-                if self._stop.is_set():
-                    raise
-                cur = asyncio.current_task()
-                cancelling = 0
-                if cur is not None and hasattr(cur, "cancelling"):
-                    try:
-                        cancelling = int(cur.cancelling())  # type: ignore[attr-defined]
-                    except Exception:
-                        cancelling = 0
-                if cancelling:
+                if self._maintain_cancelled_should_reraise():
                     raise
                 log.info("ACP recv cancelled (reconnect); maintain continues")
             except Exception as exc:
                 log.warning("ACP connection error: %s", exc)
                 self._trace("disconnect", reason="connection_error", error=str(exc)[:200])
             finally:
+                await self._maintain_session_cleanup(disconnect_reason="ws_closed")
+            if self._stop.is_set():
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 15.0)
+
+    async def _maintain_stdio_leader(self) -> None:
+        """Attach ACP via ``grok agent --always-approve --leader stdio`` (NDJSON)."""
+        backoff = 1.0
+        while not self._stop.is_set():
+            transport: StdioJsonRpcTransport | None = None
+            try:
+                log.info(
+                    "Connecting ACP via leader stdio (%s)",
+                    self.config.grok_bin,
+                )
+                self._trace("connect", transport="leader_stdio")
+                kwargs: dict[str, Any] = {
+                    "stdin": asyncio.subprocess.PIPE,
+                    "stdout": asyncio.subprocess.PIPE,
+                    "stderr": asyncio.subprocess.PIPE,
+                }
+                if sys.platform == "win32":
+                    # Keep pipes (not detached); hide console window only.
+                    kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+                proc = await asyncio.create_subprocess_exec(
+                    self.config.grok_bin,
+                    "agent",
+                    "--always-approve",
+                    "--leader",
+                    "stdio",
+                    **kwargs,
+                )
+                transport = StdioJsonRpcTransport(proc)
+                transport.start_reader()
+                self._ws = transport
+                # Reader must run before initialize/request awaits responses
+                self._recv_task = asyncio.create_task(
+                    self._recv_loop(transport), name="acp-recv"
+                )
+                await self._initialize()
+                await self._set_connected(True)
+                backoff = 1.0
+                log.info("ACP leader stdio connected and initialized")
+                await self._recv_task
+            except asyncio.CancelledError:
+                if self._maintain_cancelled_should_reraise():
+                    raise
+                log.info("ACP stdio recv cancelled (reconnect); maintain continues")
+            except Exception as exc:
+                log.warning("ACP leader stdio error: %s", exc)
+                self._trace(
+                    "disconnect",
+                    reason="stdio_connection_error",
+                    error=str(exc)[:200],
+                )
+            finally:
+                # Ensure transport/process torn down even if cleanup races.
+                ws = self._ws
                 self._ws = None
-                self.loaded_session_id = None
-                self._warm_sessions.clear()
-                for _fut in self._load_inflight.values():
-                    if not _fut.done():
-                        _fut.set_exception(ConnectionError("ACP disconnected"))
-                self._load_inflight.clear()
-                # Cancel method may no longer apply after reconnect.
-                self._cancel_method = None
-                if (
-                    self.active_turns
-                    or self._pending
-                    or self._pending_user_questions
-                ):
-                    # WS already dead: cancel RPC cannot work; unlock locally.
-                    self.force_clear_turn("acp disconnected")
-                else:
-                    self.active_turns.clear()
-                    self._cancel_all_stall_watchdogs()
-                if self._recv_task and not self._recv_task.done():
-                    self._recv_task.cancel()
+                if transport is not None and ws is transport:
                     try:
-                        await self._recv_task
-                    except asyncio.CancelledError:
+                        await transport.close()
+                    except Exception:
                         pass
-                self._recv_task = None
-                for fut in list(self._pending.values()):
-                    if not fut.done():
-                        fut.set_exception(ConnectionError("ACP connection closed"))
-                self._pending.clear()
-                self._pending_session.clear()
-                self._cancel_all_pending_user_questions()
-                if self.connected:
-                    self._trace("disconnect", reason="ws_closed")
-                    await self._set_connected(False)
+                elif isinstance(ws, StdioJsonRpcTransport):
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                await self._maintain_session_cleanup(disconnect_reason="stdio_closed")
             if self._stop.is_set():
                 break
             await asyncio.sleep(backoff)
@@ -2003,6 +2252,13 @@ class AcpClient:
         Order is always cancel-before-clear so the agent releases the old prompt
         before the hub unlocks. Cancel is bounded by cancel_timeout; clear runs
         even if cancel fails (WS dead, unsupported method, etc.).
+
+        After clear, drops bg activity stamps for the session (or all when
+        session_id is None) so Working/Stuck status does not lie after Stop.
+
+        Residual: agent cancel targets the parent sessionId only. Nested
+        subagent sessions depend on agent ACP to cancel children; hub cannot
+        guarantee nested stop without agent support.
         """
         sid_key = str(session_id) if session_id is not None else "__all__"
         lock = self._end_turn_locks.get(sid_key)
@@ -2052,6 +2308,11 @@ class AcpClient:
                     cancelled = any_ok
 
             cleared = self.force_clear_turn(reason, session_id=session_id)
+            # Stop honesty: clear Working/Stuck bg stamps for ended turn(s).
+            if session_id is not None:
+                self._pop_bg_activity(str(session_id))
+            else:
+                self.clear_bg_activity()
             if session_id is not None and not cancelled:
                 log.warning(
                     "end_turn: agent cancel failed session=%s force_cleared=%s reason=%s",
@@ -2065,12 +2326,14 @@ class AcpClient:
                 "reason": reason,
             }
 
-    async def session_cancel(self, session_id: str) -> None:
+    async def session_cancel(self, session_id: str) -> dict:
         """Cancel agent turn for one session and unlock local hub turn state.
 
         Only clears this session's turn and its pending user questions.
         Other projects' turns are left running.
+
+        Returns the end_turn result dict (cancelled/cleared/reason).
+        Never raises after local force-clear: UI must unlock on Stop.
         """
         self._cancel_pending_user_questions_for_session(session_id)
-        await self.end_turn(session_id, "user cancel")
-        # Never raise after local force-clear: UI must unlock on Stop.
+        return await self.end_turn(session_id, "user cancel")

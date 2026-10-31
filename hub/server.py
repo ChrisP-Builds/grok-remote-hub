@@ -18,6 +18,14 @@ from aiohttp import WSMsgType, web
 from hub.acp_client import AcpClient
 from hub.agent_supervisor import AgentSupervisor
 from hub.config import Config, PROJECT_ROOT, TAILSCALE_EXE
+from hub.harden_policy import (
+    agent_recycle_complete,
+    agent_recycle_reconnect_plan,
+    heal_exhaust_operator_fields,
+    health_response_body,
+    is_public_unauthenticated_path,
+    should_auto_restart_agent_on_heal_exhaust,
+)
 from hub.ops_metrics import OpsMetrics
 from hub.fs_browser import (
     RAW_MAX_BYTES,
@@ -37,6 +45,8 @@ from hub.site_preview import (
 )
 from hub.history import load_session_history
 from hub.plan_view import PlanViewError, apply_plan_action, read_session_plan
+from hub.recap_view import build_session_recap_from_disk
+from hub.session_search import session_matches_query
 from hub.projects import ProjectError, create_project, list_project_browse
 from hub.multi_turn import (
     STATUS_IDLE,
@@ -61,6 +71,7 @@ from hub.compact import (
     hub_compact_gate_set_inflight,
     hub_compact_gate_suppresses_notification,
     normalize_compact_notification,
+    parse_compact_rpc_tokens,
     parse_compact_slash,
     resolve_compact_outcome,
     usage_from_compact_tokens,
@@ -195,6 +206,8 @@ class Hub:
         self._acp_disconnected_at: float | None = None  # monotonic
         self._acp_heal_last_error: str | None = None
         self._acp_heal_in_progress = False
+        # Config-gated auto restart-agent after heal exhaust (once per process).
+        self._acp_heal_auto_restarts_used = 0
         self._agent_restart_in_progress = False
         self.clients: set[web.WebSocketResponse] = set()
         self.subscriptions: dict[web.WebSocketResponse, set[str]] = {}
@@ -252,6 +265,8 @@ class Hub:
         # Hub-owned /compact gate: sid → monotonic deadline (in-flight + post grace).
         # While active, notification path skips terminal/started compact broadcasts.
         self._hub_compact_gate: dict[str, float] = {}
+        # sid → agent compact tokens from auto_compact_* (stashed even under gate).
+        self._agent_compact_tokens: dict[str, dict[str, int | None]] = {}
         self.cli_version: str | None = None
         self.compat: dict[str, Any] = {
             "ok": False,
@@ -491,16 +506,19 @@ class Hub:
         capacity = self._capacity_payload()
         pending_q = sorted(self.acp.sessions_with_pending_questions())
         session_flags = self._session_flags_map()
-        heal_exhausted = (
-            self._acp_heal_attempts >= self._acp_heal_max
-            and not bool(mapped["acpConnected"])
-            and mapped["agentProcess"] == "up"
+        heal_fields = heal_exhaust_operator_fields(
+            heal_attempts=self._acp_heal_attempts,
+            max_attempts=self._acp_heal_max,
+            agent_process_up=mapped["agentProcess"] == "up",
+            acp_connected=bool(mapped["acpConnected"]),
+            last_error=self._acp_heal_last_error,
         )
         body: dict[str, Any] = {
             "type": "status",
             "agent": mapped["agent"],
             "agentProcess": mapped["agentProcess"],
             "agentDetail": mapped["agentDetail"],
+            "agentBackend": getattr(self.config, "agent_backend", "serve") or "serve",
             "acpQuality": mapped.get("acpQuality", "down"),
             "bind": self.bind_mode,
             "tailscaleIp": self.tailscale_ip,
@@ -510,8 +528,9 @@ class Hub:
             ),
             "acpLastRecvAgeSeconds": live.get("seconds_since_recv"),
             "acpLastSendOkAgeSeconds": live.get("seconds_since_send_ok"),
-            "acpHealAttempts": self._acp_heal_attempts,
-            "acpHealError": self._acp_heal_last_error if heal_exhausted else None,
+            "acpHealAttempts": heal_fields["acpHealAttempts"],
+            "acpHealError": heal_fields["acpHealError"],
+            "acpHealExhausted": heal_fields["acpHealExhausted"],
             "loadedSessionId": self.acp.loaded_session_id,
             "turnRunning": self.acp.turn_running,
             "turnSessionId": self.acp.turn_session_id,
@@ -602,6 +621,8 @@ class Hub:
             self._acp_heal_attempts = 0
             self._acp_disconnected_at = None
             self._acp_heal_last_error = None
+            # Healthy ACP: reset auto-restart budget for a later exhaust cycle.
+            self._acp_heal_auto_restarts_used = 0
         else:
             if self._acp_disconnected_at is None:
                 self._acp_disconnected_at = time.monotonic()
@@ -929,10 +950,23 @@ class Hub:
             "summaryPreview": body.get("summaryPreview"),
             "error": body.get("error"),
         }
+        agent_before = body.get("tokensBefore")
+        agent_after = body.get("tokensAfter")
+        # Always stash agent tokens on terminal notifications (even under gate) so
+        # hub-owned /compact can merge them into resolve_compact_outcome.
+        if body["state"] in ("completed", "failed") and (
+            agent_before is not None or agent_after is not None
+        ):
+            self._agent_compact_tokens[sid] = {
+                "tokensBefore": agent_before
+                if isinstance(agent_before, int)
+                else None,
+                "tokensAfter": agent_after
+                if isinstance(agent_after, int)
+                else None,
+            }
         if body["state"] == "completed":
             # Ground toast/bar in session signals; agent tokens are diagnostic only.
-            agent_before = body.get("tokensBefore")
-            agent_after = body.get("tokensAfter")
             signals = read_session_signals(self.config.sessions_root, sid)
             outcome = resolve_compact_outcome(
                 signals_before_used=None,
@@ -1622,6 +1656,7 @@ class Hub:
         app.router.add_get("/api/sessions/{id}/history", self.handle_history)
         app.router.add_get("/api/sessions/{id}/plan", self.handle_session_plan)
         app.router.add_post("/api/sessions/{id}/plan/action", self.handle_session_plan_action)
+        app.router.add_get("/api/sessions/{id}/recap", self.handle_session_recap)
         app.router.add_get("/api/sessions/{id}/usage", self.handle_session_usage)
         app.router.add_get("/api/usage/plan", self.handle_usage_plan)
         app.router.add_post("/api/sessions", self.handle_new_session)
@@ -1662,8 +1697,9 @@ class Hub:
 
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):
-        # Static assets and health still respect token if configured
-        if request.path == "/health":
+        # SPA shell/static assets + /health load without token so ?token= document
+        # navigation can fetch /app.js etc. API, WS, and preview stay gated.
+        if is_public_unauthenticated_path(request.method, request.path):
             return await handler(request)
         if not self.check_auth(request):
             return web.json_response({"error": "unauthorized"}, status=401)
@@ -1936,21 +1972,62 @@ class Hub:
                     await self.broadcast(self.status_payload())
                 except Exception:
                     log.debug("ACP heal exhausted status broadcast failed", exc_info=True)
+                # Optional config-gated auto restart-agent (never mid-turn).
+                turn_active = bool(self.acp.turn_running) or bool(
+                    getattr(self.acp, "active_turns", None)
+                )
+                if should_auto_restart_agent_on_heal_exhaust(
+                    enabled=bool(
+                        getattr(
+                            self.config,
+                            "auto_restart_agent_on_heal_exhaust",
+                            False,
+                        )
+                    ),
+                    agent_process_up=self.agent_status == "up",
+                    acp_connected=bool(self.acp_connected),
+                    heal_attempts=self._acp_heal_attempts,
+                    max_attempts=self._acp_heal_max,
+                    turn_active=turn_active,
+                    auto_restarts_used=self._acp_heal_auto_restarts_used,
+                ):
+                    self._acp_heal_auto_restarts_used += 1
+                    log.warning(
+                        "ACP heal exhaust: auto restart-agent "
+                        "(used=%s, config auto_restart_agent_on_heal_exhaust)",
+                        self._acp_heal_auto_restarts_used,
+                    )
+                    try:
+                        await self._restart_agent_process(
+                            reason="heal exhaust auto-restart"
+                        )
+                    except Exception:
+                        log.exception(
+                            "ACP heal exhaust auto restart-agent failed"
+                        )
 
     async def handle_index(self, request: web.Request) -> web.FileResponse:
         return web.FileResponse(Path(self.config.static_dir) / "index.html")
 
     def _health_body(self) -> dict[str, Any]:
-        """Shared health fields for /health and diagnostics."""
+        """Shared FULL health fields for /health (auth) and diagnostics."""
         compat = self.compat or {}
         mapped, live = self._map_agent_from_live()
         primary_tel = self._primary_turn_telemetry()
         capacity = self._capacity_payload()
+        heal_fields = heal_exhaust_operator_fields(
+            heal_attempts=self._acp_heal_attempts,
+            max_attempts=self._acp_heal_max,
+            agent_process_up=mapped["agentProcess"] == "up",
+            acp_connected=bool(mapped["acpConnected"]),
+            last_error=self._acp_heal_last_error,
+        )
         body: dict[str, Any] = {
             "ok": True,
             "agent": mapped["agent"],
             "agentProcess": mapped["agentProcess"],
             "agentDetail": mapped["agentDetail"],
+            "agentBackend": getattr(self.config, "agent_backend", "serve") or "serve",
             "acpQuality": mapped.get("acpQuality", "down"),
             "acpConnected": mapped["acpConnected"],
             "acpConsecutiveSendFailures": int(
@@ -1958,16 +2035,9 @@ class Hub:
             ),
             "acpLastRecvAgeSeconds": live.get("seconds_since_recv"),
             "acpLastSendOkAgeSeconds": live.get("seconds_since_send_ok"),
-            "acpHealAttempts": self._acp_heal_attempts,
-            "acpHealError": (
-                self._acp_heal_last_error
-                if (
-                    self._acp_heal_attempts >= self._acp_heal_max
-                    and not bool(mapped["acpConnected"])
-                    and mapped["agentProcess"] == "up"
-                )
-                else None
-            ),
+            "acpHealAttempts": heal_fields["acpHealAttempts"],
+            "acpHealError": heal_fields["acpHealError"],
+            "acpHealExhausted": heal_fields["acpHealExhausted"],
             "bind": self.bind_mode,
             "host": self.bind_host,
             "hosts": list(self.bind_hosts),
@@ -2011,7 +2081,14 @@ class Hub:
         return body
 
     async def handle_health(self, request: web.Request) -> web.Response:
-        return web.json_response(self._health_body())
+        full = self._health_body()
+        authenticated = self.check_auth(request)
+        body = health_response_body(
+            full,
+            authenticated=authenticated,
+            hub_token=self.config.hub_token or "",
+        )
+        return web.json_response(body)
 
     async def handle_acp_trace(self, request: web.Request) -> web.Response:
         """Return recent structured ACP lifecycle events (admin / phone debug)."""
@@ -2315,26 +2392,86 @@ class Hub:
                 await self.broadcast(self.status_payload())
                 return False, err
 
-            # 5) Reconnect ACP to the new serve process.
-            try:
-                await self.acp.reconnect(timeout=reconnect_timeout)
-            except Exception as exc:
-                err = f"agent up but ACP reconnect failed: {exc}"
-                self._acp_heal_last_error = str(exc)
-                if self._acp_disconnected_at is None:
-                    self._acp_disconnected_at = time.monotonic()
-                log.warning("restart-agent: %s", err)
+            plan = agent_recycle_reconnect_plan(
+                reconnect_timeout_s=reconnect_timeout,
+            )
+            # Port open is not ACP-ready; settle briefly then multi-attempt reconnect.
+            settle = float(plan["settle_after_port_s"])
+            if settle > 0:
+                await asyncio.sleep(settle)
 
-            ok = bool(self.acp_connected) and self.agent_status == "up"
+            # Heal state may have been set during kill; reset again before reconnect.
+            self._acp_heal_attempts = 0
+            self._acp_heal_last_error = None
+            self._acp_disconnected_at = None
+            self._acp_heal_in_progress = False
+
+            # 5) Reconnect ACP to the new serve process (reset maintain each attempt).
+            attempts = int(plan["reconnect_attempts"])
+            rto = float(plan["reconnect_timeout_s"])
+
+            for attempt in range(1, attempts + 1):
+                try:
+                    log.info(
+                        "restart-agent: ACP reconnect attempt %s/%s timeout=%.1fs",
+                        attempt,
+                        attempts,
+                        rto,
+                    )
+                    await self.acp.reconnect(timeout=rto, reset_maintain=True)
+                    process_up = (
+                        self.agent_status == "up"
+                        or bool(self.supervisor.is_up)
+                        or bool(up)
+                    )
+                    acp_ok = bool(self.acp.connected or self.acp_connected)
+                    if agent_recycle_complete(
+                        process_up=process_up,
+                        acp_connected=acp_ok,
+                    ):
+                        break
+                except Exception as exc:
+                    err = f"agent up but ACP reconnect failed: {exc}"
+                    log.warning(
+                        "restart-agent: reconnect attempt %s/%s failed: %s",
+                        attempt,
+                        attempts,
+                        exc,
+                    )
+                    if attempt < attempts:
+                        await asyncio.sleep(0.5)
+
+            process_up = (
+                self.agent_status == "up" or bool(self.supervisor.is_up) or bool(up)
+            )
+            acp_ok = bool(self.acp.connected or self.acp_connected)
+            ok = agent_recycle_complete(process_up=process_up, acp_connected=acp_ok)
             if ok:
                 self._acp_heal_attempts = 0
                 self._acp_heal_last_error = None
                 self._acp_disconnected_at = None
                 log.info("restart-agent: success agentProcess=up acpConnected=true")
+                try:
+                    self.ops.emit("agent_restart_reconnect_ok", reason=str(reason or "")[:200])
+                except Exception:
+                    pass
             else:
                 if not err:
                     err = "agent up but ACP not connected"
+                self._acp_heal_last_error = err
+                if self._acp_disconnected_at is None:
+                    self._acp_disconnected_at = time.monotonic()
+                # Keep heal budget usable after recycle; never leave exhausted.
+                self._acp_heal_attempts = 0
                 log.warning("restart-agent: partial failure: %s", err)
+                try:
+                    self.ops.emit(
+                        "agent_restart_reconnect_fail",
+                        reason=str(reason or "")[:200],
+                        error=str(err)[:200],
+                    )
+                except Exception:
+                    pass
 
             await self.broadcast(self.status_payload())
             return ok, err if not ok else None
@@ -2380,7 +2517,20 @@ class Hub:
         return web.json_response(body, status=200 if ok else 502)
 
     async def handle_sessions(self, request: web.Request) -> web.Response:
-        return web.json_response({"items": self._sessions_items_with_status()})
+        items = self._sessions_items_with_status()
+        q = str(request.rel_url.query.get("q") or "").strip()
+        if q:
+            items = [
+                it
+                for it in items
+                if session_matches_query(
+                    str(it.get("title") or ""),
+                    str(it.get("sessionId") or ""),
+                    str(it.get("cwd") or ""),
+                    q,
+                )
+            ]
+        return web.json_response({"items": items, "q": q or None})
 
     async def handle_rename_session(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]
@@ -2446,6 +2596,31 @@ class Hub:
             max_messages=self.config.max_history_messages,
         )
         return web.json_response({"sessionId": session_id, "messages": messages})
+
+    async def handle_session_recap(self, request: web.Request) -> web.Response:
+        """Bounded last user+assistant catch-up for mobile resume."""
+        session_id = request.match_info["id"]
+        session = find_session(self.config.sessions_root, session_id)
+        if session is None:
+            return web.json_response({"error": "session not found"}, status=404)
+        try:
+            max_chars_raw = request.rel_url.query.get("maxChars") or request.rel_url.query.get(
+                "max_chars"
+            )
+            max_chars = int(max_chars_raw) if max_chars_raw else 800
+        except (TypeError, ValueError):
+            max_chars = 800
+        max_chars = max(80, min(max_chars, 4000))
+        payload = await asyncio.to_thread(
+            build_session_recap_from_disk,
+            self.config.sessions_root,
+            session_id,
+            session_path=session.path,
+            max_chars=max_chars,
+            max_messages=min(self.config.max_history_messages, 200),
+        )
+        payload["sessionId"] = session_id
+        return web.json_response(payload)
 
     async def handle_session_plan(self, request: web.Request) -> web.Response:
         """Read plan.md + plan_mode.json for Hub plan viewer."""
@@ -3727,12 +3902,18 @@ class Hub:
                 },
                 session_id=session_id,
             )
+        # Capture session signals before compact (UI/CTX bar source of truth).
+        signals_before = read_session_signals(self.config.sessions_root, session_id)
+        before_used = signals_before.get("contextTokensUsed")
+        before_window = signals_before.get("contextWindowTokens")
+        # Drop any stale stash from a prior compact for this session.
+        self._agent_compact_tokens.pop(session_id, None)
         await self.broadcast(
             {
                 "type": "compact",
                 "sessionId": session_id,
                 "state": "started",
-                "tokensBefore": None,
+                "tokensBefore": before_used,
                 "tokensAfter": None,
                 "summaryPreview": None,
                 "error": None,
@@ -3742,14 +3923,13 @@ class Hub:
         await self._broadcast_turn(
             session_id, "running", None, also_session_id=view_session_id
         )
-        # Capture session signals before compact (UI/CTX bar source of truth).
-        signals_before = read_session_signals(self.config.sessions_root, session_id)
-        before_used = signals_before.get("contextTokensUsed")
-        before_window = signals_before.get("contextWindowTokens")
 
         try:
-            await self.acp.session_compact(session_id, context=context or None)
+            rpc_result = await self.acp.session_compact(
+                session_id, context=context or None
+            )
             log.info("compact ok session=%s", session_id)
+            rpc_before, rpc_after = parse_compact_rpc_tokens(rpc_result)
             # Poll signals so agent can write signals.json after compact
             # (CLI-visible lag; allow ~5s for late writes).
             after_used = None
@@ -3761,10 +3941,32 @@ class Hub:
                     after_used = sig.get("contextTokensUsed")
                 if sig.get("contextWindowTokens") is not None:
                     after_window = sig.get("contextWindowTokens")
+            # One extra wait when meter still flat (agent may write signals late).
+            if (
+                before_used is not None
+                and after_used is not None
+                and after_used >= before_used
+            ):
+                await asyncio.sleep(2.5)
+                sig = read_session_signals(self.config.sessions_root, session_id)
+                if sig.get("contextTokensUsed") is not None:
+                    after_used = sig.get("contextTokensUsed")
+                if sig.get("contextWindowTokens") is not None:
+                    after_window = sig.get("contextWindowTokens")
+            # Prefer stashed notification agent tokens; fall back to RPC result.
+            stashed = self._agent_compact_tokens.pop(session_id, None) or {}
+            agent_before = stashed.get("tokensBefore")
+            agent_after = stashed.get("tokensAfter")
+            if agent_before is None:
+                agent_before = rpc_before
+            if agent_after is None:
+                agent_after = rpc_after
             outcome = resolve_compact_outcome(
                 signals_before_used=before_used,
                 signals_after_used=after_used,
                 signals_window=after_window,
+                agent_before=agent_before,
+                agent_after=agent_after,
             )
             reduced = bool(outcome.get("reduced"))
             feedback = outcome.get("feedback") or "unknown"
@@ -3783,11 +3985,14 @@ class Hub:
             )
             log.info(
                 "compact outcome reduced=%s feedback=%s used_before=%s "
-                "used_after=%s method=_x.ai/compact_conversation",
+                "used_after=%s agent_before=%s agent_after=%s "
+                "method=_x.ai/compact_conversation",
                 reduced,
                 feedback,
                 before_used,
                 after_used if after_used is not None else tokens_after,
+                agent_before,
+                agent_after,
             )
             if state == "failed":
                 reduced = False
@@ -3806,6 +4011,10 @@ class Hub:
                 }
                 if window_tokens is not None:
                     payload["windowTokens"] = window_tokens
+                if agent_before is not None:
+                    payload["agentTokensBefore"] = agent_before
+                if agent_after is not None:
+                    payload["agentTokensAfter"] = agent_after
                 await self.broadcast(payload, session_id=session_id)
             else:
                 completed = {
@@ -3822,6 +4031,10 @@ class Hub:
                 }
                 if window_tokens is not None:
                     completed["windowTokens"] = window_tokens
+                if agent_before is not None:
+                    completed["agentTokensBefore"] = agent_before
+                if agent_after is not None:
+                    completed["agentTokensAfter"] = agent_after
                 await self.broadcast(completed, session_id=session_id)
             try:
                 await self._broadcast_usage_after_compact(session_id)
@@ -4167,8 +4380,9 @@ class Hub:
         await self.broadcast(
             {"type": "queue", "queueLength": remaining, "sessionId": session_id}
         )
+        end_result: dict[str, Any] | None = None
         try:
-            await self.acp.session_cancel(session_id)
+            end_result = await self.acp.session_cancel(session_id)
         except Exception as exc:
             log.warning("session_cancel raised session=%s: %s — force-clearing", session_id, exc)
             try:
@@ -4177,6 +4391,10 @@ class Hub:
                 )
             except Exception:
                 log.exception("force_clear_turn after cancel failure")
+            try:
+                self.acp._pop_bg_activity(session_id)
+            except Exception:
+                pass
             try:
                 await self._emit_error(
                     (
@@ -4188,7 +4406,23 @@ class Hub:
                 )
             except Exception:
                 pass
-        # Always broadcast idle + status so clients unlock this session.
+        else:
+            # Soft notice only when agent did not ack cancel (local clear still done).
+            # Avoid spamming when cancel simply was not needed (no live turn).
+            if (
+                isinstance(end_result, dict)
+                and end_result.get("cancelled") is False
+                and end_result.get("cleared") is True
+            ):
+                try:
+                    await self._emit_error(
+                        "Stop: agent did not confirm cancel; hub cleared local turn.",
+                        session_id=session_id,
+                        ws=ws,
+                    )
+                except Exception:
+                    pass
+        # Always broadcast idle + status so clients unlock and bg fields update.
         await self.broadcast(
             {"type": "turn", "sessionId": session_id, "state": "idle", "error": None},
             session_id=session_id,

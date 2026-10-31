@@ -22,6 +22,10 @@ _DETACHED_PROCESS = 0x00000008
 _CREATE_NO_WINDOW = 0x08000000
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
+# Experiment: leader lock under ~/.grok (see logs/exp-leader/FINDINGS.md).
+_LEADER_LOCK_NAME = "leader.lock"
+_LEADER_PIPE_PREFIX = "grok-leader"
+
 
 def _port_open(host: str, port: int, timeout: float = 0.4) -> bool:
     try:
@@ -41,8 +45,93 @@ def _windows_spawn_flags() -> int:
     )
 
 
+def leader_lock_path() -> Path:
+    """Path to grok leader lock file (~/.grok/leader.lock)."""
+    return Path.home() / ".grok" / _LEADER_LOCK_NAME
+
+
+def pid_is_alive(pid: int) -> bool:
+    """True if *pid* looks like a live OS process (best-effort, cross-platform)."""
+    if pid is None or pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+            )
+            if not handle:
+                return False
+            try:
+                code = wintypes.DWORD()
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return int(code.value) == STILL_ACTIVE
+                return True
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+def leader_named_pipe_present() -> bool:
+    """True if a Windows named pipe matching grok-leader* exists."""
+    if sys.platform != "win32":
+        return False
+    try:
+        # \\.\pipe\ listing
+        for name in os.listdir(r"\\.\pipe"):
+            if _LEADER_PIPE_PREFIX in str(name).lower():
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def leader_is_ready(
+    *,
+    pid: int | None = None,
+    lock_path: Path | None = None,
+) -> bool:
+    """Leader readiness: live pid, lock pid, or leader named pipe.
+
+    Used by AgentSupervisor is_up/wait for agent_backend=leader.
+    """
+    if pid is not None and pid_is_alive(pid):
+        return True
+    path = lock_path if lock_path is not None else leader_lock_path()
+    try:
+        if path.is_file():
+            raw = path.read_text(encoding="utf-8", errors="replace").strip()
+            # lock may be bare pid or key=value; take first integer token
+            for tok in raw.replace("=", " ").replace(",", " ").split():
+                if tok.isdigit():
+                    if pid_is_alive(int(tok)):
+                        return True
+                    break
+    except OSError:
+        pass
+    if leader_named_pipe_present():
+        return True
+    return False
+
+
 class AgentSupervisor:
-    """Owns `grok agent serve` lifecycle with restart backoff.
+    """Owns agent backend lifecycle with restart backoff.
+
+    Default backend is ``agent serve`` (TCP WS). Opt-in ``agent_backend=leader``
+    spawns ``grok agent leader`` and treats lock/pipe as readiness (experiment).
 
     By default, hub stop leaves a surviving agent process running so code
     deploys / hub bounce do not cold-kill serve. Full agent teardown only when
@@ -60,6 +149,10 @@ class AgentSupervisor:
         self._agent_pid: int | None = None
         self.status: str = "down"  # up | down
         self._log_path: Path | None = None
+
+    @property
+    def uses_leader(self) -> bool:
+        return bool(getattr(self.config, "uses_leader_backend", False))
 
     @property
     def pid_path(self) -> Path:
@@ -263,13 +356,25 @@ class AgentSupervisor:
             log.warning("Failed to enumerate listeners on port %s: %s", port, exc)
         return found
 
+    def _backend_ready(self) -> bool:
+        """Process-level readiness for the configured backend."""
+        if self.uses_leader:
+            return leader_is_ready(
+                pid=self._agent_pid or self._read_pid_file(),
+                lock_path=leader_lock_path(),
+            )
+        return _port_open(self.config.agent_bind, self.config.agent_port)
+
     async def force_kill_agent(self) -> bool:
         """Kill agent regardless of attach vs hub-spawned ownership.
 
-        Hung ACP with process still listening needs a hard kill of the port
-        holder, not only processes where ``_started_by_us`` is True.
+        Serve: hard kill of the port holder.
+        Leader: ``grok leader kill`` plus recorded pid tree.
         Returns True if at least one kill was attempted.
         """
+        if self.uses_leader:
+            return await self._force_kill_leader()
+
         pids: list[int] = []
         seen: set[int] = set()
 
@@ -315,37 +420,114 @@ class AgentSupervisor:
             await self._emit("down")
         return True
 
-    async def force_restart(self, wait_up_timeout: float = 40.0) -> bool:
-        """Kill whatever holds the agent port, then wait until it is open again.
+    async def _force_kill_leader(self) -> bool:
+        """Kill leader process tree carefully (leader kill CLI + pid)."""
+        attempted = False
+        pids: list[int] = []
+        seen: set[int] = set()
 
-        Relies on the supervisor ``_run_loop`` spawn path after the listener dies.
+        def _add(pid: int | None) -> None:
+            if pid is None or pid <= 0 or pid in seen:
+                return
+            seen.add(pid)
+            pids.append(pid)
+
+        if self._proc is not None and self._proc.pid:
+            _add(self._proc.pid)
+        _add(self._agent_pid)
+        _add(self._read_pid_file())
+        try:
+            lock = leader_lock_path()
+            if lock.is_file():
+                raw = lock.read_text(encoding="utf-8", errors="replace").strip()
+                for tok in raw.replace("=", " ").replace(",", " ").split():
+                    if tok.isdigit():
+                        _add(int(tok))
+                        break
+        except OSError:
+            pass
+
+        # Prefer grok's own cleanup first (clears lock).
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.config.grok_bin,
+                "leader",
+                "kill",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            attempted = True
+            log.warning("force_kill_agent(leader): ran grok leader kill")
+        except Exception as exc:
+            log.warning("force_kill_agent(leader): leader kill failed: %s", exc)
+
+        if pids:
+            log.warning("force_kill_agent(leader): killing pids=%s", pids)
+            for pid in pids:
+                await self._kill_pid(pid)
+            attempted = True
+
+        if not attempted:
+            log.warning("force_kill_agent(leader): no pid and leader kill failed")
+
+        self._proc = None
+        self._clear_pid_file()
+        self._started_by_us = False
+        if self.status != "down":
+            await self._emit("down")
+        return attempted
+
+    async def force_restart(self, wait_up_timeout: float = 40.0) -> bool:
+        """Kill backend, then wait until process readiness is up again.
+
+        Serve: TCP port. Leader: lock/pipe/pid. ACP not yet verified.
         """
-        log.warning(
-            "force_restart: begin port=%s wait_up=%.1fs",
-            self.config.agent_port,
-            wait_up_timeout,
-        )
-        await self.force_kill_agent()
-        # Allow the OS to release the bind before polling / spawn.
-        await asyncio.sleep(0.4)
-        up = await self.wait_until_up(timeout=wait_up_timeout)
-        if up:
-            log.info(
-                "force_restart: agent port %s is up again",
-                self.config.agent_port,
+        if self.uses_leader:
+            log.warning(
+                "force_restart(leader): begin wait_up=%.1fs",
+                wait_up_timeout,
             )
         else:
-            log.error(
-                "force_restart: agent port %s still down after %.1fs",
+            log.warning(
+                "force_restart: begin port=%s wait_up=%.1fs",
                 self.config.agent_port,
                 wait_up_timeout,
             )
+        await self.force_kill_agent()
+        # Allow the OS to release the bind / lock before polling / spawn.
+        await asyncio.sleep(0.4)
+        up = await self.wait_until_up(timeout=wait_up_timeout)
+        if up:
+            if self.uses_leader:
+                log.info(
+                    "force_restart(leader): ready again "
+                    "(process/lock/pipe only; ACP not yet verified)"
+                )
+            else:
+                log.info(
+                    "force_restart: agent port %s is up again "
+                    "(TCP only; ACP not yet verified)",
+                    self.config.agent_port,
+                )
+        else:
+            if self.uses_leader:
+                log.error(
+                    "force_restart(leader): still down after %.1fs",
+                    wait_up_timeout,
+                )
+            else:
+                log.error(
+                    "force_restart: agent port %s still down after %.1fs",
+                    self.config.agent_port,
+                    wait_up_timeout,
+                )
         return up
 
     async def wait_until_up(self, timeout: float = 30.0) -> bool:
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
-            if _port_open(self.config.agent_bind, self.config.agent_port):
+            if self._backend_ready():
                 if self.status != "up":
                     await self._emit("up")
                 return True
@@ -353,6 +535,12 @@ class AgentSupervisor:
         return False
 
     async def _run_loop(self) -> None:
+        if self.uses_leader:
+            await self._run_loop_leader()
+            return
+        await self._run_loop_serve()
+
+    async def _run_loop_serve(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
             try:
@@ -421,6 +609,135 @@ class AgentSupervisor:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
+    async def _run_loop_leader(self) -> None:
+        """Spawn/attach loop for agent_backend=leader (no TCP port)."""
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                if leader_is_ready(
+                    pid=self._agent_pid or self._read_pid_file(),
+                    lock_path=leader_lock_path(),
+                ):
+                    # Existing leader (CLI or prior hub): attach, do not spawn.
+                    if not self._started_by_us:
+                        self._proc = None
+                    log.info(
+                        "Leader already ready (lock/pipe/pid); attach, not spawn"
+                    )
+                    await self._emit("up")
+                    while not self._stop.is_set() and leader_is_ready(
+                        pid=self._agent_pid or self._read_pid_file(),
+                        lock_path=leader_lock_path(),
+                    ):
+                        await asyncio.sleep(2.0)
+                    if self._stop.is_set():
+                        break
+                    log.warning("Leader went down; will restart")
+                    await self._emit("down")
+                    continue
+
+                await self._spawn_leader()
+                if self._proc is None and self._agent_pid is None:
+                    await self._emit("down")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    continue
+
+                up = await self.wait_until_up(timeout=20.0)
+                if not up:
+                    log.error("Leader failed to become ready (lock/pipe)")
+                    await self._kill_proc()
+                    await self._emit("down")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
+                    continue
+
+                backoff = 1.0
+                await self._emit("up")
+                if self._proc is not None:
+                    code = await self._proc.wait()
+                    self._proc = None
+                    log.warning("Leader process exited with code %s", code)
+                else:
+                    while not self._stop.is_set() and leader_is_ready(
+                        pid=self._agent_pid or self._read_pid_file(),
+                        lock_path=leader_lock_path(),
+                    ):
+                        await asyncio.sleep(2.0)
+                    if self._stop.is_set():
+                        break
+                    log.warning("Leader readiness lost (detached)")
+                self._clear_pid_file()
+                await self._emit("down")
+                if self._stop.is_set():
+                    break
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.exception("Leader supervisor error: %s", exc)
+                await self._emit("down")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+
+    async def _spawn_detached(self, cmd: list[str], log_label: str) -> None:
+        """Shared detached spawn for serve and leader backends."""
+        self._log_path = self._log_path or (self.config.log_dir / "agent.log")
+        self.config.log_dir.mkdir(parents=True, exist_ok=True)
+        log_f = open(self._log_path, "a", encoding="utf-8", errors="replace")
+        try:
+            kwargs: dict = {
+                "stdout": log_f,
+                "stderr": asyncio.subprocess.STDOUT,
+                "stdin": asyncio.subprocess.DEVNULL,
+            }
+            if sys.platform == "win32":
+                flags = _windows_spawn_flags()
+                try:
+                    self._proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        creationflags=flags,
+                        **kwargs,
+                    )
+                except OSError as exc:
+                    log.warning(
+                        "Detached spawn with breakaway failed (%s); retry without breakaway",
+                        exc,
+                    )
+                    flags = (
+                        _CREATE_NEW_PROCESS_GROUP
+                        | _DETACHED_PROCESS
+                        | _CREATE_NO_WINDOW
+                    )
+                    self._proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        creationflags=flags,
+                        **kwargs,
+                    )
+            else:
+                kwargs["start_new_session"] = True
+                self._proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+
+            self._started_by_us = True
+            if self._proc is not None and self._proc.pid:
+                self._write_pid_file(self._proc.pid)
+                log.info(
+                    "%s spawned pid=%s (detached=%s)",
+                    log_label,
+                    self._proc.pid,
+                    sys.platform == "win32",
+                )
+        except FileNotFoundError:
+            log.error("grok binary not found: %s", self.config.grok_bin)
+            log_f.close()
+            self._proc = None
+            self._started_by_us = False
+            self._clear_pid_file()
+        except Exception:
+            log_f.close()
+            raise
+
     async def _spawn(self) -> None:
         bind = f"{self.config.agent_bind}:{self.config.agent_port}"
         # --always-approve is a `grok agent` option (before mode), not a serve flag
@@ -439,55 +756,28 @@ class AgentSupervisor:
             self.config.grok_bin,
             bind,
         )
-        self._log_path = self._log_path or (self.config.log_dir / "agent.log")
-        self.config.log_dir.mkdir(parents=True, exist_ok=True)
-        log_f = open(self._log_path, "a", encoding="utf-8", errors="replace")
-        try:
-            kwargs: dict = {
-                "stdout": log_f,
-                "stderr": asyncio.subprocess.STDOUT,
-                "stdin": asyncio.subprocess.DEVNULL,
-            }
-            if sys.platform == "win32":
-                # Detached so hub force-kill / job teardown does not take agent.
-                flags = _windows_spawn_flags()
-                try:
-                    self._proc = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        creationflags=flags,
-                        **kwargs,
-                    )
-                except OSError as exc:
-                    # Breakaway may be denied; retry without it.
-                    log.warning(
-                        "Detached spawn with breakaway failed (%s); retry without breakaway",
-                        exc,
-                    )
-                    flags = (
-                        _CREATE_NEW_PROCESS_GROUP
-                        | _DETACHED_PROCESS
-                        | _CREATE_NO_WINDOW
-                    )
-                    self._proc = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        creationflags=flags,
-                        **kwargs,
-                    )
-            else:
-                # Start new session so SIGHUP to hub does not kill agent.
-                kwargs["start_new_session"] = True
-                self._proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+        await self._spawn_detached(cmd, "Agent")
 
-            self._started_by_us = True
-            if self._proc is not None and self._proc.pid:
-                self._write_pid_file(self._proc.pid)
-                log.info("Agent spawned pid=%s (detached=%s)", self._proc.pid, sys.platform == "win32")
-        except FileNotFoundError:
-            log.error("grok binary not found: %s", self.config.grok_bin)
-            log_f.close()
-            self._proc = None
-            self._started_by_us = False
-            self._clear_pid_file()
-        except Exception:
-            log_f.close()
-            raise
+    async def _spawn_leader(self) -> None:
+        """Spawn ``grok agent leader`` detached (experiment backend)."""
+        day = datetime.now(timezone.utc).strftime("%Y%m%d")
+        debug_file = self.config.log_dir / f"agent-leader-{day}.log"
+        self.config.log_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            self.config.grok_bin,
+            "agent",
+            "--always-approve",
+            "leader",
+            "--no-exit-on-disconnect",
+            "--relay-on-demand",
+            "--debug-file",
+            str(debug_file),
+        ]
+        log.info(
+            "Starting leader: %s agent --always-approve leader "
+            "--no-exit-on-disconnect --relay-on-demand --debug-file %s",
+            self.config.grok_bin,
+            debug_file.name,
+        )
+        self._log_path = self.config.log_dir / f"agent-{day}.log"
+        await self._spawn_detached(cmd, "Leader")

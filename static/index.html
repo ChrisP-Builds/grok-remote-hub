@@ -12,7 +12,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/app.css?v=20260726a" />
+  <link rel="stylesheet" href="/app.css?v=20260812a" />
 </head>
 <body style="background:#0a0c10;color:#d6deea">
   <div id="app">
@@ -70,6 +70,7 @@
           <div class="topbar-title-row">
             <h1 id="chat-title" class="chat-title">Select a session</h1>
             <button type="button" id="btn-rename-session" class="session-rename-btn topbar-rename hidden" aria-label="Rename session" title="Rename session">✎</button>
+            <button type="button" id="btn-catch-up" class="btn btn-ghost btn-sm topbar-catch-up hidden" title="Catch up: last user + assistant" aria-label="Catch up">Catch up</button>
           </div>
           <div class="chat-sub" id="chat-sub">
             <span id="chat-project" class="chip chip-project meta-chip hidden" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Project details"></span>
@@ -115,6 +116,10 @@
         </div>
       </div>
 
+      <div id="auth-token-banner" class="auth-token-banner hidden" role="alert" aria-live="polite">
+        <span id="auth-token-banner-text"></span>
+      </div>
+
       <div id="chat-panel" class="chat-panel">
         <div id="capacity-banner" class="capacity-banner hidden" data-state="idle" aria-live="polite">
           <span id="capacity-banner-text"></span>
@@ -123,6 +128,13 @@
         <div id="latency-hint-banner" class="latency-hint-banner hidden" data-kind="" aria-live="polite">
           <span id="latency-hint-banner-text"></span>
           <button type="button" id="btn-latency-hint-dismiss" class="btn btn-ghost btn-sm latency-hint-dismiss hidden" aria-label="Dismiss">Dismiss</button>
+        </div>
+
+        <div id="compact-status-bar" class="compact-status-bar hidden" aria-live="polite" aria-busy="false">
+          <span class="compact-status-track" aria-hidden="true"><span class="compact-status-pulse"></span></span>
+          <span id="compact-status-label" class="compact-status-label">Compacting conversation…</span>
+          <span id="compact-status-elapsed" class="compact-status-elapsed muted"></span>
+          <span id="compact-status-detail" class="compact-status-detail muted"></span>
         </div>
 
         <div id="session-banner" class="session-banner hidden" data-mode="none" aria-live="polite">
@@ -337,6 +349,7 @@
       <p class="muted modal-help plan-soft-note">Approve clears Hub plan-mode gate (writes plan_mode.json) and continues the session. Not the stock TUI a-key.</p>
       <div class="modal-actions plan-actions">
         <button type="button" id="btn-plan-close" class="btn btn-ghost" data-close="modal-plan">Close</button>
+        <button type="button" id="btn-plan-copy" class="btn btn-ghost">Copy plan</button>
         <button type="button" id="btn-plan-quit" class="btn btn-ghost">Quit plan</button>
         <button type="button" id="btn-plan-request-changes" class="btn btn-ghost">Request changes</button>
         <button type="button" id="btn-plan-approve" class="btn btn-accent">Approve</button>
@@ -357,6 +370,6 @@
   <script src="/vendor/marked.min.js"></script>
   <script src="/vendor/purify.min.js"></script>
   <!-- cache-bust: blank-page fix; mermaid loads on demand from app.js when needed -->
-  <script src="/app.js?v=20260726a"></script>
+  <script src="/app.js?v=20260812a"></script>
 </body>
 </html>

@@ -246,6 +246,60 @@ def _msg_low(after: int, window: int | None) -> str:
     )
 
 
+def _msg_agent_reduced_signals_stale(
+    agent_before: int,
+    agent_after: int,
+    signals_after: int,
+    window: int | None,
+) -> str:
+    """Honest copy when agent shrank but session meter did not move yet."""
+    if window is not None and window > 0:
+        meter = (
+            f"{format_token_short(signals_after)} / {format_token_short(window)}"
+        )
+    else:
+        meter = format_token_short(signals_after)
+    return (
+        f"Compact finished (agent {format_token_short(agent_before)}→"
+        f"{format_token_short(agent_after)}) but session meter still {meter}. "
+        "Meter often updates after the next reply; if it stays high, remaining "
+        "context is still large."
+    )
+
+
+def parse_compact_rpc_tokens(result: Any) -> tuple[int | None, int | None]:
+    """Defensively extract agent compact tokens from RPC result (if any)."""
+    if not isinstance(result, dict):
+        return None, None
+    # Prefer top-level; fall back to nested result/data/compact blobs.
+    candidates: list[dict[str, Any]] = [result]
+    for key in ("result", "data", "compact", "usage"):
+        nested = result.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+
+    before: Any = None
+    after: Any = None
+    for blob in candidates:
+        if before is None:
+            if "tokensBefore" in blob:
+                before = blob.get("tokensBefore")
+            elif "tokens_before" in blob:
+                before = blob.get("tokens_before")
+            elif "pre_tokens" in blob:
+                before = blob.get("pre_tokens")
+        if after is None:
+            if "tokensAfter" in blob:
+                after = blob.get("tokensAfter")
+            elif "tokens_after" in blob:
+                after = blob.get("tokens_after")
+            elif "post_tokens" in blob:
+                after = blob.get("post_tokens")
+        if before is not None and after is not None:
+            break
+    return sanitize_compact_tokens(before, after)
+
+
 def resolve_compact_outcome(
     *,
     signals_before_used: int | None,
@@ -260,7 +314,8 @@ def resolve_compact_outcome(
     Returns:
       {
         "reduced": bool,  # True when signals (or agent+signals agree) show shrink
-        "feedback": "reduced" | "no_change_still_full" | "no_change_low" | "unknown",
+        "feedback": "reduced" | "no_change_still_full" | "no_change_low"
+          | "agent_reduced_signals_stale" | "unknown",
         "tokensBefore": int|None,  # what UI should display
         "tokensAfter": int|None,
         "windowTokens": int|None,
@@ -285,6 +340,18 @@ def resolve_compact_outcome(
                 "tokensAfter": after,
                 "windowTokens": window,
                 "message": _msg_reduced(before, after, window),
+            }
+        # Meter flat/up, but agent claims a real shrink → stale signals (honest).
+        if compact_claims_reduction(agent_b, agent_a):
+            return {
+                "reduced": False,
+                "feedback": "agent_reduced_signals_stale",
+                "tokensBefore": before,
+                "tokensAfter": after,
+                "windowTokens": window,
+                "message": _msg_agent_reduced_signals_stale(
+                    int(agent_b), int(agent_a), after, window
+                ),
             }
         if _usage_is_still_full(
             after, window, full_threshold_pct=full_threshold_pct
@@ -367,12 +434,16 @@ def compact_user_outcome_state(
 
     - reduced True → completed
     - feedback no_change_low / unknown with low or missing → completed
-    - no_change_still_full (high usage, no shrink) → failed
+    - agent_reduced_signals_stale → completed (disk work done; meter lag)
+    - no_change_still_full (high usage, no shrink, no agent reduction) → failed
       (agent ran but did not free context — not CLI-success-equivalent)
     """
     if reduced:
         return "completed"
     fb = (feedback or "").strip()
+    if fb == "agent_reduced_signals_stale":
+        # Compact wrote on agent side; signals lag is not hard failure.
+        return "completed"
     if fb == "no_change_still_full":
         return "failed"
     if fb == "no_change_low":
