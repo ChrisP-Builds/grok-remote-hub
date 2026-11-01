@@ -26,7 +26,13 @@ from hub.harden_policy import (
     redact_for_browser,
     should_auto_restart_agent_on_heal_exhaust,
 )
-from hub.http_guard import GuardPolicy, install_guard, request_has_token
+from hub.http_guard import (
+    AUTH_VIA,
+    TAILSCALE_IDENTITY,
+    GuardPolicy,
+    install_guard,
+    request_has_token,
+)
 from hub.ops_metrics import OpsMetrics
 from hub.fs_browser import (
     RAW_MAX_BYTES,
@@ -57,6 +63,18 @@ from hub.multi_turn import (
     merge_session_flags,
 )
 from hub.prompt_queue import PromptQueue
+from hub.push import (
+    PHONE_SETUP_STEPS,
+    SWEEP_INTERVAL_S,
+    PresenceTracker,
+    Push,
+    PushNotifier,
+    PushTriggers,
+    SubscriptionStore,
+    qr_svg_data_uri,
+    read_serve_active,
+    subscription_origin,
+)
 from hub.session_index import (
     delete_session,
     find_session,
@@ -112,6 +130,8 @@ from hub.skills_index import list_skills
 from hub.version_info import HUB_VERSION, get_cli_version, structural_compat
 
 log = logging.getLogger("hub.server")
+
+SERVE_STATUS_CACHE_S = 30.0
 
 LAST_REMOTE_SESSION_FILE = PROJECT_ROOT / "logs" / "last-remote-session.txt"
 REMOTE_SESSIONS_FILE = PROJECT_ROOT / "data" / "remote-sessions.json"
@@ -263,6 +283,13 @@ class Hub:
         self.acp.on_force_clear = self._on_force_clear
         self.hook_key = config.ensure_hook_secret()
         self._session_cwds: dict[str, str] = {}
+        self.serve_url: str | None = None
+        self._serve_check: tuple[float, bool] | None = None
+        self.presence = PresenceTracker()
+        self.push_triggers = PushTriggers(self.presence)
+        self.push_store = SubscriptionStore()
+        self.notifier = PushNotifier(self.push_store, sub_claim=lambda: self.serve_url)
+        self._push_sweep_task: asyncio.Task | None = None
         self.approvals = ApprovalBroker(
             APPROVAL_RULES_FILE,
             self.broadcast,
@@ -726,6 +753,37 @@ class Hub:
         # Refresh sessionFlags / pendingQuestionSessions so rail shows question.
         await self.broadcast(self.status_payload())
 
+    def _project_dir_for(self, session_id: str) -> str | None:
+        if not session_id:
+            return None
+        known = self._session_cwds.get(session_id) or self._session_root_for(session_id)
+        if known:
+            return known
+        session = find_session(self.config.sessions_root, session_id)
+        return session.cwd if session else None
+
+    def _run_push_trigger(self, decide: Any) -> None:
+        """Push failures are logged, never raised into hub flow."""
+        try:
+            for push in decide() or ():
+                task = asyncio.create_task(self._send_push(push), name="hub-push")
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
+        except Exception:
+            log.exception("push trigger failed")
+
+    async def _send_push(self, push: Push) -> None:
+        try:
+            sent = await self.notifier.send(push.note, urgency=push.urgency, ttl=push.ttl)
+            log.info("push kind=%s sent=%d", push.note.get("kind"), sent)
+        except Exception:
+            log.exception("push send failed")
+
+    async def _push_sweep_loop(self) -> None:
+        while True:
+            await asyncio.sleep(SWEEP_INTERVAL_S)
+            self._run_push_trigger(lambda: self.push_triggers.sweep(time.monotonic()))
+
     async def _on_terminal_out(self, payload: dict[str, Any]) -> None:
         """Fan out hub-hosted terminal/* pump deltas to subscribed UIs."""
         session_id = payload.get("sessionId")
@@ -1173,11 +1231,16 @@ class Hub:
             except Exception:
                 pass
             await self._drop_client(ws)
+        if payload.get("type") in PushTriggers.EVENT_TYPES:
+            self._run_push_trigger(
+                lambda: self.push_triggers.observe(payload, self._project_dir_for, time.monotonic())
+            )
 
     async def _drop_client(self, ws: web.WebSocketResponse) -> None:
         was_present = ws in self.clients
         self.clients.discard(ws)
         self.subscriptions.pop(ws, set())
+        self.presence.drop(ws)
         if was_present:
             try:
                 self.ops.inc("ws_disconnect")
@@ -1732,6 +1795,12 @@ class Hub:
         app.router.add_get("/api/preview/status", self.handle_preview_status)
         # Register before static / so preview paths are not swallowed.
         app.router.add_get("/preview-site/{path:.*}", self.handle_preview_site)
+        app.router.add_get("/api/whoami", self.handle_whoami)
+        app.router.add_get("/api/push/config", self.handle_push_config)
+        app.router.add_post("/api/push/subscribe", self.handle_push_subscribe)
+        app.router.add_post("/api/push/unsubscribe", self.handle_push_unsubscribe)
+        app.router.add_post("/api/push/test", self.handle_push_test)
+        app.router.add_get("/api/phone-setup", self.handle_phone_setup)
         app.router.add_get("/ws", self.handle_ws)
         app.router.add_post("/internal/pre-tool-use", make_pre_tool_use_handler(self.approvals, self.hook_key))
         static_dir = Path(self.config.static_dir)
@@ -1744,6 +1813,13 @@ class Hub:
         return app
 
     async def _on_startup(self, app: web.Application) -> None:
+        try:
+            dropped = self.push_store.drop_stale_token_subscriptions(self.config.hub_token)
+            if dropped:
+                log.info("push: dropped %d subscription(s) made with an old hub token", dropped)
+        except Exception:
+            log.exception("push: stale subscription cleanup failed")
+        self._push_sweep_task = asyncio.create_task(self._push_sweep_loop(), name="hub-push-sweep")
         # CLI version is cheap and useful even if agent is slow
         self.cli_version = await asyncio.to_thread(get_cli_version, self.config.grok_bin)
         write_gate_plugin(
@@ -1791,14 +1867,15 @@ class Hub:
         )
 
     async def _on_cleanup(self, app: web.Application) -> None:
-        task = self._status_resync_task
-        self._status_resync_task = None
-        if task is not None and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._status_resync_task, self._push_sweep_task):
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._status_resync_task = self._push_sweep_task = None
+        self.notifier.close()
         self.site_preview.stop()
         await self.tailer.stop()
         await self.acp.stop()
@@ -2050,6 +2127,71 @@ class Hub:
 
     async def handle_index(self, request: web.Request) -> web.FileResponse:
         return web.FileResponse(Path(self.config.static_dir) / "index.html")
+
+    async def handle_whoami(self, request: web.Request) -> web.Response:
+        identity = request.get(TAILSCALE_IDENTITY) or {}
+        return web.json_response(
+            {"via": request.get(AUTH_VIA), "login": identity.get("login"), "name": identity.get("name")}
+        )
+
+    async def handle_push_config(self, request: web.Request) -> web.Response:
+        return web.json_response(self.notifier.config())
+
+    @staticmethod
+    async def _json_object(request: web.Request) -> dict[str, Any] | None:
+        try:
+            body = await request.json()
+        except Exception:
+            return None
+        return body if isinstance(body, dict) else None
+
+    async def handle_push_subscribe(self, request: web.Request) -> web.Response:
+        body = await self._json_object(request)
+        origin = subscription_origin(
+            request.get(AUTH_VIA), request.get(TAILSCALE_IDENTITY), self.config.hub_token
+        )
+        if body is None or not self.push_store.add(
+            body.get("subscription"), str(body.get("device") or ""), origin
+        ):
+            return web.json_response({"error": "invalid subscription"}, status=400)
+        return web.json_response({"ok": True})
+
+    async def handle_push_unsubscribe(self, request: web.Request) -> web.Response:
+        body = await self._json_object(request)
+        if body is None or not isinstance(body.get("endpoint"), str):
+            return web.json_response({"error": "endpoint required"}, status=400)
+        self.push_store.remove(body["endpoint"])
+        return web.json_response({"ok": True})
+
+    async def handle_push_test(self, request: web.Request) -> web.Response:
+        note = {
+            "title": "Grok Remote Hub",
+            "body": "Notifications are working",
+            "tag": "test",
+            "url": "/",
+            "sessionId": None,
+            "kind": "test",
+        }
+        return web.json_response({"ok": True, "sent": await self.notifier.send(note, ttl=60)})
+
+    async def handle_phone_setup(self, request: web.Request) -> web.Response:
+        url = self.serve_url
+        return web.json_response(
+            {
+                "url": url,
+                "serveActive": await self._serve_active(),
+                "qrDataUri": qr_svg_data_uri(url),
+                "steps": list(PHONE_SETUP_STEPS),
+            }
+        )
+
+    async def _serve_active(self) -> bool:
+        now = time.monotonic()
+        if self._serve_check and now - self._serve_check[0] < SERVE_STATUS_CACHE_S:
+            return self._serve_check[1]
+        active = await asyncio.to_thread(read_serve_active, self.config.bind_port)
+        self._serve_check = (now, active)
+        return active
 
     def _health_body(self) -> dict[str, Any]:
         """Shared FULL health fields for /health (auth) and diagnostics."""
@@ -3344,6 +3486,12 @@ class Hub:
             if not answered:
                 log.info("approval answer ignored; no longer pending id=%s", payload.get("id"))
             return
+        if typ == "presence":
+            sid = payload.get("sessionId")
+            self.presence.update(
+                ws, payload.get("visible") is True, str(sid) if sid else None, time.monotonic()
+            )
+            return
         if typ == "set_approval_mode":
             sid = str(payload.get("sessionId") or "")
             if sid:
@@ -3403,6 +3551,10 @@ class Hub:
                 session_id or "-",
                 state,
                 error,
+            )
+        if state == "running":
+            self._run_push_trigger(
+                lambda: self.push_triggers.turn_started(session_id, also_session_id, time.monotonic())
             )
         payload = {
             "type": "turn",

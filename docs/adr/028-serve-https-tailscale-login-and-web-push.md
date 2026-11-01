@@ -70,3 +70,13 @@ for the calling user and **replaces** a client-forged copy of that header.
 ## Related
 
 - ADR-026 Host/Origin guard; ADR-027 phone approvals
+
+## Notes (2026-11-01)
+
+Review hardening: a page with no input for 2 minutes counts as not visible,
+and the hub re-checks pending approvals and questions every few seconds so a
+nudge still goes out after the desktop is left focused. Subscriptions are
+re-posted on every load, endpoints are limited to the known push services
+with redirects off, and token-created subscriptions are dropped when the
+token changes. The VAPID `sub` claim carries `https://<machine>.<tailnet>.ts.net`,
+so the push services also see the machine name (already public via CT logs).

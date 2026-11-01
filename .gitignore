@@ -51,3 +51,5 @@ node_modules/
 package-lock.json
 npm_install_log.txt
 _release_scan.txt
+# pywebpush curl-mode artifact
+/encrypted.data
