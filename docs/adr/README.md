@@ -52,3 +52,4 @@ a new ADR.
 | 025 | Mobile plan copy/mermaid and session search/recap continuity | Accepted | 2026-08-08 |
 | 026 | Guard Host and Origin, and serve previews as sandboxed capability URLs | Accepted | 2026-10-31 |
 | 027 | Approve risky agent actions from the phone via a hub-owned Grok hook | Accepted | 2026-10-31 |
+| 028 | Serve over Tailscale HTTPS, trust the Tailscale login, and send web push | Accepted | 2026-11-01 |
