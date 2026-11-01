@@ -8,6 +8,8 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from hub.http_guard import (
+    AUTH_VIA,
+    TAILSCALE_IDENTITY,
     GuardPolicy,
     build_allowed_hosts,
     install_guard,
@@ -191,3 +193,88 @@ def test_grok_hook_path_skips_token_but_not_host_check() -> None:
         assert (await client.get("/internal/pre-tool-use")).status in (401, 405)
 
     _run(_loopback_policy(token="s3cret"), scenario)
+
+SERVE = "desk.tailnet.ts.net"
+OWNER = "owner@example.com"
+
+
+def _serve_policy(token: str = "s3cret") -> GuardPolicy:
+    return GuardPolicy(
+        token=token,
+        allowed_hosts=build_allowed_hosts(["127.0.0.1"], None, [SERVE + "."], []),
+        serve_hosts=frozenset({SERVE}),
+        tailscale_logins=frozenset({OWNER}),
+    )
+
+
+def test_trusted_login_requires_loopback_serve_host_and_allowed_login() -> None:
+    from hub.http_guard import trusted_login
+
+    p = _serve_policy()
+    assert trusted_login("127.0.0.1", SERVE, "Owner@Example.com", p) == "Owner@Example.com"
+    assert trusted_login("::1", SERVE + ":443", OWNER, p) == OWNER
+    assert trusted_login("100.64.1.2", SERVE, OWNER, p) is None, "tailnet peer hitting the IP directly"
+    assert trusted_login("127.0.0.1", "127.0.0.1:8787", OWNER, p) is None, "not addressed to Serve"
+    assert trusted_login("127.0.0.1", SERVE, "someone@else.com", p) is None
+    assert trusted_login("127.0.0.1", SERVE, "", p) is None
+    assert trusted_login("127.0.0.1", SERVE, OWNER, GuardPolicy(serve_hosts=frozenset())) is None
+
+
+def test_tailscale_owner_login_parses_status() -> None:
+    from hub.http_guard import tailscale_owner_login
+
+    status = {"Self": {"UserID": 42}, "User": {"42": {"LoginName": OWNER}}}
+    assert tailscale_owner_login(status) == OWNER
+    assert tailscale_owner_login({}) is None
+
+
+def test_serve_request_with_owner_login_needs_no_token() -> None:
+    seen: list = []
+
+    async def whoami(request: web.Request) -> web.Response:
+        seen.append((request.get(AUTH_VIA), request.get(TAILSCALE_IDENTITY)))
+        return web.json_response({"ok": True})
+
+    async def scenario(client: TestClient) -> None:
+        via_serve = {"Host": SERVE, "Tailscale-User-Login": OWNER, "Tailscale-User-Name": "Chris"}
+        assert (await client.get("/api/whoami", headers=via_serve)).status == 200
+        assert seen[-1] == ("tailscale", {"login": OWNER, "name": "Chris"})
+        stranger = {**via_serve, "Tailscale-User-Login": "intruder@example.com"}
+        assert (await client.get("/api/whoami", headers=stranger)).status == 401
+        assert (await client.get("/api/whoami?token=s3cret")).status == 200
+        assert seen[-1] == ("token", None)
+
+    async def run() -> None:
+        app = web.Application()
+        install_guard(app, _serve_policy())
+        app.router.add_get("/api/whoami", whoami)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            await scenario(client)
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_open_mode_marks_auth_via_open() -> None:
+    seen: list = []
+
+    async def whoami(request: web.Request) -> web.Response:
+        seen.append(request.get(AUTH_VIA))
+        return web.json_response({"ok": True})
+
+    async def run() -> None:
+        app = web.Application()
+        install_guard(app, _loopback_policy())
+        app.router.add_get("/api/whoami", whoami)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            assert (await client.get("/api/whoami")).status == 200
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+    assert seen == ["open"]

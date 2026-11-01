@@ -86,6 +86,7 @@ _PUBLIC_STATIC_EXACT = frozenset({
     "/app.css",
     "/favicon.svg",
     "/favicon.ico",
+    "/manifest.webmanifest",
 })
 
 _PUBLIC_ASSET_EXTENSIONS = frozenset({

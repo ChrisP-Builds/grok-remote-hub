@@ -85,6 +85,8 @@ class Config:
     # Extra Host names / exact origins the HTTP guard accepts (ADR-026).
     allowed_hosts: list[str] = field(default_factory=list)
     allowed_origins: list[str] = field(default_factory=list)
+    # Tailscale logins trusted via Serve besides the machine owner (ADR-028).
+    allowed_tailscale_logins: list[str] = field(default_factory=list)
     # When True, after ACP heal attempts exhaust with process up / ACP down and
     # no live turn, call KillAgent-style restart once per process (config-gated).
     auto_restart_agent_on_heal_exhaust: bool = False
@@ -175,6 +177,7 @@ def load_config(path: Path | None = None) -> Config:
         hub_token=str(hub.get("hub_token", "") or ""),
         allowed_hosts=_str_list(hub.get("allowed_hosts")),
         allowed_origins=_str_list(hub.get("allowed_origins")),
+        allowed_tailscale_logins=_str_list(hub.get("allowed_tailscale_logins")),
         auto_restart_agent_on_heal_exhaust=bool(
             hub.get("auto_restart_agent_on_heal_exhaust", False)
         ),

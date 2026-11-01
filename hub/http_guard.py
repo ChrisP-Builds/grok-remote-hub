@@ -6,9 +6,11 @@ API can drive the host. Policy and threat model: ADR-026.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import secrets
 from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import urlsplit
 
 from aiohttp import web
@@ -18,6 +20,8 @@ from hub.harden_policy import is_public_unauthenticated_path
 log = logging.getLogger("hub.guard")
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+AUTH_VIA = web.RequestKey("auth_via", str)
+TAILSCALE_IDENTITY = web.RequestKey("tailscale_identity", dict)
 PREVIEW_PREFIX = "/preview-site/"
 GROK_HOOK_PATH = "/internal/pre-tool-use"
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
@@ -29,6 +33,9 @@ class GuardPolicy:
     token: str = ""
     allowed_hosts: frozenset[str] = LOOPBACK_HOSTS
     allowed_origins: frozenset[str] = field(default_factory=frozenset)
+    # Tailscale Serve name(s) and casefolded logins trusted without a token (ADR-028).
+    serve_hosts: frozenset[str] = field(default_factory=frozenset)
+    tailscale_logins: frozenset[str] = field(default_factory=frozenset)
 
 
 def normalize_host(value: str) -> str:
@@ -112,6 +119,33 @@ def request_has_token(request: web.Request, token: str) -> bool:
     return token_matches(request.rel_url.query.get("token") or "", token)
 
 
+def _is_loopback(remote: str | None) -> bool:
+    try:
+        return ipaddress.ip_address(str(remote or "")).is_loopback
+    except ValueError:
+        return False
+
+
+def trusted_login(
+    remote: str | None, host_header: str | None, login_header: str | None, policy: GuardPolicy
+) -> str | None:
+    """Login vouched for by Tailscale Serve, which replaces any client-sent copy of the header."""
+    login = str(login_header or "").strip()
+    if not login or not _is_loopback(remote):
+        return None
+    if normalize_host(host_header or "") not in policy.serve_hosts:
+        return None
+    return login if login.casefold() in policy.tailscale_logins else None
+
+
+def tailscale_owner_login(status: Any) -> str | None:
+    if not isinstance(status, dict):
+        return None
+    uid = (status.get("Self") or {}).get("UserID")
+    user = (status.get("User") or {}).get(str(uid)) if uid is not None else None
+    return str(user.get("LoginName")) if isinstance(user, dict) and user.get("LoginName") else None
+
+
 def _is_capability_path(method: str, path: str) -> bool:
     """Paths whose handler checks its own key instead of the browser token."""
     if method == "POST" and path == GROK_HOOK_PATH:
@@ -136,10 +170,18 @@ def install_guard(app: web.Application, policy: GuardPolicy) -> None:
             origin = request.headers.get("Origin")
             if not origin_allowed(origin, host, policy.allowed_origins):
                 return _forbidden("forbidden origin", request, origin or "")
-        if not (
+        login = trusted_login(request.remote, host, request.headers.get("Tailscale-User-Login"), policy)
+        if login:
+            request[AUTH_VIA] = "tailscale"
+            request[TAILSCALE_IDENTITY] = {
+                "login": login,
+                "name": request.headers.get("Tailscale-User-Name") or "",
+            }
+        elif request_has_token(request, policy.token):
+            request[AUTH_VIA] = "token" if policy.token else "open"
+        elif not (
             is_public_unauthenticated_path(request.method, request.path)
             or _is_capability_path(request.method, request.path)
-            or request_has_token(request, policy.token)
         ):
             return web.json_response({"error": "unauthorized"}, status=401)
         return await handler(request)

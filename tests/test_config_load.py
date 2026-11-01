@@ -67,3 +67,10 @@ def test_load_config_approval_mode(tmp_path: Path) -> None:
     loaded = load_config(cfg_path)
     assert loaded.approval_mode == "balanced"
     assert loaded.gate_plugin_dir.name == "grok-approval-gate"
+
+def test_load_config_allowed_tailscale_logins(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[hub]\nallowed_tailscale_logins = ["Partner@Example.com"]\n', encoding="utf-8")
+    assert load_config(cfg_path).allowed_tailscale_logins == ["Partner@Example.com"]
+    cfg_path.write_text("[hub]\n", encoding="utf-8")
+    assert load_config(cfg_path).allowed_tailscale_logins == []

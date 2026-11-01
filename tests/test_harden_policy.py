@@ -354,3 +354,9 @@ def test_redact_for_browser_secret_keys_but_not_token_counts() -> None:
 def test_server_redacts_acp_messages_before_broadcast() -> None:
     src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
     assert '"message": redact_for_browser(msg)' in src
+
+
+def test_manifest_and_service_worker_are_public_for_home_screen_install() -> None:
+    assert is_public_unauthenticated_path("GET", "/manifest.webmanifest") is True
+    assert is_public_unauthenticated_path("GET", "/sw.js") is True
+    assert is_public_unauthenticated_path("GET", "/icons/icon-192.png") is True
