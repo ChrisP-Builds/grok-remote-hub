@@ -5,14 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
   <meta name="theme-color" content="#0a0c10" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="Grok Hub" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-  <link rel="apple-touch-icon" href="/favicon.svg" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png" />
   <title>Grok Remote Hub</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/app.css?v=20261031a" />
+  <link rel="stylesheet" href="/app.css?v=20261101a" />
 </head>
 <body style="background:#0a0c10;color:#d6deea">
   <div id="app">
@@ -54,6 +57,21 @@
         <div id="file-empty" class="empty-rail">
           <p>Open a session to browse its project.</p>
         </div>
+      </div>
+      <div id="device-bar" class="device-bar">
+        <div id="push-control" class="push-control" data-state="checking" aria-live="polite">
+          <div class="push-status">
+            <span class="push-icon" aria-hidden="true">🔔</span>
+            <span id="push-label" class="push-label">Notifications</span>
+          </div>
+          <p id="push-detail" class="push-detail muted hidden"></p>
+          <div class="push-actions">
+            <button type="button" id="btn-push-on" class="btn btn-accent btn-sm hidden">Turn on notifications</button>
+            <button type="button" id="btn-push-test" class="btn btn-ghost btn-sm hidden">Send test</button>
+            <button type="button" id="btn-push-off" class="btn btn-ghost btn-sm hidden">Turn off</button>
+          </div>
+        </div>
+        <button type="button" id="btn-phone-setup" class="btn btn-ghost btn-sm phone-setup-btn">Set up phone</button>
       </div>
       <div id="version-badge" class="version-badge" title="Hub and CLI compatibility">
         <span id="compat-dot" class="compat-dot" data-state="unknown" aria-hidden="true"></span>
@@ -363,6 +381,27 @@
     </div>
   </div>
 
+  <div id="modal-phone-setup" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-phone-setup-title">
+    <div class="modal-backdrop" data-close="modal-phone-setup"></div>
+    <div class="modal-card modal-card-phone">
+      <header class="modal-header">
+        <h2 id="modal-phone-setup-title">Set up your phone</h2>
+        <button type="button" class="btn btn-ghost btn-icon" data-close="modal-phone-setup" aria-label="Close">×</button>
+      </header>
+      <p id="phone-setup-warning" class="phone-setup-warning hidden" role="alert">HTTPS address is not active yet</p>
+      <div class="phone-setup-body">
+        <img id="phone-setup-qr" class="phone-setup-qr hidden" alt="QR code for the hub address" width="200" height="200" />
+        <div class="phone-setup-info">
+          <div class="phone-setup-url-row">
+            <code id="phone-setup-url" class="phone-setup-url"></code>
+            <button type="button" id="btn-phone-setup-copy" class="btn btn-ghost btn-sm">Copy</button>
+          </div>
+          <ol id="phone-setup-steps" class="phone-setup-steps"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Fixed outside topbar so overflow:hidden does not clip the bubble -->
   <div id="meta-popover" class="meta-popover hidden" role="tooltip" aria-live="polite"></div>
 
@@ -376,6 +415,6 @@
   <script src="/vendor/marked.min.js"></script>
   <script src="/vendor/purify.min.js"></script>
   <!-- cache-bust: blank-page fix; mermaid loads on demand from app.js when needed -->
-  <script src="/app.js?v=20261031a"></script>
+  <script src="/app.js?v=20261101a"></script>
 </body>
 </html>

@@ -108,9 +108,9 @@ def test_countdown_corrects_server_clock_skew() -> None:
 
 
 def test_cache_bust_token_bumped() -> None:
-    html = _html()
-    assert "/app.css?v=20261031a" in html
-    assert "/app.js?v=20261031a" in html
+    tokens = set(re.findall(r'/app\.(?:css|js)\?v=(\w+)"', _html()))
+    assert len(tokens) == 1
+    assert tokens.pop() >= "20261031a"
 
 
 def test_approvals_block_never_parses_html() -> None:

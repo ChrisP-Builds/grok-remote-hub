@@ -957,6 +957,13 @@
     approvalModes: {},
     approvalDefaultMode: "balanced",
     approvalTick: null,
+    /** null until /api/whoami answers; true when the hub demands a token. */
+    authNeeded: null,
+    whoami: null,
+    push: { config: null, permission: "default", subscribed: false, busy: false, loaded: false, synced: false },
+    presenceSent: "",
+    lastInputAt: Date.now(),
+    userIdle: false,
     turnStartedAt: 0,
     lastTermLineAt: 0,
     stallTimer: null,
@@ -1061,6 +1068,19 @@
     composerHint: $("#composer-hint"),
     approvalStack: $("#approval-stack"),
     approvalMode: $("#approval-mode"),
+    pushControl: $("#push-control"),
+    pushLabel: $("#push-label"),
+    pushDetail: $("#push-detail"),
+    btnPushOn: $("#btn-push-on"),
+    btnPushTest: $("#btn-push-test"),
+    btnPushOff: $("#btn-push-off"),
+    btnPhoneSetup: $("#btn-phone-setup"),
+    modalPhoneSetup: $("#modal-phone-setup"),
+    phoneSetupWarning: $("#phone-setup-warning"),
+    phoneSetupQr: $("#phone-setup-qr"),
+    phoneSetupUrl: $("#phone-setup-url"),
+    btnPhoneSetupCopy: $("#btn-phone-setup-copy"),
+    phoneSetupSteps: $("#phone-setup-steps"),
     slash: $("#slash-palette"),
     btnMenu: $("#btn-menu"),
     btnRailCollapse: $("#btn-rail-collapse"),
@@ -1186,7 +1206,7 @@
 
   function updateAuthTokenBanner() {
     if (!els.authTokenBanner) return;
-    if (hubToken()) {
+    if (hubToken() || state.authNeeded !== true) {
       els.authTokenBanner.classList.add("hidden");
       if (els.authTokenBannerText) els.authTokenBannerText.textContent = "";
       return;
@@ -1465,10 +1485,12 @@
       refreshMetaPopoverContent();
     }
     renderApprovals();
+    sendPresence();
   }
 
   function clearTopbarSessionMeta() {
     renderApprovals();
+    sendPresence();
     if (els.chatTitle) els.chatTitle.textContent = "Select a session";
     if (els.btnRenameSession) els.btnRenameSession.classList.add("hidden");
     if (els.btnCatchUp) els.btnCatchUp.classList.add("hidden");
@@ -2169,6 +2191,7 @@
   function setLivePromptSessionId(sessionId) {
     state.livePromptSessionId = sessionId;
     renderApprovals();
+    sendPresence();
   }
 
   function isHubCreatedSession(sessionId) {
@@ -7383,6 +7406,8 @@
       state.wsState = "open";
       updateStatusPill();
       sendWs({ type: "hello" });
+      sendPresence({ force: true });
+      if (!state.push.loaded) loadPushState();
       resumeAfterReconnect({ wasReconnect });
     });
 
@@ -8319,11 +8344,7 @@
   }
 
   async function focusApprovalSession(sessionId) {
-    if (sessionId && sessionId !== state.selectedId) {
-      const row = (state.sessions || []).find((s) => s && s.sessionId === sessionId);
-      await openSession(row || { sessionId });
-    }
-    if (state.mainMode === "file") closeFileMode({ force: false });
+    await openSessionById(sessionId);
     renderApprovalStack();
   }
 
@@ -8634,6 +8655,444 @@
     renderApprovalMode();
   }
   // End approvals
+
+  // Push and phone setup (ADR-028): service worker, notifications, presence, QR.
+  const PRESENCE_HEARTBEAT_MS = 60000;
+  const SW_READY_TIMEOUT_MS = 10000;
+  const USER_IDLE_MS = 120000;
+  const USER_IDLE_CHECK_MS = 10000;
+  const USER_INPUT_EVENTS = ["pointerdown", "pointermove", "keydown", "touchstart", "wheel", "scroll"];
+
+  async function hubJson(path, init) {
+    const res = await fetch(apiUrl(path), init);
+    let data = null;
+    try {
+      data = await res.json();
+    } catch (_) {}
+    return { ok: res.ok, status: res.status, data: data || {} };
+  }
+
+  function postJson(path, body) {
+    return hubJson(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+  }
+
+  async function openSessionById(sessionId) {
+    if (sessionId && sessionId !== state.selectedId) {
+      const row = (state.sessions || []).find((s) => s && s.sessionId === sessionId);
+      await openSession(row || { sessionId });
+    }
+    if (state.mainMode === "file") closeFileMode({ force: false });
+  }
+
+  function consumeSessionDeepLink() {
+    let url;
+    try {
+      url = new URL(location.href);
+    } catch (_) {
+      return null;
+    }
+    const sessionId = (url.searchParams.get("session") || "").trim();
+    if (!sessionId) return null;
+    url.searchParams.delete("session");
+    try {
+      history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+    } catch (_) {}
+    return sessionId;
+  }
+
+  async function loadWhoami() {
+    try {
+      const res = await fetch(apiUrl("/api/whoami"));
+      if (res.ok) {
+        state.whoami = await res.json();
+        state.authNeeded = false;
+      } else if (res.status === 401 || res.status === 403 || res.status === 404) {
+        state.authNeeded = true;
+      }
+    } catch (_) {}
+    updateAuthTokenBanner();
+  }
+
+  function registerServiceWorker() {
+    if (!(window.isSecureContext && "serviceWorker" in navigator)) return;
+    navigator.serviceWorker.addEventListener("message", onServiceWorkerMessage);
+    navigator.serviceWorker.startMessages();
+    navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(() => {});
+  }
+
+  function onServiceWorkerMessage(event) {
+    const data = event.data || {};
+    if (data.type !== "open-url") return;
+    noteUserInput();
+    try {
+      const url = new URL(String(data.url || "/"), location.origin);
+      if (url.origin !== location.origin) return;
+      const sessionId = url.searchParams.get("session");
+      if (sessionId) openSessionById(sessionId);
+    } catch (_) {}
+  }
+
+  function serviceWorkerReady() {
+    return Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("service worker not ready")), SW_READY_TIMEOUT_MS)
+      ),
+    ]);
+  }
+
+  function isIosDevice() {
+    const ua = navigator.userAgent || "";
+    return /iPhone|iPad|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  }
+
+  function isStandaloneApp() {
+    if (navigator.standalone === true) return true;
+    return !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
+  }
+
+  function pushDeviceLabel() {
+    const ua = navigator.userAgent || "";
+    let device = "Browser";
+    if (/iPhone/.test(ua)) device = "iPhone";
+    else if (isIosDevice()) device = "iPad";
+    else if (/Android/.test(ua)) device = "Android";
+    else if (/Windows/.test(ua)) device = "Windows";
+    else if (/Macintosh/.test(ua)) device = "Mac";
+    else if (/Linux/.test(ua)) device = "Linux";
+    return device + (isStandaloneApp() ? " app" : " browser");
+  }
+
+  function urlBase64ToUint8Array(value) {
+    const padded = value + "=".repeat((4 - (value.length % 4)) % 4);
+    const raw = atob(padded.replace(/-/g, "+").replace(/_/g, "/"));
+    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+  }
+
+  function computePushState() {
+    const p = state.push;
+    if (!window.isSecureContext) return "insecure";
+    if (isIosDevice() && !isStandaloneApp()) return "home-screen";
+    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+      return "unsupported";
+    }
+    if (!p.config) return "checking";
+    if (!p.config.enabled) return "disabled";
+    if (p.permission === "denied") return "blocked";
+    return p.subscribed ? "on" : "off";
+  }
+
+  function pushStateText(st) {
+    switch (st) {
+      case "insecure":
+        return {
+          label: "Notifications unavailable",
+          detail: "Open the https Tailscale address (ends in .ts.net) to get notifications here.",
+        };
+      case "home-screen":
+        return {
+          label: "Add to Home Screen first",
+          detail: "In Safari tap Share, then Add to Home Screen, and open Grok Hub from there.",
+        };
+      case "unsupported":
+        return { label: "Notifications unavailable", detail: "This browser does not support web push." };
+      case "disabled":
+        return {
+          label: "Notifications unavailable",
+          detail: (state.push.config && state.push.config.reason) || "Push is turned off on the hub.",
+        };
+      case "blocked":
+        return {
+          label: "Notifications blocked",
+          detail: isIosDevice()
+            ? "Turn them back on in iOS Settings, Notifications, Grok Hub."
+            : "Allow notifications for this site in the browser's site settings, then reload.",
+        };
+      case "on":
+        return { label: "Notifications on", detail: "" };
+      case "off":
+        return { label: "Notifications off", detail: "" };
+      default:
+        return { label: "Notifications", detail: "" };
+    }
+  }
+
+  function renderPushControl() {
+    if (!els.pushControl) return;
+    const st = computePushState();
+    const text = pushStateText(st);
+    els.pushControl.dataset.state = st;
+    els.pushLabel.textContent = text.label;
+    els.pushDetail.textContent = text.detail;
+    els.pushDetail.classList.toggle("hidden", !text.detail);
+    els.btnPushOn.classList.toggle("hidden", st !== "off");
+    els.btnPushTest.classList.toggle("hidden", st !== "on");
+    els.btnPushOff.classList.toggle("hidden", st !== "on");
+    [els.btnPushOn, els.btnPushTest, els.btnPushOff].forEach((btn) => {
+      btn.disabled = state.push.busy;
+    });
+  }
+
+  async function loadPushState() {
+    const p = state.push;
+    if (!p.loaded) {
+      try {
+        const res = await hubJson("/api/push/config");
+        if (res.ok) {
+          p.config = res.data;
+          p.loaded = true;
+        } else {
+          p.config = { enabled: false, reason: "Could not load push settings from the hub." };
+        }
+      } catch (_) {
+        p.config = { enabled: false, reason: "Could not reach the hub for push settings." };
+      }
+    }
+    if ("Notification" in window) p.permission = Notification.permission;
+    if (window.isSecureContext && "serviceWorker" in navigator && "PushManager" in window) {
+      try {
+        const reg = await navigator.serviceWorker.getRegistration("/");
+        const sub = reg ? await reg.pushManager.getSubscription() : null;
+        p.subscribed = !!sub;
+        if (sub) await syncPushSubscription(reg, sub);
+      } catch (_) {}
+    }
+    renderPushControl();
+  }
+
+  function normalizeBase64Url(value) {
+    return String(value || "").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function subscriptionKey(sub) {
+    const key = sub.options && sub.options.applicationServerKey;
+    if (!key) return "";
+    let raw = "";
+    new Uint8Array(key).forEach((b) => {
+      raw += String.fromCharCode(b);
+    });
+    return normalizeBase64Url(btoa(raw));
+  }
+
+  // Once per page load: heal a hub key rotation or a wiped subscription store.
+  async function syncPushSubscription(reg, sub) {
+    const p = state.push;
+    if (p.synced || Notification.permission !== "granted") return;
+    if (!p.config || !p.config.enabled || !p.config.publicKey) return;
+    p.synced = true;
+    let current = sub;
+    try {
+      if (subscriptionKey(sub) !== normalizeBase64Url(p.config.publicKey)) {
+        await sub.unsubscribe();
+        current = null;
+        current = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(p.config.publicKey),
+        });
+      }
+      await postJson("/api/push/subscribe", {
+        subscription: current.toJSON(),
+        device: pushDeviceLabel(),
+      });
+    } catch (_) {}
+    p.subscribed = !!current;
+  }
+
+  async function enablePush() {
+    const p = state.push;
+    if (p.busy || !p.config || !p.config.publicKey) return;
+    p.busy = true;
+    renderPushControl();
+    let sub = null;
+    try {
+      p.permission = await Notification.requestPermission();
+      if (p.permission !== "granted") return;
+      const reg = await serviceWorkerReady();
+      const options = {
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(p.config.publicKey),
+      };
+      try {
+        sub = await reg.pushManager.subscribe(options);
+      } catch (err) {
+        const stale = await reg.pushManager.getSubscription();
+        if (!stale) throw err;
+        await stale.unsubscribe();
+        sub = await reg.pushManager.subscribe(options);
+      }
+      const res = await postJson("/api/push/subscribe", {
+        subscription: sub.toJSON(),
+        device: pushDeviceLabel(),
+      });
+      if (!res.ok) throw new Error("hub answered " + res.status);
+      p.subscribed = true;
+      p.synced = true;
+      toast("Notifications on for this device", "");
+    } catch (err) {
+      if (sub) sub.unsubscribe().catch(() => {});
+      toast("Could not turn on notifications: " + ((err && err.message) || "error"), "danger");
+    } finally {
+      p.busy = false;
+      renderPushControl();
+    }
+  }
+
+  async function disablePush() {
+    const p = state.push;
+    if (p.busy) return;
+    p.busy = true;
+    renderPushControl();
+    try {
+      const reg = await navigator.serviceWorker.getRegistration("/");
+      const sub = reg && (await reg.pushManager.getSubscription());
+      if (sub) {
+        const endpoint = sub.endpoint;
+        await sub.unsubscribe();
+        await postJson("/api/push/unsubscribe", { endpoint });
+      }
+      p.subscribed = false;
+      toast("Notifications off for this device", "");
+    } catch (_) {
+      toast("Could not turn off notifications", "danger");
+    } finally {
+      p.busy = false;
+      renderPushControl();
+    }
+  }
+
+  async function sendPushTest() {
+    try {
+      const res = await postJson("/api/push/test", {});
+      if (!res.ok) throw new Error(String(res.status));
+      const sent = Number(res.data.sent) || 0;
+      toast(sent ? "Test sent to " + sent + (sent === 1 ? " device" : " devices") : "No devices are subscribed", sent ? "" : "danger");
+    } catch (_) {
+      toast("Could not send a test notification", "danger");
+    }
+  }
+
+  function pageVisible() {
+    return document.visibilityState === "visible" && document.hasFocus() && !state.userIdle;
+  }
+
+  function noteUserInput() {
+    state.lastInputAt = Date.now();
+    if (!state.userIdle) return;
+    state.userIdle = false;
+    sendPresence();
+  }
+
+  function checkUserIdle() {
+    if (state.userIdle || Date.now() - state.lastInputAt < USER_IDLE_MS) return;
+    state.userIdle = true;
+    sendPresence();
+  }
+
+  function sendPresence(opts) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    const msg = { type: "presence", visible: pageVisible(), sessionId: approvalSessionId() || null };
+    const key = msg.visible + "|" + msg.sessionId;
+    if (key === state.presenceSent && !(opts && opts.force)) return;
+    state.presenceSent = key;
+    sendWs(msg);
+  }
+
+  function onPresenceVisibilityChange() {
+    if (document.visibilityState === "visible") noteUserInput();
+    sendPresence();
+    if (document.visibilityState === "visible") loadPushState();
+  }
+
+  function bindPresence() {
+    window.addEventListener("focus", () => {
+      noteUserInput();
+      sendPresence();
+    });
+    window.addEventListener("blur", () => sendPresence());
+    USER_INPUT_EVENTS.forEach((name) => {
+      // Capture so scrolls inside inner panes (which do not bubble) still count.
+      document.addEventListener(name, noteUserInput, { capture: true, passive: true });
+    });
+    setInterval(checkUserIdle, USER_IDLE_CHECK_MS);
+    setInterval(() => {
+      if (document.visibilityState === "visible") sendPresence({ force: true });
+    }, PRESENCE_HEARTBEAT_MS);
+  }
+
+  async function openPhoneSetup() {
+    if (!els.modalPhoneSetup) return;
+    renderPhoneSetup(null);
+    els.modalPhoneSetup.classList.remove("hidden");
+    try {
+      const res = await hubJson("/api/phone-setup");
+      renderPhoneSetup(res.ok ? res.data : { error: true });
+    } catch (_) {
+      renderPhoneSetup({ error: true });
+    }
+  }
+
+  function closePhoneSetup() {
+    if (els.modalPhoneSetup) els.modalPhoneSetup.classList.add("hidden");
+  }
+
+  function renderPhoneSetup(data) {
+    const loading = !data;
+    data = data || {};
+    const url = typeof data.url === "string" ? data.url : "";
+    const qr =
+      typeof data.qrDataUri === "string" &&
+      /^data:image\/(svg\+xml|png);base64,/.test(data.qrDataUri)
+        ? data.qrDataUri
+        : "";
+    els.phoneSetupQr.classList.toggle("hidden", !qr);
+    if (qr) els.phoneSetupQr.src = qr;
+    else els.phoneSetupQr.removeAttribute("src");
+    els.phoneSetupUrl.textContent = loading ? "Loading…" : url || "No HTTPS address yet";
+    els.phoneSetupUrl.dataset.url = url;
+    els.btnPhoneSetupCopy.disabled = !url;
+    let warning = "";
+    if (data.error) warning = "Could not load phone setup from the hub";
+    else if (data.serveActive === false) warning = "HTTPS address is not active yet";
+    els.phoneSetupWarning.textContent = warning;
+    els.phoneSetupWarning.classList.toggle("hidden", !warning);
+    const steps = Array.isArray(data.steps) ? data.steps : [];
+    els.phoneSetupSteps.replaceChildren(
+      ...steps.map((step) => {
+        const li = document.createElement("li");
+        li.textContent = String(step);
+        return li;
+      })
+    );
+  }
+
+  async function copyPhoneSetupUrl() {
+    const url = els.phoneSetupUrl.dataset.url || "";
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast("Address copied", "");
+    } catch (_) {
+      const range = document.createRange();
+      range.selectNodeContents(els.phoneSetupUrl);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      toast("Address selected; press Ctrl+C to copy", "");
+    }
+  }
+
+  function bindPushControls() {
+    if (els.btnPushOn) els.btnPushOn.addEventListener("click", enablePush);
+    if (els.btnPushTest) els.btnPushTest.addEventListener("click", sendPushTest);
+    if (els.btnPushOff) els.btnPushOff.addEventListener("click", disablePush);
+    if (els.btnPhoneSetup) els.btnPhoneSetup.addEventListener("click", openPhoneSetup);
+    if (els.btnPhoneSetupCopy) els.btnPhoneSetupCopy.addEventListener("click", copyPhoneSetupUrl);
+  }
+  // End push
 
   function updateComposerPlaceholder() {
     const ta = els.input;
@@ -11556,6 +12015,11 @@
           closeLightbox();
           return;
         }
+        if (els.modalPhoneSetup && !els.modalPhoneSetup.classList.contains("hidden")) {
+          e.preventDefault();
+          closePhoneSetup();
+          return;
+        }
         if (
           els.modalSitePreview &&
           !els.modalSitePreview.classList.contains("hidden")
@@ -11642,8 +12106,10 @@
         if (id === "modal-ask-user") cancelAskUserQuestion();
         if (id === "modal-site-preview") stopSitePreview();
         if (id === "modal-plan") closePlanModal();
+        if (id === "modal-phone-setup") closePhoneSetup();
       });
     });
+    bindPushControls();
     $$(".site-preview-preset").forEach((btn) => {
       btn.addEventListener("click", () => {
         setSitePreviewDevice(btn.getAttribute("data-device") || "desktop");
@@ -11916,6 +12382,7 @@
     }
 
     document.addEventListener("visibilitychange", () => {
+      onPresenceVisibilityChange();
       if (document.visibilityState !== "visible") return;
       scheduleWakeReconcile("visibility");
     });
@@ -12474,6 +12941,12 @@
     hideUsageBar();
     startHistoryPoll();
     startUsagePoll();
+    const deepLinkId = consumeSessionDeepLink();
+    registerServiceWorker();
+    bindPresence();
+    renderPushControl();
+    loadWhoami();
+    loadPushState();
 
     try {
       if (localStorage.getItem("grh.railCollapsed") === "1" && !isMobile()) {
@@ -12528,8 +13001,9 @@
         subscribeActiveChildrenOfSelected();
         // Restore last selected chat across refresh (desktop + mobile).
         // If id is missing from top-N list, open by id when history exists (P1.11).
-        const saved = loadSelectedSessionMeta();
-        const savedId = saved && saved.sessionId;
+        const stored = loadSelectedSessionMeta();
+        const savedId = deepLinkId || (stored && stored.sessionId);
+        const saved = stored && stored.sessionId === savedId ? stored : null;
         if (savedId && Array.isArray(state.sessions)) {
           const row = state.sessions.find((s) => s && s.sessionId === savedId);
           // Cap restore so a hung attach never blocks connectWs forever.
@@ -12550,7 +13024,7 @@
                 apiUrl(`/api/sessions/${encodeURIComponent(savedId)}/history`)
               );
               if (hRes.status === 404) {
-                clearSelectedSession();
+                if (saved) clearSelectedSession();
               } else if (hRes.ok) {
                 await openWithCap({
                   sessionId: savedId,

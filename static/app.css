@@ -4065,8 +4065,10 @@ a {
     transform: translateX(-105%);
     transition: transform 180ms ease;
     padding-top: var(--safe-t);
+    padding-bottom: var(--safe-b);
     box-shadow: 8px 0 32px rgba(0, 0, 0, 0.4);
     overflow-x: hidden;
+    z-index: 60;
   }
 
   .rail.open {
@@ -4078,7 +4080,7 @@ a {
     position: fixed;
     inset: 0;
     background: rgba(0, 0, 0, 0.5);
-    z-index: 35;
+    z-index: 55;
     border: none;
     padding: 0;
   }
@@ -4521,3 +4523,143 @@ a {
   }
 }
 /* End approvals */
+
+/* Push and phone setup (ADR-028): rail footer device controls, phone setup modal */
+.device-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  min-width: 0;
+}
+
+.push-control {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  font-family: var(--font);
+  font-size: 11.5px;
+}
+
+.push-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+}
+
+.push-control[data-state="off"] .push-status,
+.push-control[data-state="checking"] .push-status,
+.push-control[data-state="insecure"] .push-status,
+.push-control[data-state="unsupported"] .push-status,
+.push-control[data-state="disabled"] .push-status {
+  color: var(--muted);
+}
+
+.push-control[data-state="on"] .push-label {
+  color: var(--ok);
+}
+
+.push-control[data-state="blocked"] .push-label,
+.push-control[data-state="home-screen"] .push-label {
+  color: var(--warn);
+}
+
+.push-detail {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.push-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.push-actions .btn.hidden {
+  display: none;
+}
+
+.phone-setup-btn {
+  align-self: flex-start;
+}
+
+.modal-card-phone {
+  max-width: min(560px, 100%);
+}
+
+.phone-setup-warning {
+  margin: 0 0 10px;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--warn) 55%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--warn) 12%, transparent);
+  color: var(--warn);
+  font-size: 12px;
+}
+
+.phone-setup-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.phone-setup-qr {
+  width: 200px;
+  height: 200px;
+  padding: 8px;
+  background: #fff;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+
+.phone-setup-info {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+.phone-setup-url-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.phone-setup-url {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.phone-setup-steps {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+@media (max-width: 899px) {
+  .phone-setup-btn {
+    display: none;
+  }
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .push-actions .btn {
+    min-height: 40px;
+  }
+}
+/* End push */
