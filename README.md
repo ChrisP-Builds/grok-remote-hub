@@ -153,6 +153,8 @@ http://127.0.0.1:8787          # this PC only
 
 ## Use from your phone
 
+**Recommended (HTTPS + notifications, ADR-028):** enable HTTPS certificates in the Tailscale admin console, run `tailscale serve --bg 8787` once on the PC, then on the desktop hub click **Set up phone** and scan the QR code. On the phone: open the address in Safari, Share, **Add to Home Screen**, open it from the icon and turn on notifications in the sidebar footer. Requests through Tailscale Serve are trusted by your own Tailscale login, so no token is needed there; approvals, agent questions and long turns then buzz the phone even when the app is closed. The steps below (IP address + token) still work as a fallback.
+
 1. Install **Tailscale** on the PC and phone (same account / tailnet).
 2. Start the hub on the PC. Confirm it prints `Hub is up` and health checks show `OK`.
 3. **Once, as Administrator**, open the firewall:
