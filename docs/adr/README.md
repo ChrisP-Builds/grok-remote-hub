@@ -54,3 +54,4 @@ a new ADR.
 | 027 | Approve risky agent actions from the phone via a hub-owned Grok hook | Accepted | 2026-10-31 |
 | 028 | Serve over Tailscale HTTPS, trust the Tailscale login, and send web push | Accepted | 2026-11-01 |
 | 029 | Sequence session events and resume reconnects from an in-memory log | Accepted | 2026-11-01 |
+| 030 | Keep per-session runtime state in one object per session | Accepted | 2026-11-01 |

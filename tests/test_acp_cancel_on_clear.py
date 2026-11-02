@@ -222,7 +222,7 @@ def test_no_output_heal_forces_reload_no_warm_skip() -> None:
     assert "release_load_suppress" not in block
     acp = (ROOT / "hub" / "acp_client.py").read_text(encoding="utf-8")
     assert "def forget_warm_session" in acp
-    assert "_warm_sessions.discard" in acp
+    assert "rt.warm = False" in acp
     assert "async def wait_load_suppress_settled" in acp
 
 

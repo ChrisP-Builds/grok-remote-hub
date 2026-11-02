@@ -126,6 +126,7 @@ from hub.session_policy import (
     should_auto_retry_no_output,
     turn_telemetry,
 )
+from hub.session_runtime import SessionRuntimes, compact_gate_map
 from hub.session_tailer import EventDedupe, SessionTailer
 from hub.skills_index import list_skills
 from hub.version_info import HUB_VERSION, get_cli_version, structural_compat
@@ -271,12 +272,15 @@ class Hub:
         # Background WS work (prompt/cancel) so the receive loop can process pings.
         self._bg_tasks: set[asyncio.Task] = set()
         self.supervisor = AgentSupervisor(config, self.secret, on_status=self._on_agent_status)
+        # Per-session runtime state shared with AcpClient: ADR-030.
+        self.runtimes = SessionRuntimes()
         self.acp = AcpClient(
             config,
             self.secret,
             on_message=self._on_acp_message,
             on_connection=self._on_acp_connection,
             log_dir=getattr(config, "log_dir", None),
+            runtimes=self.runtimes,
         )
         self.acp.on_user_question = self._on_user_question
         self.acp.on_terminal_out = self._on_terminal_out
@@ -300,11 +304,7 @@ class Hub:
         self.acp.exec_gate = self.approvals.exec_refusal
         # Process-local ops counters + event ring (never external backends).
         self.ops = OpsMetrics(log_dir=getattr(config, "log_dir", None))
-        # Debounce status broadcasts from high-rate bg activity (e.g. 8s subagent_progress).
-        self._bg_status_broadcast_at: dict[str, float] = {}
         self._had_bg_activity = False
-        # Last ops-reported bg phase per session (transition-only counters).
-        self._ops_bg_phase: dict[str, str] = {}
         self._last_acp_quality: str | None = None
         self._last_heal_skip_reason: str | None = None
         self._acp_dedupe = EventDedupe(maxlen=2000)
@@ -338,9 +338,7 @@ class Hub:
         self._last_broadcast_force_clear: str | None = None
         # Hub-owned /compact gate: sid → monotonic deadline (in-flight + post grace).
         # While active, notification path skips terminal/started compact broadcasts.
-        self._hub_compact_gate: dict[str, float] = {}
-        # sid → agent compact tokens from auto_compact_* (stashed even under gate).
-        self._agent_compact_tokens: dict[str, dict[str, int | None]] = {}
+        self._hub_compact_gate = compact_gate_map(self.runtimes)
         self.cli_version: str | None = None
         self.compat: dict[str, Any] = {
             "ok": False,
@@ -815,6 +813,21 @@ class Hub:
         except Exception:
             log.debug("ops force_clear hook failed", exc_info=True)
 
+    def _clear_ops_bg_phase(self, session_id: str) -> None:
+        rt = self.runtimes.get(session_id)
+        if rt is not None:
+            rt.ops_bg_phase = None
+            self.runtimes.prune(session_id)
+
+    def _pop_agent_compact_tokens(self, session_id: str) -> dict[str, int | None] | None:
+        rt = self.runtimes.get(session_id)
+        if rt is None:
+            return None
+        tokens = rt.compact.agent_tokens
+        rt.compact.agent_tokens = None
+        self.runtimes.prune(session_id)
+        return tokens
+
     async def _on_session_activity(
         self, session_id: str, kind: str | None
     ) -> None:
@@ -834,7 +847,7 @@ class Hub:
                 self.ops.emit(
                     "bg_cleared", sessionId=session_id_slice(sid)
                 )
-                self._ops_bg_phase.pop(sid, None)
+                self._clear_ops_bg_phase(sid)
             except Exception:
                 log.debug("ops bg_cleared failed", exc_info=True)
             try:
@@ -860,9 +873,10 @@ class Hub:
             return
         phase = self.acp.bg_activity_phase_for(sid)
         try:
-            prev = self._ops_bg_phase.get(sid)
+            rt = self.runtimes.get(sid)
+            prev = rt.ops_bg_phase if rt is not None else None
             if phase in ("working", "stuck") and phase != prev:
-                self._ops_bg_phase[sid] = phase
+                self.runtimes.get_or_create(sid).ops_bg_phase = phase
                 if phase == "working":
                     self.ops.inc("bg_activity_working")
                     self.ops.emit(
@@ -874,7 +888,7 @@ class Hub:
                         "bg_stuck", sessionId=session_id_slice(sid)
                     )
             elif phase not in ("working", "stuck"):
-                self._ops_bg_phase.pop(sid, None)
+                self._clear_ops_bg_phase(sid)
         except Exception:
             log.debug("ops bg phase failed", exc_info=True)
         label = bg_activity_label(kind)
@@ -891,11 +905,13 @@ class Hub:
             )
         except Exception:
             log.debug("activity broadcast failed session=%s", sid, exc_info=True)
+        # Debounce status broadcasts from high-rate bg activity (e.g. 8s subagent_progress).
         now = time.monotonic()
-        last = self._bg_status_broadcast_at.get(sid, 0.0)
-        if (now - last) < 1.0:
+        runtime = self.runtimes.get_or_create(sid)
+        until = runtime.bg_status_debounce_until
+        if until is not None and now < until:
             return
-        self._bg_status_broadcast_at[sid] = now
+        runtime.bg_status_debounce_until = now + 1.0
         try:
             await self.broadcast(self.status_payload())
         except Exception:
@@ -1068,7 +1084,7 @@ class Hub:
         if body["state"] in ("completed", "failed") and (
             agent_before is not None or agent_after is not None
         ):
-            self._agent_compact_tokens[sid] = {
+            self.runtimes.get_or_create(sid).compact.agent_tokens = {
                 "tokensBefore": agent_before
                 if isinstance(agent_before, int)
                 else None,
@@ -2756,6 +2772,9 @@ class Hub:
 
         self.acp_created_sessions.discard(session_id)
         self._acp_dedupe.clear_session(session_id)
+        runtime = self.runtimes.get(session_id)
+        if runtime is not None and not runtime.is_busy():
+            self.runtimes.drop(session_id)
         removed_keys = [
             key
             for key, sid in list(self.remote_agent_session.items())
@@ -4089,7 +4108,7 @@ class Hub:
         before_used = signals_before.get("contextTokensUsed")
         before_window = signals_before.get("contextWindowTokens")
         # Drop any stale stash from a prior compact for this session.
-        self._agent_compact_tokens.pop(session_id, None)
+        self._pop_agent_compact_tokens(session_id)
         await self.broadcast(
             {
                 "type": "compact",
@@ -4136,7 +4155,7 @@ class Hub:
                 if sig.get("contextWindowTokens") is not None:
                     after_window = sig.get("contextWindowTokens")
             # Prefer stashed notification agent tokens; fall back to RPC result.
-            stashed = self._agent_compact_tokens.pop(session_id, None) or {}
+            stashed = self._pop_agent_compact_tokens(session_id) or {}
             agent_before = stashed.get("tokensBefore")
             agent_after = stashed.get("tokensAfter")
             if agent_before is None:

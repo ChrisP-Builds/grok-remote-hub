@@ -548,7 +548,7 @@ def test_server_execute_compact_reads_signals_and_resolves() -> None:
     assert "agent_before" in block
     assert "agent_after" in block
     assert "parse_compact_rpc_tokens" in block
-    assert "_agent_compact_tokens" in block
+    assert "_pop_agent_compact_tokens" in block
     assert '"message"' in block or "'message'" in block
     assert "state" in block and "completed" in block
     assert '"failed"' in block or "'failed'" in block
@@ -785,7 +785,7 @@ def test_server_hub_compact_gate_suppresses_notification_terminal() -> None:
     assert "_hub_compact_gate" in emit_block
     assert "time.monotonic()" in emit_block
     # Stash agent tokens even when gate suppresses broadcast.
-    assert "_agent_compact_tokens" in emit_block
+    assert "compact.agent_tokens" in emit_block
     assert '"completed", "failed"' in emit_block or "'completed', 'failed'" in emit_block
     # While gate active: still refresh usage on completed, do not broadcast compact.
     assert 'body["state"] == "completed"' in emit_block

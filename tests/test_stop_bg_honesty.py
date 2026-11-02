@@ -13,23 +13,25 @@ def _client() -> AcpClient:
     return AcpClient(Config(), secret="test-secret-stop-bg")
 
 
+def _bg(client: AcpClient, sid: str):
+    rt = client.runtimes.get(sid)
+    return rt.background if rt is not None else None
+
+
 def test_end_turn_pops_bg_activity_for_session() -> None:
     async def run() -> None:
         client = _client()
         sid = "stop-bg-sid-1"
         client._register_active_turn(sid)
         client.note_bg_activity(sid, kind="subagent_progress", now=100.0)
-        assert sid in client._bg_activity_at
+        assert _bg(client, sid) is not None
         assert client.bg_activity_phase_for(sid, now=100.0) in ("working", "stuck")
 
         client.notify_agent_cancel = AsyncMock(return_value=True)  # type: ignore[method-assign]
         result = await client.end_turn(sid, "user cancel")
         assert result["cancelled"] is True
         assert result["cleared"] is True
-        assert sid not in client._bg_activity_at
-        assert sid not in client._bg_activity_started_at
-        assert sid not in client._bg_activity_kind
-        assert sid not in client._bg_activity_rich_at
+        assert _bg(client, sid) is None
         assert client.bg_activity_phase_for(sid, now=101.0) == "idle"
         assert sid not in client.active_turns
 
@@ -46,7 +48,7 @@ def test_end_turn_clears_bg_even_when_cancel_fails() -> None:
         result = await client.end_turn(sid, "user cancel")
         assert result["cancelled"] is False
         assert result["cleared"] is True
-        assert sid not in client._bg_activity_at
+        assert _bg(client, sid) is None
 
     asyncio.run(run())
 
@@ -62,10 +64,9 @@ def test_end_turn_all_sessions_clear_bg_activity() -> None:
         client.notify_agent_cancel = AsyncMock(return_value=True)  # type: ignore[method-assign]
         result = await client.end_turn(None, "admin clear all")
         assert result["cleared"] is True
-        assert client._bg_activity_at == {}
-        assert client._bg_activity_started_at == {}
-        assert client._bg_activity_kind == {}
-        assert client._bg_activity_rich_at == {}
+        assert _bg(client, a) is None
+        assert _bg(client, b) is None
+        assert all(rt.background is None for _, rt in client.runtimes.items())
 
     asyncio.run(run())
 
