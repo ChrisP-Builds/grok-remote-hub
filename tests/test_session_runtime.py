@@ -415,6 +415,33 @@ def test_deleting_a_busy_session_reclaims_its_runtime_once_the_turn_ends(
     asyncio.run(run())
 
 
+def test_deleting_a_session_denies_its_pending_approval_cards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card left open for a deleted session could still be approved from the phone."""
+    hub = _hub(tmp_path, monkeypatch)
+    sid = "019f06ee-305f-7903-b295-d706c08f0b4f"
+    _write_session(tmp_path / "sessions", sid)
+
+    async def run() -> None:
+        decision = asyncio.create_task(hub.approvals.decide({
+            "sessionId": sid, "cwd": r"D:\Projects\Alpha",
+            "toolName": "run_terminal_command", "toolInput": {"command": "git push origin main"},
+        }))
+        for _ in range(50):
+            if hub.approvals.pending_payload():
+                break
+            await asyncio.sleep(0.01)
+        assert hub.approvals.pending_payload(), "the push should be waiting on a card"
+        resp = await hub.handle_delete_session(SimpleNamespace(match_info={"id": sid}))
+        assert resp.status == 200
+        result = await asyncio.wait_for(decision, timeout=2)
+        assert result["decision"] == "deny"
+        assert not hub.approvals.pending_payload()
+
+    asyncio.run(run())
+
+
 def test_bg_activity_debounce_and_ops_phase_live_on_the_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

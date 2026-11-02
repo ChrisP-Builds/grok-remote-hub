@@ -2768,6 +2768,7 @@ class Hub:
 
         self.acp_created_sessions.discard(session_id)
         self._acp_dedupe.clear_session(session_id)
+        self.approvals.cancel_session(session_id)
         runtime = self.runtimes.get(session_id)
         if runtime is not None:
             if runtime.is_busy():
