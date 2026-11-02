@@ -13,7 +13,7 @@ import pytest
 
 from hub.acp_client import AcpClient
 from hub.config import Config
-from hub.session_policy import is_no_output_error_message, should_auto_retry_no_output
+from hub.session_policy import is_no_output_error_message, should_auto_retry_no_output  # noqa: F401
 
 
 def _client() -> AcpClient:
@@ -83,6 +83,63 @@ def test_stall_watchdog_loop_force_clears_zero_update_turn() -> None:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+    asyncio.run(run())
+
+
+def test_watchdog_end_honoured_by_the_agent_still_reaches_the_prompt_path() -> None:
+    """Grok answers the cancelled prompt normally; the stall must still be reported, retried, and
+    its bg stamps dropped, with no force-clear claimed."""
+
+    async def run() -> None:
+        from hub.acp_client import TurnEndedError
+
+        client = _client()
+        sid = "watchdog-honoured-sid"
+        client.note_bg_activity(sid, kind="tool_call")
+        prompt_reply = asyncio.get_running_loop().create_future()
+
+        async def request(method: str, params: dict | None = None, timeout: float = 120.0, *, session_id=None):
+            assert method == "session/prompt"
+            return await prompt_reply
+
+        async def send(payload: dict) -> None:
+            if payload.get("method") == "session/cancel" and not prompt_reply.done():
+                prompt_reply.set_result({"stopReason": "cancelled"})
+
+        client.request = request  # type: ignore[method-assign]
+        client._send = send  # type: ignore[method-assign]
+        with pytest.raises(TurnEndedError) as info:
+            await client.session_prompt(sid, "hi", allow_load=False, no_output_seconds=0.3)
+        assert "no ACP session/update" in str(info.value)
+        assert is_no_output_error_message(info.value)
+        assert should_auto_retry_no_output(info.value, already_retried=False)
+        assert sid not in client.active_turns
+        assert client.last_force_clear_reason is None
+        for _ in range(40):
+            if _bg(client, sid) is None:
+                break
+            await asyncio.sleep(0.05)
+        assert _bg(client, sid) is None
+        assert client.runtimes.get(sid) is None
+
+    asyncio.run(run())
+
+
+def test_prompt_completed_by_the_agent_returns_its_result() -> None:
+    """Only a hub-ended turn raises; a normal completion still returns the agent's reply."""
+
+    async def run() -> None:
+        client = _client()
+        sid = "completed-sid"
+
+        async def request(method: str, params: dict | None = None, timeout: float = 120.0, *, session_id=None):
+            return {"stopReason": "end_turn"}
+
+        client.request = request  # type: ignore[method-assign]
+        assert await client.session_prompt(sid, "hi", allow_load=False) == {"stopReason": "end_turn"}
+        assert sid not in client.active_turns
+        assert client.runtimes.get(sid) is None
 
     asyncio.run(run())
 

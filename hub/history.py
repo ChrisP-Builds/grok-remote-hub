@@ -491,14 +491,7 @@ def load_session_history(
     return parse_updates_jsonl(updates, max_messages=max_messages) if updates else []
 
 
-def history_etag(
-    sessions_root: Path,
-    session_id: str,
-    session_path: str | Path | None,
-    max_messages: int,
-) -> str | None:
-    """Strong ETag for a session's history: the source file's identity plus how it is rendered."""
-    updates = _updates_path(sessions_root, session_id, session_path)
+def _etag_for(updates: Path | None, max_messages: int) -> str | None:
     if updates is None:
         return None
     try:
@@ -506,3 +499,21 @@ def history_etag(
     except OSError:
         return None
     return f'"h{HISTORY_FORMAT}-{st.st_mtime_ns:x}-{st.st_size:x}-{max_messages}"'
+
+
+def history_etag(
+    sessions_root: Path,
+    session_id: str,
+    session_path: str | Path | None,
+    max_messages: int,
+) -> str | None:
+    """Strong ETag for a session's history: the source file's identity plus how it is rendered."""
+    return _etag_for(_updates_path(sessions_root, session_id, session_path), max_messages)
+
+
+def resolve_history(
+    sessions_root: Path, session_id: str, max_messages: int
+) -> tuple[Path | None, str | None]:
+    """One blocking disk pass for the history endpoint: the updates file (or None) and its ETag."""
+    updates = _updates_path(sessions_root, session_id, None)
+    return updates, _etag_for(updates, max_messages)

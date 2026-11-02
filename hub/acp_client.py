@@ -60,6 +60,24 @@ log = logging.getLogger("hub.acp")
 
 MessageCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
+# Agent requests that block for the lifetime of a command run off the receive loop (ADR-031).
+_OFF_LOOP_CLIENT_METHODS = frozenset({"terminal/wait_for_exit", "terminal/waitForExit"})
+
+
+class TurnEndedError(RuntimeError):
+    """The hub ended this turn (Stop, watchdog, admin) and the agent confirmed it; see ADR-031."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"Turn ended by hub: {reason}")
+        self.reason = reason
+
+
+def _running_task() -> asyncio.Task | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
 
 def _bg_phase(
     bg: BackgroundActivity | None,
@@ -84,6 +102,7 @@ def _bg_phase(
 __all__ = (
     "AcpClient",
     "StdioJsonRpcTransport",
+    "TurnEndedError",
     "NO_OUTPUT_SECONDS",
     "MID_TURN_STALL_SECONDS",
     "MAX_TURN_SECONDS",
@@ -269,6 +288,7 @@ class AcpClient:
         self._terminals = TerminalManager()
         # Pending _x.ai/ask_user_question futures keyed by str(msg_id).
         self._pending_user_questions: dict[str, asyncio.Future] = {}
+        self._client_request_tasks: set[asyncio.Task] = set()
         # Hub sets this to fan out user_question events to the web UI.
         self.on_user_question: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None
         # Hub sets this to fan out live terminal/* pump deltas to the web UI.
@@ -722,7 +742,7 @@ class AcpClient:
     def _detach_stall_watchdog(self, rt: SessionRuntime) -> None:
         wd = rt.stall_watchdog
         rt.stall_watchdog = None
-        if wd is not None and not wd.done():
+        if wd is not None and not wd.done() and wd is not _running_task():
             wd.cancel()
         self.runtimes.prune(rt.session_id)
 
@@ -1154,6 +1174,9 @@ class AcpClient:
             except asyncio.CancelledError:
                 pass
         self._recv_task = None
+        for task in list(self._client_request_tasks):
+            task.cancel()
+        self._client_request_tasks.clear()
         for fut in list(self._pending.values()):
             if not fut.done():
                 fut.set_exception(ConnectionError("ACP connection closed"))
@@ -1228,7 +1251,7 @@ class AcpClient:
                 kwargs: dict[str, Any] = {
                     "stdin": asyncio.subprocess.PIPE,
                     "stdout": asyncio.subprocess.PIPE,
-                    "stderr": asyncio.subprocess.PIPE,
+                    "stderr": asyncio.subprocess.DEVNULL,
                 }
                 if sys.platform == "win32":
                     # Keep pipes (not detached); hide console window only.
@@ -1446,17 +1469,31 @@ class AcpClient:
         )
         self.note_activity(str(sid) if sid else None)
 
+        # Spawn task so the ACP recv loop keeps processing while the UI answers.
+        if "ask_user_question" in method_l:
+            asyncio.create_task(
+                self._handle_ask_user_question(msg_id, params),
+                name=f"acp-ask-user-{msg_id!s}"[:48],
+            )
+            return
+        if method in _OFF_LOOP_CLIENT_METHODS:
+            self._spawn_client_request(msg_id, method, params)
+            return
+        await self._serve_client_request(msg_id, method, params)
+
+    def _spawn_client_request(self, msg_id: Any, method: str, params: dict[str, Any]) -> None:
+        task = asyncio.create_task(
+            self._serve_client_request(msg_id, method, params),
+            name=f"acp-client-req-{msg_id!s}"[:48],
+        )
+        self._client_request_tasks.add(task)
+        task.add_done_callback(self._client_request_tasks.discard)
+
+    async def _serve_client_request(self, msg_id: Any, method: str, params: dict[str, Any]) -> None:
+        method_l = method.lower()
         try:
             if "permission" in method_l or method_l.endswith("request_permission"):
                 await self._handle_permission(msg_id, params)
-                return
-
-            # Spawn task so the ACP recv loop keeps processing while the UI answers.
-            if "ask_user_question" in method_l:
-                asyncio.create_task(
-                    self._handle_ask_user_question(msg_id, params),
-                    name=f"acp-ask-user-{msg_id!s}"[:48],
-                )
                 return
 
             if method in ("fs/read_text_file", "fs/readTextFile"):
@@ -1523,6 +1560,8 @@ class AcpClient:
         except ValueError as exc:
             log.warning("ACP client request %s: %s", method, exc)
             await self._reply_error(msg_id, -32602, str(exc))
+        except ConnectionError as exc:
+            log.debug("ACP client request %s reply dropped, not connected: %s", method, exc)
         except Exception as exc:
             log.exception("ACP client request %s failed: %s", method, exc)
             await self._reply_error(msg_id, -32000, f"{type(exc).__name__}: {exc}")
@@ -2059,9 +2098,9 @@ class AcpClient:
                     max_turn_seconds=MAX_TURN_SECONDS,
                 )
                 if reason:
-                    # Cancel agent first (bounded), then local clear — never
-                    # unlock-only or fire-and-forget cancel after clear.
-                    await self.end_turn(session_id, reason)
+                    # Shielded: the prompt task cancels this watchdog as soon as the
+                    # agent ends the turn, and end_turn must still finish (ADR-031).
+                    await asyncio.shield(self.end_turn(session_id, reason))
                     return
         except asyncio.CancelledError:
             return
@@ -2071,17 +2110,26 @@ class AcpClient:
                 rt.stall_watchdog = None
                 self.runtimes.prune(session_id)
 
-    def _register_active_turn(self, session_id: str, cwd_key: str = "") -> None:
+    def _register_active_turn(self, session_id: str, cwd_key: str = "") -> dict[str, Any]:
         now = time.monotonic()
-        self.active_turns[session_id] = {
+        meta: dict[str, Any] = {
             "started_at": now,
             "last_activity": now,
             "saw_update": False,
             "first_update_at": None,
             "cwd_key": str(cwd_key or ""),
         }
+        self.active_turns[session_id] = meta
+        return meta
 
-    def _clear_active_turn(self, session_id: str) -> None:
+    def _turn_meta(self, session_id: str) -> dict[str, Any] | None:
+        rt = self.runtimes.get(session_id)
+        return rt.turn if rt is not None else None
+
+    def _clear_active_turn(self, session_id: str, meta: dict[str, Any] | None = None) -> None:
+        """Pop the session's turn and its watchdog; with meta, only while that is still the turn."""
+        if meta is not None and self._turn_meta(session_id) is not meta:
+            return
         self.active_turns.pop(session_id, None)
         self._cancel_stall_watchdog(session_id)
 
@@ -2163,7 +2211,7 @@ class AcpClient:
             await self.wait_load_suppress_settled(session_id)
         # Idempotent if quiet timer already released suppress.
         self.release_load_suppress(session_id)
-        self._register_active_turn(session_id, key)
+        meta = self._register_active_turn(session_id, key)
         self._cancel_stall_watchdog(session_id)
         # Always run continuous stall watchdog for mid-turn / max duration.
         self.runtimes.get_or_create(session_id).stall_watchdog = asyncio.create_task(
@@ -2201,9 +2249,6 @@ class AcpClient:
                 timeout=float(MAX_TURN_SECONDS),
                 session_id=session_id,
             )
-            log.info("Prompt end session=%s ok", session_id)
-            self._trace("prompt_end", sessionId=session_id_slice(session_id), ok=True)
-            return result
         except Exception as exc:
             log.warning("Prompt end session=%s error: %s", session_id, exc)
             self._trace(
@@ -2214,7 +2259,20 @@ class AcpClient:
             )
             raise
         finally:
-            self._clear_active_turn(session_id)
+            self._clear_active_turn(session_id, meta)
+        ended_by_hub = meta.get("end_reason")
+        if ended_by_hub:
+            log.info("Prompt end session=%s ended by hub: %s", session_id, ended_by_hub)
+            self._trace(
+                "prompt_end",
+                sessionId=session_id_slice(session_id),
+                ok=False,
+                error=f"ended by hub: {ended_by_hub}"[:200],
+            )
+            raise TurnEndedError(str(ended_by_hub))
+        log.info("Prompt end session=%s ok", session_id)
+        self._trace("prompt_end", sessionId=session_id_slice(session_id), ok=True)
+        return result
 
     async def notify_agent_cancel(self, session_id: str) -> bool:
         """Send the ACP session/cancel notification; True once it is on the wire.
@@ -2294,13 +2352,24 @@ class AcpClient:
         cancel_timeout: float,
     ) -> dict:
         cancelled = False
+        replaced = False
         if session_id is not None:
-            cancelled = await self._cancel_and_await_turn_end(
-                str(session_id), cancel_timeout
-            )
+            sid = str(session_id)
+            # The prompt path reads this to report a hub-ended turn even when the
+            # agent answers the cancelled prompt normally (ADR-031).
+            target = self._turn_meta(sid)
+            if target is not None:
+                target.setdefault("end_reason", reason)
+            cancelled = await self._cancel_and_await_turn_end(sid, cancel_timeout)
+            current = self._turn_meta(sid)
+            replaced = target is not None and current is not None and current is not target
         else:
             # All sessions: best-effort cancel each active id within budget.
             sids = list(self.active_turns.keys())
+            for sid in sids:
+                target = self._turn_meta(sid)
+                if target is not None:
+                    target.setdefault("end_reason", reason)
             if sids:
                 per = max(0.3, float(cancel_timeout) / max(len(sids), 1))
                 any_ok = False
@@ -2315,6 +2384,10 @@ class AcpClient:
                         pass
                 cancelled = any_ok
 
+        if replaced:
+            # The turn we meant to end is gone and a newer one owns the session now.
+            log.info("end_turn: turn already replaced session=%s reason=%s", str(session_id)[:12], reason)
+            return {"cancelled": cancelled, "cleared": False, "reason": reason}
         cleared = self.force_clear_turn(reason, session_id=session_id)
         # Stop honesty: clear Working/Stuck bg stamps for ended turn(s).
         if session_id is not None:

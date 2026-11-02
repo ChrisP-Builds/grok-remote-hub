@@ -163,6 +163,125 @@ def test_kill_awaited_stops_only_the_commands_the_agent_waits_on() -> None:
     asyncio.run(run())
 
 
+def _pid_alive(pid: int) -> bool:
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    import os
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _force_kill_pid(pid: int) -> None:
+    import os
+    import signal
+    import subprocess
+
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, creationflags=0x08000000)
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+async def _first_pid_in_output(mgr: TerminalManager, tid: str, timeout: float = 15.0) -> int:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        for line in (await mgr.output(tid))["output"].splitlines():
+            if line.strip().isdigit():
+                return int(line.strip())
+        await asyncio.sleep(0.05)
+    raise AssertionError("child never printed its pid: " + (await mgr.output(tid))["output"])
+
+
+async def _until_dead(pid: int, timeout: float = 5.0) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if not _pid_alive(pid):
+            return True
+        await asyncio.sleep(0.05)
+    return not _pid_alive(pid)
+
+
+CHILD_THAT_SLEEPS = "import os, time; print(os.getpid(), flush=True); time.sleep(60)"
+
+
+def test_kill_awaited_ends_the_whole_tree_of_a_shell_command() -> None:
+    """`npm test` style commands are shell grandchildren; killing only the shell left them running
+    and holding the output pipe, so wait_for_exit sat at its 120 s cap after Stop."""
+    quoted = f'"{sys.executable}" -c "{CHILD_THAT_SLEEPS}"'
+    # A space in the command routes it through the platform shell, as the agent's own commands are.
+    command = f"& {quoted}" if sys.platform == "win32" else quoted
+
+    async def run() -> None:
+        mgr = TerminalManager()
+        tid = (await mgr.create({"command": command, "sessionId": "s-tree"}))["terminalId"]
+        child_pid = None
+        try:
+            waiting = asyncio.create_task(mgr.wait_for_exit(tid))
+            child_pid = await _first_pid_in_output(mgr, tid)
+            assert _pid_alive(child_pid)
+            assert await mgr.kill_awaited("s-tree") == 1
+            exit_info = await asyncio.wait_for(waiting, timeout=10.0)
+            assert exit_info["exitCode"] != 0 or exit_info["signal"]
+            assert await _until_dead(child_pid), "grandchild survived Stop"
+        finally:
+            if child_pid is not None and _pid_alive(child_pid):
+                _force_kill_pid(child_pid)
+            await mgr.close_all()
+
+    asyncio.run(run())
+
+
+def test_wait_for_exit_returns_when_the_process_exits_even_if_a_child_keeps_the_pipe() -> None:
+    """A command that leaves a background child behind must not pin wait_for_exit to the output pipe."""
+    spawn_and_exit = (
+        "import os, subprocess, sys; "
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+        "print(p.pid, flush=True)"
+    )
+
+    async def run() -> None:
+        mgr = TerminalManager()
+        tid = (await mgr.create({"command": sys.executable, "args": ["-c", spawn_and_exit], "sessionId": "s-bg"}))[
+            "terminalId"
+        ]
+        child_pid = None
+        try:
+            child_pid = await _first_pid_in_output(mgr, tid)
+            started = asyncio.get_running_loop().time()
+            exit_info = await asyncio.wait_for(mgr.wait_for_exit(tid), timeout=10.0)
+            assert asyncio.get_running_loop().time() - started < 8.0
+            assert exit_info["exitCode"] == 0
+            assert (await mgr.output(tid))["exitStatus"] == {"exitCode": 0, "signal": None}
+            assert _pid_alive(child_pid), "a background child nobody waits on must keep running"
+        finally:
+            if child_pid is not None:
+                _force_kill_pid(child_pid)
+            await mgr.close_all()
+
+    asyncio.run(run())
+
+
 def test_js_handles_terminal_out() -> None:
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     assert 'type === "terminal_out"' in js

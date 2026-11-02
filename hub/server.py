@@ -14,7 +14,7 @@ from typing import Any
 
 from aiohttp import WSMsgType, web
 
-from hub.acp_client import AcpClient
+from hub.acp_client import AcpClient, TurnEndedError
 from hub.agent_supervisor import AgentSupervisor
 from hub.approvals import ApprovalBroker, make_pre_tool_use_handler, write_gate_plugin
 from hub.config import Config, PROJECT_ROOT, TAILSCALE_EXE
@@ -53,7 +53,7 @@ from hub.site_preview import (
     build_preview_plan,
     serve_preview,
 )
-from hub.history import history_etag, load_session_history
+from hub.history import load_session_history, parse_updates_jsonl, resolve_history
 from hub.plan_view import PlanViewError, apply_plan_action, read_session_plan
 from hub.recap_view import build_session_recap_from_disk
 from hub.session_search import session_matches_query
@@ -1281,7 +1281,8 @@ class Hub:
         # lines written while the socket was down (offsets stay mid-file).
 
     def check_auth(self, request: web.Request) -> bool:
-        return request_has_token(request, self.config.hub_token)
+        """Anyone the guard let through as token, Tailscale login or open (ADR-028), or a direct token."""
+        return bool(request.get(AUTH_VIA)) or request_has_token(request, self.config.hub_token)
 
     @staticmethod
     def _cwd_key(cwd: str) -> str:
@@ -2435,43 +2436,33 @@ class Hub:
         except Exception:
             body = {}
         target = str(body.get("sessionId") or "").strip() or None
-        sids = [target] if target else list(self.acp.turn_session_ids)
+        sids = [target] if target else [s for s in self.acp.turn_session_ids if s]
         was = self.acp.turn_running
+        reason = "admin POST /api/admin/reset-turn"
         # Cancel agent then local clear (end_turn), never unlock-only.
-        if target:
-            result = await self.acp.end_turn(
-                target, "admin POST /api/admin/reset-turn"
-            )
-            cleared = bool(result.get("cleared"))
-        else:
-            cleared = False
-            for sid in list(sids):
-                if sid:
-                    result = await self.acp.end_turn(
-                        sid, "admin POST /api/admin/reset-turn"
-                    )
-                    cleared = cleared or bool(result.get("cleared"))
-            # Also clear any unscoped pending if still marked running.
-            if self.acp.turn_running or self.acp.active_turns:
-                cleared = (
-                    self.acp.force_clear_turn(
-                        "admin POST /api/admin/reset-turn"
-                    )
-                    or cleared
-                )
+        cleared_sids: list[str] = []
+        for sid in sids:
+            result = await self.acp.end_turn(sid, reason)
+            if result.get("cleared"):
+                cleared_sids.append(sid)
+        if not target and (self.acp.turn_running or self.acp.active_turns):
+            leftovers = list(self.acp.active_turns.keys())
+            if self.acp.force_clear_turn(reason):
+                cleared_sids.extend(s for s in leftovers if s not in cleared_sids)
+        cleared = bool(cleared_sids)
         if cleared:
             self._last_broadcast_force_clear = self.acp.last_force_clear_reason
-        for sid in sids:
-            if sid:
-                await self.broadcast(
-                    {
-                        "type": "turn",
-                        "sessionId": sid,
-                        "state": "idle",
-                        "error": "Turn reset by admin",
-                    },
-                    session_id=sid,
-                )
+        # A turn the agent already ended has nothing to report; the Stop fallback hits this path.
+        for sid in cleared_sids:
+            await self.broadcast(
+                {
+                    "type": "turn",
+                    "sessionId": sid,
+                    "state": "idle",
+                    "error": "Turn reset by admin",
+                },
+                session_id=sid,
+            )
         # Always push full status so every client re-syncs turn state.
         await self.broadcast(self.status_payload())
         return web.json_response(
@@ -2778,8 +2769,11 @@ class Hub:
         self.acp_created_sessions.discard(session_id)
         self._acp_dedupe.clear_session(session_id)
         runtime = self.runtimes.get(session_id)
-        if runtime is not None and not runtime.is_busy():
-            self.runtimes.drop(session_id)
+        if runtime is not None:
+            if runtime.is_busy():
+                runtime.deleted = True
+            else:
+                self.runtimes.drop(session_id)
         removed_keys = [
             key
             for key, sid in list(self.remote_agent_session.items())
@@ -2805,17 +2799,17 @@ class Hub:
 
     async def handle_history(self, request: web.Request) -> web.Response:
         session_id = request.match_info["id"]
-        session = find_session(self.config.sessions_root, session_id)
-        path = session.path if session else None
         cap = self.config.max_history_messages
+        updates, etag = await asyncio.to_thread(
+            resolve_history, self.config.sessions_root, session_id, cap
+        )
         headers = {"Cache-Control": "private, no-cache"}
-        etag = history_etag(self.config.sessions_root, session_id, path, cap)
         if etag:
             headers["ETag"] = etag
             if etag in (request.headers.get("If-None-Match") or ""):
                 return web.Response(status=304, headers=headers)
-        messages = load_session_history(
-            self.config.sessions_root, session_id, session_path=path, max_messages=cap
+        messages = (
+            await asyncio.to_thread(parse_updates_jsonl, updates, cap) if updates else []
         )
         return web.json_response({"sessionId": session_id, "messages": messages}, headers=headers)
 
@@ -3879,12 +3873,10 @@ class Hub:
         cwd: str,
         cwd_key: str,
     ) -> bool:
-        """Force-clear, heal same session, re-prompt once. True if retry succeeded."""
-        if self.acp.is_session_active(session_id):
-            await self.acp.end_turn(
-                session_id,
-                "no-output recovery: clear stuck turn, same session",
-            )
+        """Heal the same session and re-prompt once. True if the retry succeeded.
+
+        The failed prompt already ended its own turn; any turn on the session now is a newer one.
+        """
         log.warning(
             "no-output: auto-retry starting session=%s (no session/new, no map rewrite)",
             session_id,
@@ -3918,11 +3910,6 @@ class Hub:
                     "skip re-prompt",
                     session_id,
                 )
-                if self.acp.is_session_active(session_id):
-                    await self.acp.end_turn(
-                        session_id,
-                        "no-output recovery: permanent unresumable, skip re-prompt",
-                    )
                 await self._broadcast_turn(
                     session_id,
                     "idle",
@@ -3979,11 +3966,6 @@ class Hub:
                 )
             except Exception:
                 pass
-            if self.acp.is_session_active(session_id):
-                await self.acp.end_turn(
-                    session_id,
-                    f"no-output auto-retry failed: {retry_exc}",
-                )
             # P0.5: do not auto-restart agent solely because process is "up"
             # after a slow/no-output prefill. Fat-session first-byte timeouts
             # must not KillAgent other projects. Operator can still POST
@@ -4431,11 +4413,7 @@ class Hub:
                 )
             except Exception:
                 pass
-            if self.acp.is_session_active(session_id):
-                await self.acp.end_turn(
-                    session_id, f"prompt exception: {exc}"
-                )
-
+            # session_prompt ended its own turn; a turn on the session now belongs to a newer prompt.
             if user_stop:
                 await self._broadcast_turn(
                     session_id, "idle", None, also_session_id=view_session_id
@@ -4466,11 +4444,6 @@ class Hub:
                         if not _auto_retry
                         else NO_OUTPUT_USER_MSG
                     )
-                    if self.acp.is_session_active(session_id):
-                        await self.acp.end_turn(
-                            session_id,
-                            "no-output recovery: clear stuck turn, same session",
-                        )
                     log.warning(
                         "no-output: kept session %s (no session/new, no map rewrite)",
                         session_id,
@@ -4479,7 +4452,7 @@ class Hub:
                     err_msg = MID_TURN_STALL_USER_MSG
                 elif self._is_max_turn_error(exc):
                     err_msg = MAX_TURN_USER_MSG
-                elif "force-cleared" in str(exc).lower():
+                elif isinstance(exc, TurnEndedError) or "force-cleared" in str(exc).lower():
                     err_msg = MID_TURN_STALL_USER_MSG
 
                 if self.acp.last_force_clear_reason:
@@ -4492,15 +4465,6 @@ class Hub:
                 )
                 await self._emit_error(
                     err_msg, session_id=session_id, level="warning"
-                )
-        finally:
-            # Always re-assert idle unlock path via status (success already idled above)
-            if self.acp.is_session_active(session_id):
-                await self.acp.end_turn(
-                    session_id, "prompt finally safeguard"
-                )
-                await self._broadcast_turn(
-                    session_id, "idle", None, also_session_id=view_session_id
                 )
         await self.broadcast(self.status_payload())
 

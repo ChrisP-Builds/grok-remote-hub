@@ -105,6 +105,69 @@ def test_end_turn_kills_the_command_the_agent_is_blocked_on() -> None:
     asyncio.run(run())
 
 
+def test_end_turn_leaves_a_follow_up_turn_alone() -> None:
+    """The agent ends turn A on cancel and a queued prompt starts B before end_turn resumes."""
+
+    async def run() -> None:
+        client = _client()
+        sid = "replaced-turn-sid"
+        client._register_active_turn(sid)
+        first = client.active_turns[sid]
+
+        def agent_ends_a_then_b_starts() -> None:
+            client._clear_active_turn(sid)
+            client._register_active_turn(sid)
+
+        async def send(payload: dict) -> None:
+            asyncio.get_running_loop().call_later(0.02, agent_ends_a_then_b_starts)
+
+        client._send = send  # type: ignore[method-assign]
+        result = await client.end_turn(sid, "user cancel", cancel_timeout=2.0)
+        assert result["cancelled"] is True
+        assert result["cleared"] is False
+        second = client.active_turns.get(sid)
+        assert second is not None and second is not first
+        assert client.last_force_clear_reason is None
+
+    asyncio.run(run())
+
+
+def test_session_prompt_cleanup_leaves_a_replacement_turn_alone() -> None:
+    """A force-clear ends this prompt's turn and a new prompt registers before the task resumes."""
+
+    async def run() -> None:
+        client = _client()
+        sid = "prompt-replaced-sid"
+        replacement_watchdog = asyncio.create_task(asyncio.sleep(30))
+
+        async def request(method: str, params: dict | None = None, timeout: float = 120.0, *, session_id=None):
+            client.force_clear_turn("no ACP session/update for 60.0s after prompt", session_id=sid)
+            client._register_active_turn(sid)
+            client.runtimes.get(sid).stall_watchdog = replacement_watchdog
+            raise TimeoutError("Turn force-cleared: no ACP session/update for 60.0s after prompt")
+
+        client.request = request  # type: ignore[method-assign]
+        try:
+            try:
+                await client.session_prompt(sid, "hi", allow_load=False)
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError("force-cleared prompt must raise")
+            rt = client.runtimes.get(sid)
+            assert rt is not None and rt.turn is not None
+            assert rt.stall_watchdog is replacement_watchdog
+            assert not replacement_watchdog.cancelled()
+        finally:
+            replacement_watchdog.cancel()
+            try:
+                await replacement_watchdog
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(run())
+
+
 def test_end_turn_force_clears_when_the_agent_ignores_cancel() -> None:
     async def run() -> None:
         client = _client()
@@ -253,14 +316,14 @@ def test_no_output_heal_forces_reload_no_warm_skip() -> None:
 
 
 
-def test_no_output_auto_retry_uses_end_turn_no_auto_restart() -> None:
-
+def test_no_output_auto_retry_ends_no_turn_and_never_restarts() -> None:
+    """The failed prompt ended its own turn; any turn on the session now is a newer one (ADR-031)."""
     src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
     idx = src.find("async def _no_output_auto_retry")
     assert idx >= 0
     end = src.find("\n    async def ", idx + 1)
     block = src[idx : end if end > idx else idx + 5000]
-    assert "end_turn" in block
+    assert "end_turn(" not in block
     # First-byte + retry thresholds wired from session_policy
     assert "NO_OUTPUT_RETRY_SECONDS" in block
     assert "no_output_seconds_for_session" in block

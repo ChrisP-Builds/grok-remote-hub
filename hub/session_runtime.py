@@ -61,6 +61,8 @@ class SessionRuntime:
     compact: CompactState = field(default_factory=CompactState)
     ops_bg_phase: str | None = None
     bg_status_debounce_until: float | None = None
+    # Session deleted while busy: sticky facts no longer keep the entry once the work ends.
+    deleted: bool = False
 
     def is_busy(self) -> bool:
         """Work still in progress for this session; a delete must not erase it."""
@@ -77,9 +79,12 @@ class SessionRuntime:
 
     def is_live(self, now: float) -> bool:
         """Busy, or holding a fact that only an explicit clear or an expiry may drop."""
+        if self.is_busy():
+            return True
+        if self.deleted:
+            return False
         return (
-            self.is_busy()
-            or self.warm
+            self.warm
             or self.ops_bg_phase is not None
             or self.compact.agent_tokens is not None
             or _deadline_ahead(self.compact.gate_until, now)

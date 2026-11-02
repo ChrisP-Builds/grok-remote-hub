@@ -393,6 +393,28 @@ def test_delete_drops_an_idle_runtime_and_keeps_a_busy_one(
     asyncio.run(run())
 
 
+def test_deleting_a_busy_session_reclaims_its_runtime_once_the_turn_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sticky facts (warm) kept a deleted session's runtime for the life of the process."""
+    hub = _hub(tmp_path, monkeypatch)
+    busy = "019f06ee-305f-7903-b295-d706c08f0b4f"
+    _write_session(tmp_path / "sessions", busy)
+    rt = hub.runtimes.get_or_create(busy)
+    rt.warm = True
+    rt.ops_bg_phase = "working"
+    hub.acp.active_turns[busy] = {"started_at": 1.0, "last_activity": 1.0, "saw_update": True}
+
+    async def run() -> None:
+        resp = await hub.handle_delete_session(SimpleNamespace(match_info={"id": busy}))
+        assert resp.status == 200
+        assert hub.runtimes.get(busy) is rt, "in-flight work must be left alone"
+        hub.acp.active_turns.pop(busy)
+        assert hub.runtimes.get(busy) is None
+
+    asyncio.run(run())
+
+
 def test_bg_activity_debounce_and_ops_phase_live_on_the_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

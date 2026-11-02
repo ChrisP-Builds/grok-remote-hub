@@ -1681,7 +1681,9 @@ def test_is_user_cancel_error() -> None:
 
     assert is_user_cancel_error(TimeoutError("Turn force-cleared: user cancel"))
     assert is_user_cancel_error("Turn force-cleared: user cancel fallback: boom")
+    assert is_user_cancel_error("Turn ended by hub: admin POST /api/admin/reset-turn")
     assert not is_user_cancel_error(TimeoutError("Turn force-cleared: mid-turn stall 600s"))
+    assert not is_user_cancel_error("Turn ended by hub: no ACP session/update for 60.0s after prompt")
     assert not is_user_cancel_error(None)
 
 

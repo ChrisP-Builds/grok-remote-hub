@@ -339,6 +339,55 @@ def test_history_etag_changes_with_file_and_format(tmp_path: Path) -> None:
     assert history_etag(tmp_path / "sessions", "s1", session, 800) != first
     assert history_etag(tmp_path / "sessions", "missing", None, 800) is None
 
+def test_history_endpoint_resolves_the_session_once_off_the_event_loop(tmp_path: Path, monkeypatch) -> None:
+    """Every history poll globbed and parsed each summary.json on the loop thread before the ETag check."""
+    import asyncio
+    import threading
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import hub.server as server_mod
+    from hub.history import resolve_history
+    from tests.test_ws_resume import _hub
+
+    session = tmp_path / "sessions" / "s-thread"
+    session.mkdir(parents=True)
+    (session / "summary.json").write_text("{}", encoding="utf-8")
+    (session / "updates.jsonl").write_text(_line("agent_message_chunk", content={"type": "text", "text": "hi"}) + "\n", encoding="utf-8")
+    _, app = _hub(tmp_path, monkeypatch)
+
+    def no_scan(*args, **kwargs):
+        raise AssertionError("history must not scan every session summary")
+
+    resolver_threads: list[int] = []
+
+    def counted_resolve(*args, **kwargs):
+        resolver_threads.append(threading.get_ident())
+        return resolve_history(*args, **kwargs)
+
+    monkeypatch.setattr(server_mod, "find_session", no_scan)
+    monkeypatch.setattr(server_mod, "resolve_history", counted_resolve)
+
+    async def run() -> None:
+        loop_thread = threading.get_ident()
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            first = await client.get("/api/sessions/s-thread/history")
+            assert first.status == 200
+            assert (await first.json())["messages"][0]["text"] == "hi"
+            again = await client.get("/api/sessions/s-thread/history", headers={"If-None-Match": first.headers["ETag"]})
+            assert again.status == 304
+            missing = await client.get("/api/sessions/nope/history")
+            assert missing.status == 200 and (await missing.json())["messages"] == []
+        finally:
+            await client.close()
+        assert len(resolver_threads) == 3, "one disk pass per request"
+        assert loop_thread not in resolver_threads
+
+    asyncio.run(run())
+
+
 def test_history_endpoint_answers_304_when_unchanged(tmp_path: Path, monkeypatch) -> None:
     import asyncio
 
