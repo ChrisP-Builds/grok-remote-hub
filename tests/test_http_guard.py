@@ -167,7 +167,8 @@ def test_preview_paths_skip_token_gate_for_capability_check() -> None:
 def test_security_headers_on_responses() -> None:
     async def scenario(client: TestClient) -> None:
         resp = await client.get("/")
-        assert resp.headers.get("Referrer-Policy") == "same-origin"
+        # The SPA URL can carry ?token=, so it must never travel as a referrer.
+        assert resp.headers.get("Referrer-Policy") == "no-referrer"
         assert "frame-ancestors 'self'" in resp.headers.get("Content-Security-Policy", "")
         assert resp.headers.get("X-Content-Type-Options") == "nosniff"
 

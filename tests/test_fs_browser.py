@@ -435,13 +435,16 @@ def test_upload_max_constants() -> None:
     assert UPLOAD_MAX_VIDEO_BYTES == 150_000_000
 
 
-@pytest.mark.parametrize("ctype", ["text/html", "image/svg+xml", "application/xhtml+xml", "text/xml"])
+@pytest.mark.parametrize("ctype", [
+    "text/html", "image/svg+xml", "application/xhtml+xml", "text/xml",
+    "application/rss+xml", "application/atom+xml", "application/octet-stream", "text/html; charset=utf-8",
+])
 def test_raw_headers_sandbox_script_capable_types(ctype: str) -> None:
     """Opening a raw HTML/SVG file must not run its script on the hub origin."""
     assert raw_response_headers(ctype)["Content-Security-Policy"] == "sandbox"
 
 
-@pytest.mark.parametrize("ctype", ["image/png", "video/mp4", "application/pdf", "text/plain"])
+@pytest.mark.parametrize("ctype", ["image/png", "video/mp4", "audio/mpeg", "application/pdf", "text/plain"])
 def test_raw_headers_leave_inert_types_alone(ctype: str) -> None:
     headers = raw_response_headers(ctype)
     assert headers["Content-Type"] == ctype

@@ -66,6 +66,15 @@ def test_require_hub_token_matrix() -> None:
     assert ok is False
 
 
+def test_empty_token_refused_when_a_proxy_name_is_accepted() -> None:
+    """Tailscale Serve proxies tailnet requests from loopback, so a loopback bind is not private."""
+    ok, err = require_hub_token(["127.0.0.1"], "", allowed_hosts=["desk.tailnet.ts.net"])
+    assert ok is False
+    assert err is not None and "allowed_hosts" in err
+    assert require_hub_token(["127.0.0.1"], "", allowed_hosts=["localhost:8787"]) == (True, None)
+    assert require_hub_token(["127.0.0.1"], "s3cret", allowed_hosts=["desk.tailnet.ts.net"]) == (True, None)
+
+
 def test_public_liveness_body_strips_rich_keys() -> None:
     full = {
         "ok": True,
@@ -338,6 +347,20 @@ def test_redact_for_browser_strips_mcp_env_and_headers() -> None:
     assert server["headers"] == [{"name": "Authorization", "value": "[redacted]"}]
     assert server["command"] == "npx"
     assert msg["params"]["mcpServers"][0]["env"][0]["value"] == "fc-not-a-real-key", "input untouched"
+
+
+def test_redact_for_browser_covers_other_mcp_secret_shapes() -> None:
+    server = redact_for_browser({
+        "env": {"STRIPE_KEY": "sk_live_x", "DATABASE_URL": "postgres://u:p@h/db"},
+        "headers": {"X-Custom": "abc"},
+        "args": ["-y", "some-mcp", "--api-key", "sk-123", "--token=t-456", "--port", "9000"],
+        "url": "https://user:pw@mcp.example.com/sse?key=k-789&mode=x",
+    })
+    assert server["env"] == {"STRIPE_KEY": "[redacted]", "DATABASE_URL": "[redacted]"}
+    assert server["headers"] == {"X-Custom": "[redacted]"}
+    assert server["args"] == ["-y", "some-mcp", "--api-key", "[redacted]", "--token=[redacted]", "--port", "9000"]
+    assert server["url"] == "https://mcp.example.com/sse?key=[redacted]&mode=x"
+    assert redact_for_browser({"url": "https://example.com/search?q=grok"})["url"] == "https://example.com/search?q=grok"
 
 
 def test_redact_for_browser_secret_keys_but_not_token_counts() -> None:

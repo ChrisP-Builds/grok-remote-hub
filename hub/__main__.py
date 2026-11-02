@@ -118,7 +118,9 @@ def main(argv: list[str] | None = None) -> int:
         log.error("%s", exc)
         return 2
 
-    token_ok, token_err = require_hub_token(hosts, config.hub_token or "")
+    token_ok, token_err = require_hub_token(
+        hosts, config.hub_token or "", allowed_hosts=config.allowed_hosts
+    )
     if not token_ok:
         log.error("%s", token_err)
         return 2

@@ -59,13 +59,11 @@ def content_type_for(path: Path) -> str:
     return "application/octet-stream"
 
 
-_SCRIPT_CAPABLE_TYPES = frozenset({
-    "text/html",
-    "image/svg+xml",
-    "application/xhtml+xml",
-    "text/xml",
-    "application/xml",
-})
+def _is_inert_type(ctype: str) -> bool:
+    base = ctype.split(";", 1)[0].strip().lower()
+    if base.startswith("image/"):
+        return base != "image/svg+xml"
+    return base.startswith(("video/", "audio/")) or base in ("application/pdf", "text/plain")
 
 
 def raw_response_headers(ctype: str) -> dict[str, str]:
@@ -74,7 +72,7 @@ def raw_response_headers(ctype: str) -> dict[str, str]:
         "Cache-Control": "private, max-age=60",
         "X-Content-Type-Options": "nosniff",
     }
-    if ctype.split(";", 1)[0].strip().lower() in _SCRIPT_CAPABLE_TYPES:
+    if not _is_inert_type(ctype):
         headers["Content-Security-Policy"] = "sandbox"
     return headers
 

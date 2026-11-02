@@ -6,6 +6,7 @@ Stdlib only. No I/O. Unit-testable without aiohttp or server state.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 # Minimal /health body for unauthenticated clients when hub_token is set.
 # Watchdog only needs ok; bootId/uptime/pid/port help ops without leaking traces.
@@ -137,23 +138,37 @@ def is_public_unauthenticated_path(method: str, path: str) -> bool:
     return False
 
 
-def require_hub_token(hosts: list[str], hub_token: str) -> tuple[bool, str | None]:
-    """Validate hub_token against bind hosts.
+def _bare_host(value: str) -> str:
+    h = str(value or "").strip().lower()
+    if h.startswith("["):
+        return h[1:].split("]", 1)[0]
+    return h.split(":", 1)[0] if h.count(":") == 1 else h
 
-    Returns (ok, error_message). error_message is None when ok.
-    """
+
+def require_hub_token(
+    hosts: list[str], hub_token: str, allowed_hosts: list[str] | tuple[str, ...] = ()
+) -> tuple[bool, str | None]:
+    """(ok, error_message) for an empty or set hub_token against bind hosts and proxy names."""
     token = str(hub_token or "").strip()
     if token:
         return True, None
-    if empty_hub_token_allowed(list(hosts or [])):
-        return True, None
-    return (
-        False,
-        "hub_token is required when binding non-loopback hosts (e.g. Tailscale). "
-        "Set hub.hub_token in config.toml to a long random secret, then open the UI "
-        "with ?token=… or Authorization: Bearer …. "
-        "Empty hub_token is only allowed for loopback-only binds (127.0.0.1 / ::1 / localhost).",
-    )
+    if not empty_hub_token_allowed(list(hosts or [])):
+        return (
+            False,
+            "hub_token is required when binding non-loopback hosts (e.g. Tailscale). "
+            "Set hub.hub_token in config.toml to a long random secret, then open the UI "
+            "with ?token=… or Authorization: Bearer …. "
+            "Empty hub_token is only allowed for loopback-only binds (127.0.0.1 / ::1 / localhost).",
+        )
+    proxied = [h for h in allowed_hosts or () if not is_loopback_host(_bare_host(h))]
+    if proxied:
+        return (
+            False,
+            f"hub_token is required when hub.allowed_hosts names a non-loopback host ({', '.join(proxied)}): "
+            "a proxy such as Tailscale Serve forwards those requests from loopback. "
+            "Set hub.hub_token in config.toml to a long random secret.",
+        )
+    return True, None
 
 
 def public_liveness_body(full: dict) -> dict[str, Any]:
@@ -286,25 +301,75 @@ _NAME_VALUE_LIST_KEYS = frozenset({"env", "headers"})
 REDACTED = "[redacted]"
 
 
+_URL_KEYS = frozenset({"url", "uri", "endpoint", "baseurl", "base_url"})
+_SECRET_QUERY_NAMES = frozenset({"key", "code", "sig", "signature", "auth"})
+
+
 def _is_secret_key(key: str) -> bool:
     k = key.lower()
     return any(p in k for p in _SECRET_KEY_PARTS) or k == "token" or k.endswith(_SECRET_KEY_SUFFIXES)
 
 
+def _redact_query_pair(pair: str) -> str:
+    name, sep, _ = pair.partition("=")
+    if sep and (name.lower() in _SECRET_QUERY_NAMES or _is_secret_key(name)):
+        return f"{name}={REDACTED}"
+    return pair
+
+
+def _redact_url(url: str) -> str:
+    """Drop userinfo and blank secret-looking query values; other query text stays readable."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if not parts.scheme or not parts.netloc:
+        return url
+    netloc = parts.netloc.rsplit("@", 1)[-1]
+    query = "&".join(_redact_query_pair(p) for p in parts.query.split("&") if p)
+    return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+
+
+def _redact_args(args: list[Any]) -> list[Any]:
+    out: list[Any] = []
+    hide_next = False
+    for arg in args:
+        if hide_next and isinstance(arg, str):
+            out.append(REDACTED)
+            hide_next = False
+            continue
+        hide_next = False
+        if isinstance(arg, str) and arg.startswith("-"):
+            flag, sep, _ = arg.partition("=")
+            if _is_secret_key(flag.lstrip("-")):
+                out.append(f"{flag}={REDACTED}" if sep else arg)
+                hide_next = not sep
+                continue
+        out.append(redact_for_browser(arg))
+    return out
+
+
 def redact_for_browser(value: Any, _parent_key: str = "") -> Any:
     """Copy of an agent message safe to send to browsers (ADR-026 amendment).
 
-    Blanks env/header values and secret-named string fields; numbers (token counts) pass.
+    Blanks env/header values, secret flags in args, URL credentials and secret-named fields.
     """
     if isinstance(value, dict):
-        if _parent_key in _NAME_VALUE_LIST_KEYS and "value" in value:
-            return {**value, "value": REDACTED}
+        if _parent_key in _NAME_VALUE_LIST_KEYS:
+            if "value" in value:
+                return {**value, "value": REDACTED}
+            return {k: REDACTED if isinstance(v, str) else redact_for_browser(v) for k, v in value.items()}
         out = {}
         for k, v in value.items():
-            if isinstance(v, str) and _is_secret_key(str(k)):
+            key = str(k).lower()
+            if isinstance(v, str) and _is_secret_key(key):
                 out[k] = REDACTED
+            elif isinstance(v, str) and key in _URL_KEYS:
+                out[k] = _redact_url(v)
+            elif isinstance(v, list) and key == "args":
+                out[k] = _redact_args(v)
             else:
-                out[k] = redact_for_browser(v, str(k).lower())
+                out[k] = redact_for_browser(v, key)
         return out
     if isinstance(value, list):
         return [redact_for_browser(v, _parent_key) for v in value]

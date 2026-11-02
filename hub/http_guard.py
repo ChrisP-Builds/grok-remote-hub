@@ -187,7 +187,7 @@ def install_guard(app: web.Application, policy: GuardPolicy) -> None:
         return await handler(request)
 
     async def security_headers(_request: web.Request, response: web.StreamResponse) -> None:
-        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'self'")
 
