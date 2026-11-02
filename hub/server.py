@@ -779,10 +779,13 @@ class Hub:
         except Exception:
             log.exception("push send failed")
 
+    def _sweep_pushes_now(self) -> None:
+        self._run_push_trigger(lambda: self.push_triggers.sweep(time.monotonic()))
+
     async def _push_sweep_loop(self) -> None:
         while True:
             await asyncio.sleep(SWEEP_INTERVAL_S)
-            self._run_push_trigger(lambda: self.push_triggers.sweep(time.monotonic()))
+            self._sweep_pushes_now()
 
     async def _on_terminal_out(self, payload: dict[str, Any]) -> None:
         """Fan out hub-hosted terminal/* pump deltas to subscribed UIs."""
@@ -1241,6 +1244,7 @@ class Hub:
         self.clients.discard(ws)
         self.subscriptions.pop(ws, set())
         self.presence.drop(ws)
+        self._sweep_pushes_now()
         if was_present:
             try:
                 self.ops.inc("ws_disconnect")
@@ -3488,9 +3492,10 @@ class Hub:
             return
         if typ == "presence":
             sid = payload.get("sessionId")
-            self.presence.update(
-                ws, payload.get("visible") is True, str(sid) if sid else None, time.monotonic()
-            )
+            visible = payload.get("visible") is True
+            self.presence.update(ws, visible, str(sid) if sid else None, time.monotonic())
+            if not visible:
+                self._sweep_pushes_now()
             return
         if typ == "set_approval_mode":
             sid = str(payload.get("sessionId") or "")

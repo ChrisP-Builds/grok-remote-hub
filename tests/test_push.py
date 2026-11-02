@@ -536,3 +536,15 @@ def test_server_wires_push_endpoints_presence_and_sweep() -> None:
     assert "drop_stale_token_subscriptions(" in src
     assert "_push_sweep_loop" in src and "self.notifier.close()" in src
     assert "mimetypes" not in src
+
+
+def test_server_sweeps_immediately_when_a_page_goes_away() -> None:
+    """Without this, a hidden or closed page waits up to SWEEP_INTERVAL_S before the phone buzzes."""
+    src = (Path(__file__).resolve().parents[1] / "hub" / "server.py").read_text(encoding="utf-8")
+    presence = src[src.index('if typ == "presence":'):src.index('if typ == "set_approval_mode":')]
+    assert "self._sweep_pushes_now()" in presence
+    assert "visible" in presence
+    drop = src[src.index("async def _drop_client"):src.index("def check_auth")]
+    assert "self._sweep_pushes_now()" in drop
+    loop = src[src.index("async def _push_sweep_loop"):src.index("async def _push_sweep_loop") + 300]
+    assert "self._sweep_pushes_now()" in loop
