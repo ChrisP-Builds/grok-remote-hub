@@ -295,3 +295,30 @@ def test_subagent_events_as_system(tmp_path: Path) -> None:
     assert "subagent spawned" in msgs[0]["text"]
     assert "child-1" in msgs[0]["text"]
     assert "subagent finished" in msgs[1]["text"]
+
+
+def _tool_output_lines(tmp_path: Path, output: str) -> dict:
+    path = tmp_path / "updates.jsonl"
+    content = [{"type": "content", "content": {"type": "text", "text": output}}]
+    path.write_text(
+        _line("tool_call", toolCallId="t1", title="run_terminal_command", rawInput={"command": "x"}) + "\n"
+        + _line("tool_call_update", toolCallId="t1", status="completed", content=content) + "\n",
+        encoding="utf-8",
+    )
+    return parse_updates_jsonl(path)[0]["meta"]
+
+
+def test_tool_output_detail_keeps_full_short_output(tmp_path: Path) -> None:
+    """The turn-end history reload used to replace 30 live output lines with a 120-char snippet."""
+    meta = _tool_output_lines(tmp_path, "\r\n".join(f"n{i}" for i in range(1, 31)))
+    assert meta["detail"].split() == [f"n{i}" for i in range(1, 31)]
+    assert len(meta["summary"]) <= 120
+
+
+def test_tool_output_detail_keeps_tail_of_long_output(tmp_path: Path) -> None:
+    meta = _tool_output_lines(tmp_path, "\n".join(f"line {i}" for i in range(1, 2001)))
+    detail = meta["detail"]
+    assert len(detail) <= 4100
+    assert detail.rstrip().endswith("line 2000")
+    assert "earlier lines omitted" in detail
+    assert "line 1\n" not in detail

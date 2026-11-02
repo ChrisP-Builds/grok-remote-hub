@@ -5308,7 +5308,7 @@
     }
   }
 
-  function createToolLine({ title, status, summary, toolCallId }) {
+  function createToolLine({ title, status, summary, detail, toolCallId }) {
     const row = document.createElement("details");
     row.className = "term-line tool";
     const st = normalizeStatus(status || "pending");
@@ -5344,17 +5344,17 @@
 
     sum.append(prefix, name, pill, oneLiner);
 
-    const detail = document.createElement("div");
-    detail.className = "term-body tool-detail";
-    row.append(sum, detail);
-    setToolDetailBody(row, snip);
+    const body = document.createElement("div");
+    body.className = "term-body tool-detail";
+    row.append(sum, body);
+    setToolDetailBody(row, (detail || "").trim() || snip);
     row._toolTitle = displayTitle;
     row._toolSummary = snip;
     refreshToolPreviewAction(row);
     return row;
   }
 
-  function updateToolLine(row, { title, status, summary }) {
+  function updateToolLine(row, { title, status, summary, detail }) {
     if (!row) return;
     let st = row.dataset.status || "pending";
     if (status != null) {
@@ -5392,7 +5392,7 @@
           oneLiner.textContent = !hideOne ? truncate(plainFull, 80) : "";
           oneLiner.hidden = hideOne;
         }
-        setToolDetailBody(row, full);
+        setToolDetailBody(row, String(detail || "").trim() || full);
       }
     } else if (title) {
       // Title-only update: re-evaluate one-liner redundancy against stored summary.
@@ -5419,6 +5419,7 @@
     if (!summary && textStr && textStr !== title) {
       summary = textStr;
     }
+    const detailText = String(meta.detail || "").trim();
     const st = meta.status || "pending";
     const id = meta.toolCallId || "";
 
@@ -5426,7 +5427,7 @@
     if (id && state.streamBuffers.tools.has(id)) {
       const existing = state.streamBuffers.tools.get(id);
       if (existing && existing.isConnected) {
-        updateToolLine(existing, { title, status: st, summary });
+        updateToolLine(existing, { title, status: st, summary, detail: detailText });
         state.streamBuffers.lastToolTitle = title;
         state.streamBuffers.lastActivityLine = formatActivityLine(title, summary);
         if (!(state._historyBatchDepth > 0)) {
@@ -5441,6 +5442,7 @@
       title,
       status: st,
       summary,
+      detail: detailText,
       toolCallId: id,
     });
     transcriptRoot().appendChild(row);

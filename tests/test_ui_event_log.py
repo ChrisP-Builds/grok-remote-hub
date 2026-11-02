@@ -31,7 +31,7 @@ def _seq_block(js: str) -> str:
 
 def test_cache_bust_bumped_for_app_js() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
-    assert "/app.js?v=20261101c" in html
+    assert "/app.js?v=20261101d" in html
 
 
 def test_pane_tracks_last_seq_and_replay_mark() -> None:
@@ -175,3 +175,10 @@ def test_connect_ws_keeps_a_single_live_socket() -> None:
 
 def test_dead_hub_recovery_forces_reconnect() -> None:
     assert "connectWs({ force: true })" in _body(_js(), "maybeHardRecoverFromDeadHub")
+
+def test_history_tool_rows_show_full_detail_not_the_one_liner() -> None:
+    """History sends a short summary and the fuller output as detail; the expanded body must use detail."""
+    js = _js()
+    assert "detail: detailText" in _body(js, "appendToolLine")
+    assert re.search(r"setToolDetailBody\(row, \(detail \|\| \"\"\)\.trim\(\) \|\| snip\)", _body(js, "createToolLine"))
+    assert 'String(detail || "").trim() || full' in _body(js, "updateToolLine")

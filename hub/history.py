@@ -155,25 +155,37 @@ def tool_summary(update: dict[str, Any], limit: int = 120) -> str:
         return _truncate(str(raw), limit)
 
 
-def _content_snippet(update: dict[str, Any], limit: int = 120) -> str:
+TOOL_DETAIL_LIMIT = 4000
+
+
+def _content_parts(update: dict[str, Any]) -> list[str]:
     content = update.get("content")
     if content is None:
-        return ""
+        return []
     # ACP content is often list of {type, content: {type, text}}
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                inner = item.get("content")
-                text = _extract_text(inner if inner is not None else item)
-            else:
-                text = _extract_text(item)
-            if text.strip():
-                parts.append(text.strip())
-        if parts:
-            return _truncate(" ".join(parts), limit)
-        return ""
-    return _truncate(_extract_text(content).strip(), limit)
+    items = content if isinstance(content, list) else [content]
+    parts: list[str] = []
+    for item in items:
+        inner = item.get("content") if isinstance(item, dict) else None
+        text = _extract_text(inner if inner is not None else item).strip()
+        if text:
+            parts.append(text)
+    return parts
+
+
+def _content_snippet(update: dict[str, Any], limit: int = 120) -> str:
+    return _truncate(" ".join(_content_parts(update)), limit)
+
+
+def _content_detail(update: dict[str, Any], limit: int = TOOL_DETAIL_LIMIT) -> str:
+    """Tool output for the expanded row; long output keeps its tail, where results usually are."""
+    text = "\n".join(_content_parts(update))
+    if len(text) <= limit:
+        return text
+    tail = text[-limit:]
+    tail = tail[tail.find("\n") + 1 :] if "\n" in tail else tail
+    omitted = text[: len(text) - len(tail)].count("\n")
+    return f"[{omitted} earlier lines omitted]\n{tail}"
 
 
 def _update_from_line(obj: dict[str, Any]) -> dict[str, Any] | None:
@@ -267,9 +279,7 @@ def _message_from_update(update: dict[str, Any]) -> dict[str, Any] | None:
         tool_id = update.get("toolCallId") or ""
         title = update.get("title") or tool_label(update)
         status = normalize_status(update.get("status"))
-        snippet = _content_snippet(update)
-        if not snippet:
-            snippet = tool_summary(update)
+        snippet = _content_snippet(update) or tool_summary(update)
         return {
             "role": "tool",
             "text": str(title),
@@ -277,7 +287,7 @@ def _message_from_update(update: dict[str, Any]) -> dict[str, Any] | None:
                 "toolCallId": tool_id,
                 "status": status,
                 "summary": snippet,
-                "detail": snippet,
+                "detail": _content_detail(update) or snippet,
                 "label": str(title),
                 "kind": "tool_call_update",
             },
