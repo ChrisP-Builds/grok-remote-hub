@@ -31,7 +31,7 @@ def _seq_block(js: str) -> str:
 
 def test_cache_bust_bumped_for_app_js() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
-    assert "/app.js?v=20261101e" in html
+    assert "/app.js?v=20261102a" in html
 
 
 def test_pane_tracks_last_seq_and_replay_mark() -> None:
@@ -43,10 +43,11 @@ def test_pane_tracks_last_seq_and_replay_mark() -> None:
 def test_wiping_a_pane_clears_its_last_seq() -> None:
     js = _js()
     clear = _body(js, "clearTranscript")
-    assert clear.find("v.historyLoaded = false") < clear.find("v.lastSeq = 0")
+    assert clear.find("v.historyLoaded = false") < clear.find("notePaneRebuilt(state.selectedId, v)")
     hydrate = _body(js, "hydrateSessionPane")
     wipe = hydrate.find('v.pane.innerHTML = ""')
-    assert 0 < wipe < hydrate.find("v.lastSeq = 0")
+    assert 0 < wipe < hydrate.find("notePaneRebuilt(sessionId, v)")
+    assert "v.lastSeq = 0" in _body(_seq_block(js), "notePaneRebuilt")
 
 
 def test_gate_drops_already_seen_events_before_handling() -> None:
@@ -58,10 +59,9 @@ def test_gate_drops_already_seen_events_before_handling() -> None:
     }
     admit = _body(block, "admitSequenced")
     assert "state.sessionViews.get(msg.sessionId)" in admit
-    assert "seq <= (v.lastSeq || 0)" in admit
+    assert "seqSeen(v, seq)" in admit
     assert "getSessionPane" not in admit
-    note = _body(block, "noteSequenced")
-    assert "seq > (v.lastSeq || 0)" in note and "v.lastSeq = seq" in note
+    assert "rememberSeq(v, seq)" in _body(block, "noteSequenced")
     receive = _body(block, "receiveHubMessage")
     assert receive.find("admitSequenced(msg)") < receive.find("onHubMessage(msg)")
     assert "finally" in receive and receive.find("onHubMessage(msg)") < receive.find("noteSequenced(msg)")
@@ -82,7 +82,7 @@ def test_history_snapshot_raises_last_seq_only_when_applied() -> None:
     assert chunk.find("applyHistoryMessages") < chunk.find("noteSnapshotSeq")
     assert chunk.find("hydrateSessionPane") < chunk.rfind("noteSnapshotSeq")
     note = _body(_seq_block(js), "noteSnapshotSeq")
-    assert "if (v && n > (v.lastSeq || 0)) v.lastSeq = n" in note
+    assert "if (n > (v.lastSeq || 0)) v.lastSeq = n" in note and "v.seqFloor = n" in note
 
 
 def test_subscribe_sends_since_seq_only_for_a_valid_cached_pane() -> None:
@@ -127,7 +127,7 @@ def test_reconnect_skips_disk_reload_for_replayed_sessions_only() -> None:
 def test_wake_reconcile_skips_forced_reload_after_replay() -> None:
     js = _js()
     wake = _body(js, "handleWakeReconcile")
-    assert "if (state.selectedId && !paneReplayed(state.selectedId))" in wake
+    assert "if (state.selectedId && !takeReplayMark(state.selectedId))" in wake
     assert "force: true" in wake and "visibilityOnly: true" in wake
     assert "reconcileTurnAfterWake(reason)" in wake
 

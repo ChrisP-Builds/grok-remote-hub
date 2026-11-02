@@ -965,6 +965,8 @@
     lastInputAt: Date.now(),
     userIdle: false,
     turnStartedAt: 0,
+    /** @type {Map<string, {epoch: number, running: boolean}>} */
+    turnMarks: new Map(),
     lastTermLineAt: 0,
     stallTimer: null,
     stallWarned: false,
@@ -4014,6 +4016,40 @@
     submitPrompt();
   }
 
+  /** Per-session turn generation: bumps each time the session starts or ends a turn. */
+  function noteTurnState(sessionId, running) {
+    if (!sessionId) return;
+    const prev = state.turnMarks.get(sessionId) || { epoch: 0, running: false };
+    if (prev.running === running) return;
+    state.turnMarks.set(sessionId, { epoch: prev.epoch + 1, running });
+  }
+
+  function turnEpoch(sessionId) {
+    const mark = state.turnMarks.get(sessionId);
+    return mark ? mark.epoch : 0;
+  }
+
+  /** Force-clear only the turn Stop was pressed on, and only while it still runs. */
+  async function runStopFallback(sessionId, epoch) {
+    if (turnEpoch(sessionId) !== epoch) return;
+    if (sessionLiveStatus(sessionId) === "idle") return;
+    try {
+      const res = await fetch(apiUrl("/api/admin/reset-turn"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId }),
+      });
+      if (!res.ok) {
+        toast("Stop did not clear the turn. Try Stop again.", "danger");
+        return;
+      }
+      const body = await res.json().catch(() => null);
+      if (body && body.cleared) toast("Turn force-cleared (Stop fallback)", "");
+    } catch (err) {
+      toast("Stop fallback failed: " + err, "danger");
+    }
+  }
+
   function setTurnRunning(running, sessionId, opts) {
     if (!running && opts && opts.all) {
       clearStaleLiveTurns({ clearQuestions: !!opts.clearQuestions });
@@ -4711,6 +4747,8 @@
         historyFingerprint: null,
         historyLoaded: false,
         lastSeq: 0,
+        seqFloor: 0,
+        seenSeqs: new Set(),
         replayed: false,
         streamBuffers: emptyStreamBuffers(),
         lastToolTitle: "",
@@ -4834,7 +4872,7 @@
       state.streamBuffers = v.streamBuffers;
       v.historyFingerprint = null;
       v.historyLoaded = false;
-      v.lastSeq = 0;
+      notePaneRebuilt(state.selectedId, v);
     } else {
       state.streamBuffers = emptyStreamBuffers();
     }
@@ -7061,7 +7099,7 @@
       beginHistoryBatch();
       try {
         v.pane.innerHTML = "";
-        v.lastSeq = 0;
+        notePaneRebuilt(sessionId, v);
         if (!list.length) {
           appendMessage({
             role: "system",
@@ -7485,6 +7523,22 @@
   // Sequenced events and resume (ADR-029)
   const SEQUENCED_TYPES = new Set(["acp", "turn", "system", "terminal_out", "compact", "usage", "commands"]);
   const RESUME_ANSWER_TIMEOUT_MS = 1500;
+  const SEEN_SEQ_WINDOW = 512;
+
+  // Seqs from two viewers can arrive out of order, so dedupe by membership, not a high-water mark.
+  function seqSeen(v, seq) {
+    return seq <= (v.seqFloor || 0) || !!(v.seenSeqs && v.seenSeqs.has(seq));
+  }
+
+  function rememberSeq(v, seq) {
+    if (!v.seenSeqs) v.seenSeqs = new Set();
+    v.seenSeqs.add(seq);
+    if (seq > (v.lastSeq || 0)) v.lastSeq = seq;
+    if (v.seenSeqs.size <= SEEN_SEQ_WINDOW) return;
+    const oldest = v.seenSeqs.values().next().value;
+    v.seenSeqs.delete(oldest);
+    if (oldest > (v.seqFloor || 0)) v.seqFloor = oldest;
+  }
 
   /** Drop a stamped event the pane already holds; a session without a pane is never gated. */
   function admitSequenced(msg) {
@@ -7492,14 +7546,14 @@
     const seq = Number(msg.seq);
     if (!(seq > 0)) return true;
     const v = state.sessionViews.get(msg.sessionId);
-    return !(v && seq <= (v.lastSeq || 0));
+    return !(v && seqSeen(v, seq));
   }
 
   function noteSequenced(msg) {
     if (!SEQUENCED_TYPES.has(msg.type) || !msg.sessionId) return;
     const seq = Number(msg.seq);
     const v = seq > 0 ? state.sessionViews.get(msg.sessionId) : null;
-    if (v && seq > (v.lastSeq || 0)) v.lastSeq = seq;
+    if (v) rememberSeq(v, seq);
   }
 
   function receiveHubMessage(msg) {
@@ -7514,7 +7568,13 @@
   function noteSnapshotSeq(sessionId, seq) {
     const v = sessionId ? state.sessionViews.get(sessionId) : null;
     const n = Number(seq);
-    if (v && n > (v.lastSeq || 0)) v.lastSeq = n;
+    if (!v || !(n > 0)) return;
+    if (n > (v.lastSeq || 0)) v.lastSeq = n;
+    if (n <= (v.seqFloor || 0)) return;
+    v.seqFloor = n;
+    if (v.seenSeqs) {
+      for (const s of [...v.seenSeqs]) if (s <= n) v.seenSeqs.delete(s);
+    }
   }
 
   /** Resume only from a pane that holds a snapshot plus every event since it. */
@@ -7524,19 +7584,29 @@
     return { sinceSeq: v.lastSeq, bootId: state.bootId };
   }
 
-  function paneReplayed(sessionId) {
+  /** One wake may skip its reload per replay; later wakes on the same socket reload again. */
+  function takeReplayMark(sessionId) {
     const v = sessionId ? state.sessionViews.get(sessionId) : null;
-    return !!(v && v.replayed);
+    if (!v || !v.replayed) return false;
+    v.replayed = false;
+    return true;
   }
 
   function registerResumeWaiter(sessionId) {
     if (!state.resumeWaiters) state.resumeWaiters = new Map();
     if (state.resumeWaiters.has(sessionId)) return;
-    const waiter = {};
+    const waiter = { paneRebuilt: false };
     waiter.promise = new Promise((resolve) => {
       waiter.resolve = resolve;
     });
     state.resumeWaiters.set(sessionId, waiter);
+  }
+
+  /** A pane redrawn from disk no longer matches the resume point its pending request asked for. */
+  function notePaneRebuilt(sessionId, v) {
+    v.lastSeq = 0;
+    const waiter = state.resumeWaiters && state.resumeWaiters.get(sessionId);
+    if (waiter) waiter.paneRebuilt = true;
   }
 
   function settleResumeWaiter(sessionId, outcome) {
@@ -7553,24 +7623,32 @@
 
   /** Bounded wait for the hub's answer to each resume request; returns the ids it replayed. */
   async function awaitReplayedSessions(ids, timeoutMs) {
-    const pending = [];
-    for (const sid of ids) {
-      const waiter = state.resumeWaiters && state.resumeWaiters.get(sid);
-      if (!waiter) continue;
-      const timeout = new Promise((resolve) => setTimeout(() => resolve("timeout"), timeoutMs));
-      pending.push(Promise.race([waiter.promise, timeout]));
-    }
-    await Promise.all(pending);
     const replayed = new Set();
-    for (const sid of ids) {
-      const v = state.sessionViews.get(sid);
-      if (v && v.replayed) replayed.add(sid);
-    }
+    const waits = ids.map(async (sid) => {
+      const waiter = state.resumeWaiters && state.resumeWaiters.get(sid);
+      if (!waiter) {
+        const v = state.sessionViews.get(sid);
+        if (v && v.replayed) replayed.add(sid);
+        return;
+      }
+      let timer = null;
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      });
+      if ((await Promise.race([waiter.promise, timeout])) === "replay") replayed.add(sid);
+      clearTimeout(timer);
+    });
+    await Promise.all(waits);
     return replayed;
   }
 
   function onReplay(msg) {
     const sid = msg.sessionId || null;
+    const waiter = sid && state.resumeWaiters ? state.resumeWaiters.get(sid) : null;
+    if (waiter && waiter.paneRebuilt) {
+      settleResumeWaiter(sid, "stale");
+      return;
+    }
     const events = Array.isArray(msg.events) ? msg.events : [];
     for (let i = 0; i < events.length; i++) receiveHubMessage(events[i]);
     const v = sid ? state.sessionViews.get(sid) : null;
@@ -7586,6 +7664,8 @@
   function resetSequenceTracking() {
     for (const v of state.sessionViews.values()) {
       v.lastSeq = 0;
+      v.seqFloor = 0;
+      v.seenSeqs = new Set();
       v.replayed = false;
     }
   }
@@ -7943,6 +8023,9 @@
       // Track turn globally so session list + offscreen pane stay live during switches.
       const busyIdle =
         msg.state === "idle" && msg.error && /busy/i.test(String(msg.error));
+      if (!busyIdle && (msg.state === "running" || msg.state === "idle")) {
+        noteTurnState(sid, msg.state === "running");
+      }
       // Old hub "busy" idle+error: keep turnRunning (server still mid-turn) and unlock composer.
       if (busyIdle) {
         if (msg.error) {
@@ -10061,14 +10144,14 @@
         return;
       }
       toast("Open full size, then long-press to save");
-      window.open(rawFsUrl(root, rel, { download: 1 }), "_blank", "noopener");
+      window.open(rawFsUrl(root, rel, { download: 1 }), "_blank", "noopener,noreferrer");
     } catch (err) {
       if (err && (err.name === "AbortError" || err.name === "NotAllowedError")) {
         return;
       }
       toast("Share failed: " + (err && err.message ? err.message : err), "danger");
       try {
-        window.open(rawFsUrl(root, rel, { download: 1 }), "_blank", "noopener");
+        window.open(rawFsUrl(root, rel, { download: 1 }), "_blank", "noopener,noreferrer");
       } catch (_) {}
     }
   }
@@ -12468,29 +12551,10 @@
     els.btnStop.addEventListener("click", () => {
       if (!state.selectedId) return;
       const sid = state.livePromptSessionId || state.selectedId;
+      const epoch = turnEpoch(sid);
       sendWs({ type: "cancel", sessionId: sid });
       // Last resort only: the hub already waits about 2s for the agent, then force-clears.
-      setTimeout(async () => {
-        if (!state.turnRunning) return;
-        if (state.selectedId !== sid && state.livePromptSessionId !== sid) return;
-        try {
-          const res = await fetch(apiUrl("/api/admin/reset-turn"), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ sessionId: sid }),
-          });
-          if (res.ok) {
-            toast("Turn force-cleared (Stop fallback)", "");
-          } else {
-            toast(
-              "Stop did not clear the turn. Try Stop again.",
-              "danger"
-            );
-          }
-        } catch (err) {
-          toast("Stop fallback failed: " + err, "danger");
-        }
-      }, 4000);
+      setTimeout(() => runStopFallback(sid, epoch), 4000);
     });
 
     els.transcript.addEventListener("scroll", () => {
@@ -12576,7 +12640,7 @@
     state._reconnectScrollFreeze = true;
     try {
       await reconcileTurnAfterWake(reason);
-      if (state.selectedId && !paneReplayed(state.selectedId)) {
+      if (state.selectedId && !takeReplayMark(state.selectedId)) {
         await refreshHistory(state.selectedId, {
           force: true,
           visibilityOnly: true,

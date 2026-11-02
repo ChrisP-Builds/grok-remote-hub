@@ -179,3 +179,13 @@ def test_preview_iframe_sandbox_has_no_same_origin_escape() -> None:
     assert m, "preview iframe must declare sandbox"
     assert "allow-scripts" in m.group(1)
     assert "allow-same-origin" not in m.group(1)
+
+
+def test_preview_iframe_sends_no_referrer() -> None:
+    """The SPA URL carries ?token=, so a framed page must not see it as document.referrer."""
+    import re
+
+    html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r'<iframe[^>]*id="site-preview-frame"[^>]*>', html, re.S)
+    assert m, "preview iframe missing"
+    assert 'referrerpolicy="no-referrer"' in m.group(0)

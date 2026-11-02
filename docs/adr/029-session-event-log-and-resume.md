@@ -1,6 +1,6 @@
 # ADR-029: Sequence session events and resume reconnects from an in-memory log
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-11-02)
 - **Date:** 2026-11-01
 - **Deciders:** project owner, Grok Remote Hub session
 - **Tags:** streaming, websocket, reconnect, mobile, reliability
@@ -72,3 +72,21 @@ already uses to merge the live ACP and disk-tail copies.
 ## Related
 
 - ADR-001 session lifecycle; ADR-016 quiet-period load suppress; ADR-020 ops metrics
+
+## Amendment (2026-11-02): dedupe by membership, ignore replays after a redraw
+
+Review found two ways the client lost or doubled events:
+
+1. The hub sends to each viewer in turn, so with two viewers a later event
+   can reach one of them first; `seq <= lastSeq` then dropped the earlier
+   one. Decision 4 now dedupes by a bounded set of recently seen seqs (512)
+   plus a floor raised by snapshots. `lastSeq` stays the highest seq seen and
+   is still what resume sends.
+2. A replay that arrived after the 1.5 s wait landed on top of a pane already
+   redrawn from disk. A replay is now dropped when its pane was wiped and
+   redrawn after the request; it is still applied when the disk reload found
+   nothing new and left the pane alone.
+
+The replayed mark is consumed by one wake instead of lasting for the socket's
+life. Validation: `tests/test_ui_client_races.py` (runs the real functions in
+node).
