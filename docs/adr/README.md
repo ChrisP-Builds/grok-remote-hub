@@ -53,3 +53,4 @@ a new ADR.
 | 026 | Guard Host and Origin, and serve previews as sandboxed capability URLs | Accepted | 2026-10-31 |
 | 027 | Approve risky agent actions from the phone via a hub-owned Grok hook | Accepted | 2026-10-31 |
 | 028 | Serve over Tailscale HTTPS, trust the Tailscale login, and send web push | Accepted | 2026-11-01 |
+| 029 | Sequence session events and resume reconnects from an in-memory log | Accepted | 2026-11-01 |
