@@ -322,3 +322,19 @@ def test_tool_output_detail_keeps_tail_of_long_output(tmp_path: Path) -> None:
     assert detail.rstrip().endswith("line 2000")
     assert "earlier lines omitted" in detail
     assert "line 1\n" not in detail
+
+def test_history_etag_changes_with_file_and_format(tmp_path: Path) -> None:
+    """The 4 s idle poll re-downloads full history; an ETag lets the browser get a 304 instead."""
+    from hub.history import history_etag
+
+    session = tmp_path / "sessions" / "s1"
+    session.mkdir(parents=True)
+    updates = session / "updates.jsonl"
+    updates.write_text(_line("agent_message_chunk", content={"type": "text", "text": "hi"}) + "\n", encoding="utf-8")
+    first = history_etag(tmp_path / "sessions", "s1", session, 800)
+    assert first and first.startswith('"') and first == history_etag(tmp_path / "sessions", "s1", session, 800)
+    assert history_etag(tmp_path / "sessions", "s1", session, 50) != first, "cap is part of the content"
+    with updates.open("a", encoding="utf-8") as f:
+        f.write(_line("agent_message_chunk", content={"type": "text", "text": "more"}) + "\n")
+    assert history_etag(tmp_path / "sessions", "s1", session, 800) != first
+    assert history_etag(tmp_path / "sessions", "missing", None, 800) is None

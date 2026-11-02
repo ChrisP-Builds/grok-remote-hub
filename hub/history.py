@@ -461,21 +461,48 @@ def parse_updates_jsonl(path: Path | str, max_messages: int = 800) -> list[dict[
     return merged
 
 
+# Bump when the history message shape changes so cached responses are not reused.
+HISTORY_FORMAT = "2"
+
+
+def _updates_path(
+    sessions_root: Path, session_id: str, session_path: str | Path | None
+) -> Path | None:
+    if session_path:
+        updates = Path(session_path) / "updates.jsonl"
+        if updates.is_file():
+            return updates
+    root = Path(sessions_root)
+    if not root.is_dir():
+        return None
+    for summary in root.rglob("summary.json"):
+        if summary.parent.name == session_id:
+            return summary.parent / "updates.jsonl"
+    return None
+
+
 def load_session_history(
     sessions_root: Path,
     session_id: str,
     session_path: str | Path | None = None,
     max_messages: int = 800,
 ) -> list[dict[str, Any]]:
-    if session_path:
-        updates = Path(session_path) / "updates.jsonl"
-        if updates.is_file():
-            return parse_updates_jsonl(updates, max_messages=max_messages)
+    updates = _updates_path(sessions_root, session_id, session_path)
+    return parse_updates_jsonl(updates, max_messages=max_messages) if updates else []
 
-    root = Path(sessions_root)
-    if not root.is_dir():
-        return []
-    for summary in root.rglob("summary.json"):
-        if summary.parent.name == session_id:
-            return parse_updates_jsonl(summary.parent / "updates.jsonl", max_messages=max_messages)
-    return []
+
+def history_etag(
+    sessions_root: Path,
+    session_id: str,
+    session_path: str | Path | None,
+    max_messages: int,
+) -> str | None:
+    """Strong ETag for a session's history: the source file's identity plus how it is rendered."""
+    updates = _updates_path(sessions_root, session_id, session_path)
+    if updates is None:
+        return None
+    try:
+        st = updates.stat()
+    except OSError:
+        return None
+    return f'"h{HISTORY_FORMAT}-{st.st_mtime_ns:x}-{st.st_size:x}-{max_messages}"'
