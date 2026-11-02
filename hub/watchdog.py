@@ -254,9 +254,8 @@ def is_watchdog_process(pid: int) -> bool:
         return False
     cmd = _cmdline_for_pid(pid)
     if not cmd:
-        # Alive but unknown cmdline: treat as possible peer only if pid file claimed it;
-        # caller uses is_watchdog_process for single-instance — require hub.watchdog marker.
-        return False
+        # Lookup failed (WMI timeout): two daemons would both restart the hub, so assume ours.
+        return True
     low = cmd.lower()
     if "hub.watchdog" not in low and "hub\\watchdog" not in low and "hub/watchdog" not in low:
         return False

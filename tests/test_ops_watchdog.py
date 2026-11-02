@@ -72,6 +72,20 @@ def test_watchdog_pure_helpers(tmp_path: Path) -> None:
     )
 
 
+def test_singleton_kept_when_live_owner_cmdline_is_unreadable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A WMI timeout must not let a second daemon take over a live one."""
+    from hub import watchdog
+
+    (tmp_path / "logs").mkdir()
+    watchdog.write_pid_file(tmp_path / "logs" / "watchdog.pid", 424242)
+    monkeypatch.setattr(watchdog, "_pid_alive", lambda pid: pid == 424242)
+    monkeypatch.setattr(watchdog, "_cmdline_for_pid", lambda pid: None)
+    assert watchdog.try_acquire_singleton(tmp_path) is False
+
+    monkeypatch.setattr(watchdog, "_cmdline_for_pid", lambda pid: r"C:\Windows\notepad.exe")
+    assert watchdog.try_acquire_singleton(tmp_path) is True
+
+
 def test_watch_hub_script_wrapper() -> None:
     path = ROOT / "watch-hub.ps1"
     assert path.is_file(), "watch-hub.ps1 must exist at repo root"
