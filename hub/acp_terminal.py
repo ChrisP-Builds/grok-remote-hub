@@ -5,6 +5,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
+import signal
+import sys
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -13,6 +16,70 @@ log = logging.getLogger("hub.acp.terminal")
 
 DEFAULT_OUTPUT_BYTE_LIMIT = 1_000_000
 WAIT_EXIT_CAP_SECONDS = 120.0
+EXIT_POLL_SECONDS = 0.05
+KILL_GRACE_SECONDS = 5.0
+OUTPUT_DRAIN_SECONDS = 1.0
+_CREATE_NO_WINDOW = 0x08000000
+_UTF8_OUTPUT = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+
+
+def _windows_shell_argv(command: str) -> list[str]:
+    """Same shell as Grok's own Shell tool on Windows: pwsh if on PATH, else Windows PowerShell."""
+    exe = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+    return [exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-Command", _UTF8_OUTPUT + command]
+
+
+def _spawn_flags() -> dict[str, Any]:
+    """Own process group on POSIX so a kill reaches the shell's children; Windows uses taskkill /T."""
+    if sys.platform == "win32":
+        return {"creationflags": _CREATE_NO_WINDOW}
+    return {"start_new_session": True}
+
+
+async def _spawn_shell(command: str, **kwargs: Any) -> asyncio.subprocess.Process:
+    if sys.platform == "win32":
+        return await asyncio.create_subprocess_exec(
+            *_windows_shell_argv(command), **_spawn_flags(), **kwargs
+        )
+    return await asyncio.create_subprocess_shell(command, **_spawn_flags(), **kwargs)
+
+
+async def _taskkill_tree(pid: int) -> bool:
+    try:
+        killer = await asyncio.create_subprocess_exec(
+            shutil.which("taskkill") or "taskkill", "/PID", str(pid), "/T", "/F",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            creationflags=_CREATE_NO_WINDOW,
+        )
+    except OSError as exc:
+        log.debug("taskkill unavailable for pid=%s: %s", pid, exc)
+        return False
+    try:
+        return await asyncio.wait_for(killer.wait(), timeout=10.0) == 0
+    except asyncio.TimeoutError:
+        killer.kill()
+        return False
+
+
+async def kill_process_tree(proc: asyncio.subprocess.Process) -> None:
+    """End the process and everything it started; killing only the shell leaves `npm test` running."""
+    if proc.returncode is not None:
+        return
+    if sys.platform == "win32":
+        await _taskkill_tree(proc.pid)
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
 
 # (terminal_id, delta_text, session_id | None) — sync or async ok
 OutputCallback = Callable[[str, str, str | None], Any]
@@ -82,11 +149,12 @@ class ManagedTerminal:
         self._buf = bytearray()
         self._truncated = False
         self._lock = asyncio.Lock()
-        self._exit_code: int | None = None
-        self._signal: str | None = None
+        # Output pump reached EOF (or gave up); the pipe can outlive the process when a child inherits it.
         self._done = asyncio.Event()
+        self._exited = asyncio.Event()
         self._pump_task: asyncio.Task | None = None
         self._decode_carry = bytearray()
+        self.exit_waiters = 0
 
     def start_pump(self) -> None:
         self._pump_task = asyncio.create_task(self._pump(), name=f"term-pump-{self.terminal_id[:8]}")
@@ -104,13 +172,6 @@ class ManagedTerminal:
                     delta = utf8_delta(chunk, self._decode_carry)
                 if delta:
                     self._emit_output(delta)
-            rc = await proc.wait()
-            self._exit_code = int(rc) if rc is not None else None
-            if rc and rc < 0:
-                # POSIX signal encoding when available
-                self._signal = str(-rc)
-                self._exit_code = None
-            # Flush any remaining incomplete sequence as replacement char.
             if self._decode_carry:
                 leftover = bytes(self._decode_carry).decode("utf-8", errors="replace")
                 self._decode_carry.clear()
@@ -120,16 +181,41 @@ class ManagedTerminal:
             raise
         except Exception as exc:
             log.debug("terminal pump error %s: %s", self.terminal_id, exc)
-            try:
-                if proc.returncode is None:
-                    proc.kill()
-                await proc.wait()
-            except Exception:
-                pass
-            if self._exit_code is None and proc.returncode is not None:
-                self._exit_code = int(proc.returncode)
+            await self.kill()
         finally:
             self._done.set()
+        await proc.wait()
+        self._exited.set()
+
+    def exit_status(self) -> dict[str, Any] | None:
+        rc = self.process.returncode
+        if rc is None:
+            return None
+        if rc < 0:
+            return {"exitCode": None, "signal": str(-rc)}
+        return {"exitCode": int(rc), "signal": None}
+
+    async def _wait_process_exit(self, timeout: float) -> bool:
+        """True once the process itself is gone. Process.wait() also waits for the output pipe,
+        which a child can hold open, so this watches returncode instead (ADR-031)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self.process.returncode is None:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(self._exited.wait(), timeout=min(EXIT_POLL_SECONDS, remaining))
+            except asyncio.TimeoutError:
+                pass
+        self._exited.set()
+        return True
+
+    async def _wait_output_drained(self, timeout: float) -> None:
+        try:
+            await asyncio.wait_for(self._done.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            log.debug("terminal %s: output pipe still open after exit; returning", self.terminal_id)
 
     def _emit_output(self, delta: str) -> None:
         """Notify manager/hub of a decoded output delta (sync; schedule if coro)."""
@@ -169,40 +255,26 @@ class ManagedTerminal:
         async with self._lock:
             text = bytes(self._buf).decode("utf-8", errors="replace")
             truncated = self._truncated
-        exit_status = None
-        if self._done.is_set():
-            exit_status = {
-                "exitCode": self._exit_code,
-                "signal": self._signal,
-            }
         return {
             "output": text,
             "truncated": truncated,
-            "exitStatus": exit_status,
+            "exitStatus": self.exit_status(),
         }
 
     async def wait_for_exit(self, timeout: float = WAIT_EXIT_CAP_SECONDS) -> dict[str, Any]:
+        self.exit_waiters += 1
         try:
-            await asyncio.wait_for(self._done.wait(), timeout=timeout)
-        except asyncio.TimeoutError:
-            await self.kill()
-            try:
-                await asyncio.wait_for(self._done.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                pass
-        return {
-            "exitCode": self._exit_code,
-            "signal": self._signal,
-        }
+            if not await self._wait_process_exit(timeout):
+                await self.kill()
+                await self._wait_process_exit(KILL_GRACE_SECONDS)
+            await self._wait_output_drained(OUTPUT_DRAIN_SECONDS)
+        finally:
+            self.exit_waiters -= 1
+        return self.exit_status() or {"exitCode": None, "signal": None}
 
     async def kill(self) -> None:
-        proc = self.process
-        if proc.returncode is not None:
-            return
         try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+            await kill_process_tree(self.process)
         except Exception as exc:
             log.debug("kill terminal %s: %s", self.terminal_id, exc)
 
@@ -290,7 +362,7 @@ class TerminalManager:
             or (" " in command and not os.path.isfile(command))
         )
         if use_shell:
-            proc = await asyncio.create_subprocess_shell(
+            proc = await _spawn_shell(
                 command,
                 cwd=cwd,
                 env=env,
@@ -308,11 +380,12 @@ class TerminalManager:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     stdin=asyncio.subprocess.DEVNULL,
+                    **_spawn_flags(),
                 )
             except FileNotFoundError:
-                # Windows often needs shell for bare commands like `dir`
+                # Bare shell commands (`dir`, `Get-Date`) are not executables.
                 shell_cmd = command if not args else " ".join([command, *args])
-                proc = await asyncio.create_subprocess_shell(
+                proc = await _spawn_shell(
                     shell_cmd,
                     cwd=cwd,
                     env=env,
@@ -349,6 +422,15 @@ class TerminalManager:
     async def kill(self, terminal_id: str) -> dict[str, Any]:
         await self.get(terminal_id).kill()
         return {}
+
+    async def kill_awaited(self, session_id: str) -> int:
+        """Kill the session's commands the agent is blocked on; background ones keep running."""
+        blocking = [
+            t for t in self._terms.values() if t.session_id == session_id and t.exit_waiters
+        ]
+        for term in blocking:
+            await term.kill()
+        return len(blocking)
 
     async def release(self, terminal_id: str) -> dict[str, Any]:
         term = self._terms.pop(terminal_id, None)

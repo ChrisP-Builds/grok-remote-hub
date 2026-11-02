@@ -841,6 +841,7 @@
       acpConnected: false,
       acpHealAttempts: 0,
       acpHealError: null,
+      acpHealExhausted: false,
       bind: "local",
       tailscaleIp: null,
       loadedSessionId: null,
@@ -944,7 +945,28 @@
     /** Current folder browser payload from /api/projects/browse */
     projectBrowse: null,
     pendingUserQuestion: null, // { requestId, sessionId, questions, toolCallId }
+    /** @type {Map<string, object>} approval id -> normalized approval_request */
+    pendingApprovals: new Map(),
+    /** Approval ids whose answer was sent and await approval_resolved. */
+    approvalAnswering: new Set(),
+    /** Approval ids already handled by notifyApproval (toasted or on screen). */
+    approvalNotified: new Set(),
+    /** @type {Map<string, number>} approval id -> no-confirmation watchdog timer */
+    approvalAnswerTimers: new Map(),
+    /** @type {Record<string, string>} sessionId -> balanced | strict | trusted */
+    approvalModes: {},
+    approvalDefaultMode: "balanced",
+    approvalTick: null,
+    /** null until /api/whoami answers; true when the hub demands a token. */
+    authNeeded: null,
+    whoami: null,
+    push: { config: null, permission: "default", subscribed: false, busy: false, loaded: false, synced: false },
+    presenceSent: "",
+    lastInputAt: Date.now(),
+    userIdle: false,
     turnStartedAt: 0,
+    /** @type {Map<string, {epoch: number, running: boolean}>} */
+    turnMarks: new Map(),
     lastTermLineAt: 0,
     stallTimer: null,
     stallWarned: false,
@@ -1006,6 +1028,7 @@
     emptyMain: $("#empty-main"),
     chatTitle: $("#chat-title"),
     btnRenameSession: $("#btn-rename-session"),
+    btnCatchUp: $("#btn-catch-up"),
     btnViewPlan: $("#btn-view-plan"),
     modalPlan: $("#modal-plan"),
     planBody: $("#plan-body"),
@@ -1013,6 +1036,7 @@
     btnPlanApprove: $("#btn-plan-approve"),
     btnPlanRequestChanges: $("#btn-plan-request-changes"),
     btnPlanQuit: $("#btn-plan-quit"),
+    btnPlanCopy: $("#btn-plan-copy"),
     btnPlanClose: $("#btn-plan-close"),
     planAwaitBanner: $("#plan-await-banner"),
     planAwaitBannerText: $("#plan-await-banner-text"),
@@ -1032,6 +1056,10 @@
     latencyHintBanner: $("#latency-hint-banner"),
     latencyHintBannerText: $("#latency-hint-banner-text"),
     btnLatencyHintDismiss: $("#btn-latency-hint-dismiss"),
+    compactStatusBar: $("#compact-status-bar"),
+    compactStatusLabel: $("#compact-status-label"),
+    compactStatusElapsed: $("#compact-status-elapsed"),
+    compactStatusDetail: $("#compact-status-detail"),
     form: $("#composer-form"),
     input: $("#composer-input"),
     composerFileInput: $("#composer-file-input"),
@@ -1040,6 +1068,21 @@
     btnSend: $("#btn-send"),
     btnStop: $("#btn-stop"),
     composerHint: $("#composer-hint"),
+    approvalStack: $("#approval-stack"),
+    approvalMode: $("#approval-mode"),
+    pushControl: $("#push-control"),
+    pushLabel: $("#push-label"),
+    pushDetail: $("#push-detail"),
+    btnPushOn: $("#btn-push-on"),
+    btnPushTest: $("#btn-push-test"),
+    btnPushOff: $("#btn-push-off"),
+    btnPhoneSetup: $("#btn-phone-setup"),
+    modalPhoneSetup: $("#modal-phone-setup"),
+    phoneSetupWarning: $("#phone-setup-warning"),
+    phoneSetupQr: $("#phone-setup-qr"),
+    phoneSetupUrl: $("#phone-setup-url"),
+    btnPhoneSetupCopy: $("#btn-phone-setup-copy"),
+    phoneSetupSteps: $("#phone-setup-steps"),
     slash: $("#slash-palette"),
     btnMenu: $("#btn-menu"),
     btnRailCollapse: $("#btn-rail-collapse"),
@@ -1098,6 +1141,8 @@
     compatDot: $("#compat-dot"),
     sessionBanner: $("#session-banner"),
     sessionBannerText: $("#session-banner-text"),
+    authTokenBanner: $("#auth-token-banner"),
+    authTokenBannerText: $("#auth-token-banner-text"),
     usageBar: $("#usage-bar"),
     usageBarFill: $("#usage-bar-fill"),
     usageBarFillPlan: $("#usage-bar-fill-plan"),
@@ -1111,13 +1156,44 @@
     metaPopover: $("#meta-popover"),
   };
 
+  const HUB_TOKEN_KEY = "grh.hubToken";
+  let _resolvedHubToken = null;
+
   function tokenFromQuery() {
     const u = new URL(location.href);
     return u.searchParams.get("token") || "";
   }
 
+  function hubToken() {
+    if (_resolvedHubToken !== null) return _resolvedHubToken;
+    let t = tokenFromQuery();
+    if (t) {
+      try {
+        localStorage.setItem(HUB_TOKEN_KEY, t);
+      } catch (_) {}
+    } else {
+      try {
+        t = localStorage.getItem(HUB_TOKEN_KEY) || "";
+      } catch (_) {
+        t = "";
+      }
+    }
+    t = t || "";
+    if (t) {
+      try {
+        const u = new URL(location.href);
+        if (u.searchParams.get("token") !== t) {
+          u.searchParams.set("token", t);
+          history.replaceState(history.state, "", u.pathname + u.search + u.hash);
+        }
+      } catch (_) {}
+    }
+    _resolvedHubToken = t;
+    return t;
+  }
+
   function apiUrl(path) {
-    const t = tokenFromQuery();
+    const t = hubToken();
     if (!t) return path;
     const join = path.includes("?") ? "&" : "?";
     return `${path}${join}token=${encodeURIComponent(t)}`;
@@ -1125,10 +1201,27 @@
 
   function wsUrl() {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const t = tokenFromQuery();
+    const t = hubToken();
     const q = t ? `?token=${encodeURIComponent(t)}` : "";
     return `${proto}//${location.host}/ws${q}`;
   }
+
+  function updateAuthTokenBanner() {
+    if (!els.authTokenBanner) return;
+    if (hubToken() || state.authNeeded !== true) {
+      els.authTokenBanner.classList.add("hidden");
+      if (els.authTokenBannerText) els.authTokenBannerText.textContent = "";
+      return;
+    }
+    els.authTokenBanner.classList.remove("hidden");
+    if (els.authTokenBannerText) {
+      els.authTokenBannerText.textContent =
+        "Add ?token= to this URL to see sessions. The token is required for API and WebSocket access.";
+    }
+  }
+
+  hubToken();
+  updateAuthTokenBanner();
 
   function toast(message, kind = "", durationMs, opts) {
     if (durationMs && typeof durationMs === "object") {
@@ -1159,6 +1252,7 @@
     } else {
       el.textContent = message;
     }
+    if (typeof opts.onTap === "function") makeToastTappable(el, opts.onTap);
     els.toastHost.appendChild(el);
     const ms =
       typeof durationMs === "number"
@@ -1169,6 +1263,25 @@
     setTimeout(() => {
       if (el.parentNode) el.remove();
     }, ms);
+  }
+
+  function makeToastTappable(el, onTap) {
+    el.classList.add("toast-tappable");
+    el.setAttribute("role", "button");
+    el.tabIndex = 0;
+    const tap = () => {
+      el.remove();
+      try {
+        onTap();
+      } catch (_) {}
+    };
+    el.addEventListener("click", tap);
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        tap();
+      }
+    });
   }
 
   /** Recoverable turn-clear notices (stall / max duration / no output / auto-retry) — not hard failures. */
@@ -1328,6 +1441,10 @@
       if (state.selectedId) els.btnRenameSession.classList.remove("hidden");
       else els.btnRenameSession.classList.add("hidden");
     }
+    if (els.btnCatchUp) {
+      if (state.selectedId) els.btnCatchUp.classList.remove("hidden");
+      else els.btnCatchUp.classList.add("hidden");
+    }
     // View plan visibility is driven by refreshSessionPlan (plan.md exists)
 
     const cwd = meta.cwd || "";
@@ -1369,11 +1486,16 @@
     if (state.metaPopoverPinned || (els.metaPopover && !els.metaPopover.classList.contains("hidden"))) {
       refreshMetaPopoverContent();
     }
+    renderApprovals();
+    sendPresence();
   }
 
   function clearTopbarSessionMeta() {
+    renderApprovals();
+    sendPresence();
     if (els.chatTitle) els.chatTitle.textContent = "Select a session";
     if (els.btnRenameSession) els.btnRenameSession.classList.add("hidden");
+    if (els.btnCatchUp) els.btnCatchUp.classList.add("hidden");
     setViewPlanVisible(false);
     state.sessionPlan = null;
     if (els.chatProject) {
@@ -2068,6 +2190,12 @@
     return state.selectedId;
   }
 
+  function setLivePromptSessionId(sessionId) {
+    state.livePromptSessionId = sessionId;
+    renderApprovals();
+    sendPresence();
+  }
+
   function isHubCreatedSession(sessionId) {
     if (!sessionId) return false;
     const ids = state.hubSessionIds || [];
@@ -2129,7 +2257,9 @@
         // After heal exhaustion, stop implying a silent reconnect is still running.
         const healAttempts = Number(state.status.acpHealAttempts) || 0;
         const healExhausted =
-          !!state.status.acpHealError || healAttempts >= 3;
+          !!state.status.acpHealExhausted ||
+          !!state.status.acpHealError ||
+          healAttempts >= 3;
         if (healExhausted) {
           stateKey = "acp-hung";
           text = "Agent hung — restart";
@@ -2515,6 +2645,7 @@
         }
       }
     }
+    syncApprovalBadges();
   }
 
   /**
@@ -3885,6 +4016,40 @@
     submitPrompt();
   }
 
+  /** Per-session turn generation: bumps each time the session starts or ends a turn. */
+  function noteTurnState(sessionId, running) {
+    if (!sessionId) return;
+    const prev = state.turnMarks.get(sessionId) || { epoch: 0, running: false };
+    if (prev.running === running) return;
+    state.turnMarks.set(sessionId, { epoch: prev.epoch + 1, running });
+  }
+
+  function turnEpoch(sessionId) {
+    const mark = state.turnMarks.get(sessionId);
+    return mark ? mark.epoch : 0;
+  }
+
+  /** Force-clear only the turn Stop was pressed on, and only while it still runs. */
+  async function runStopFallback(sessionId, epoch) {
+    if (turnEpoch(sessionId) !== epoch) return;
+    if (sessionLiveStatus(sessionId) === "idle") return;
+    try {
+      const res = await fetch(apiUrl("/api/admin/reset-turn"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId }),
+      });
+      if (!res.ok) {
+        toast("Stop did not clear the turn. Try Stop again.", "danger");
+        return;
+      }
+      const body = await res.json().catch(() => null);
+      if (body && body.cleared) toast("Turn force-cleared (Stop fallback)", "");
+    } catch (err) {
+      toast("Stop fallback failed: " + err, "danger");
+    }
+  }
+
   function setTurnRunning(running, sessionId, opts) {
     if (!running && opts && opts.all) {
       clearStaleLiveTurns({ clearQuestions: !!opts.clearQuestions });
@@ -4012,7 +4177,7 @@
       reason !== "resume_failed" &&
       reason !== "dead_view"
     ) {
-      state.livePromptSessionId = toId;
+      setLivePromptSessionId(toId);
       setSessionMode("live-remote", { attachSwitched: true });
       subscribeSessionIds(state.selectedId, toId, liveTurnId());
       toast(message || "Live hub session ready — still showing this session’s history", "");
@@ -4022,7 +4187,7 @@
     }
     // Already on a different session than the switch source — only record live id.
     if (state.selectedId && from && state.selectedId !== from && state.selectedId !== toId) {
-      state.livePromptSessionId = toId;
+      setLivePromptSessionId(toId);
       subscribeSessionIds(state.selectedId, toId, liveTurnId());
       return;
     }
@@ -4049,7 +4214,7 @@
     state.selectedId = toId;
     if (meta && !meta.sessionId) meta.sessionId = toId;
     state.selectedMeta = meta;
-    state.livePromptSessionId = toId;
+    setLivePromptSessionId(toId);
     saveSelectedSession(toId, meta);
     // Keep prior commands until agent sends a fresh list; builtins fill gaps.
     const v = showSessionPane(toId);
@@ -4243,10 +4408,12 @@
         // "standard" legacy storage maps to working in init
         if (state.sessionKindFilter === "standard" && !isWorkingSession(s)) return false;
         if (!q) return true;
+        const sid = (s.sessionId || "").toLowerCase();
         return (
           (s.title || "").toLowerCase().includes(q) ||
           (s.cwd || "").toLowerCase().includes(q) ||
-          (s.sessionId || "").toLowerCase().startsWith(q) ||
+          sid.includes(q) ||
+          sid.startsWith(q) ||
           basename(s.cwd).toLowerCase().includes(q) ||
           (s.agentName || "").toLowerCase().includes(q)
         );
@@ -4463,6 +4630,7 @@
       els.sessionList.appendChild(btn);
     }
     _sessionPillRanks = nextPillRanks;
+    syncApprovalBadges();
   }
 
   function emptyStreamBuffers() {
@@ -4578,6 +4746,10 @@
         stickToBottom: true,
         historyFingerprint: null,
         historyLoaded: false,
+        lastSeq: 0,
+        seqFloor: 0,
+        seenSeqs: new Set(),
+        replayed: false,
         streamBuffers: emptyStreamBuffers(),
         lastToolTitle: "",
         lastActivityLine: "",
@@ -4700,6 +4872,7 @@
       state.streamBuffers = v.streamBuffers;
       v.historyFingerprint = null;
       v.historyLoaded = false;
+      notePaneRebuilt(state.selectedId, v);
     } else {
       state.streamBuffers = emptyStreamBuffers();
     }
@@ -5173,7 +5346,7 @@
     }
   }
 
-  function createToolLine({ title, status, summary, toolCallId }) {
+  function createToolLine({ title, status, summary, detail, toolCallId }) {
     const row = document.createElement("details");
     row.className = "term-line tool";
     const st = normalizeStatus(status || "pending");
@@ -5209,17 +5382,17 @@
 
     sum.append(prefix, name, pill, oneLiner);
 
-    const detail = document.createElement("div");
-    detail.className = "term-body tool-detail";
-    row.append(sum, detail);
-    setToolDetailBody(row, snip);
+    const body = document.createElement("div");
+    body.className = "term-body tool-detail";
+    row.append(sum, body);
+    setToolDetailBody(row, (detail || "").trim() || snip);
     row._toolTitle = displayTitle;
     row._toolSummary = snip;
     refreshToolPreviewAction(row);
     return row;
   }
 
-  function updateToolLine(row, { title, status, summary }) {
+  function updateToolLine(row, { title, status, summary, detail }) {
     if (!row) return;
     let st = row.dataset.status || "pending";
     if (status != null) {
@@ -5257,7 +5430,7 @@
           oneLiner.textContent = !hideOne ? truncate(plainFull, 80) : "";
           oneLiner.hidden = hideOne;
         }
-        setToolDetailBody(row, full);
+        setToolDetailBody(row, String(detail || "").trim() || full);
       }
     } else if (title) {
       // Title-only update: re-evaluate one-liner redundancy against stored summary.
@@ -5284,6 +5457,7 @@
     if (!summary && textStr && textStr !== title) {
       summary = textStr;
     }
+    const detailText = String(meta.detail || "").trim();
     const st = meta.status || "pending";
     const id = meta.toolCallId || "";
 
@@ -5291,7 +5465,7 @@
     if (id && state.streamBuffers.tools.has(id)) {
       const existing = state.streamBuffers.tools.get(id);
       if (existing && existing.isConnected) {
-        updateToolLine(existing, { title, status: st, summary });
+        updateToolLine(existing, { title, status: st, summary, detail: detailText });
         state.streamBuffers.lastToolTitle = title;
         state.streamBuffers.lastActivityLine = formatActivityLine(title, summary);
         if (!(state._historyBatchDepth > 0)) {
@@ -5306,6 +5480,7 @@
       title,
       status: st,
       summary,
+      detail: detailText,
       toolCallId: id,
     });
     transcriptRoot().appendChild(row);
@@ -5936,6 +6111,69 @@
     return true;
   }
 
+  let _compactStatusTimer = null;
+  let _compactStatusStartedAt = 0;
+  let _compactStatusSessionId = null;
+
+  function setUsageSegCompacting(active) {
+    const seg = document.querySelector(".usage-seg-context");
+    if (!seg) return;
+    seg.classList.toggle("usage-seg-compacting", !!active);
+  }
+
+  function hideCompactStatusBar() {
+    if (_compactStatusTimer != null) {
+      clearInterval(_compactStatusTimer);
+      _compactStatusTimer = null;
+    }
+    _compactStatusStartedAt = 0;
+    _compactStatusSessionId = null;
+    setUsageSegCompacting(false);
+    const bar = els.compactStatusBar;
+    if (!bar) return;
+    bar.classList.add("hidden");
+    bar.setAttribute("aria-busy", "false");
+    if (els.compactStatusElapsed) els.compactStatusElapsed.textContent = "";
+    if (els.compactStatusDetail) els.compactStatusDetail.textContent = "";
+  }
+
+  function tickCompactStatusElapsed() {
+    if (!_compactStatusStartedAt || !els.compactStatusElapsed) return;
+    const sec = Math.max(0, Math.floor((Date.now() - _compactStatusStartedAt) / 1000));
+    els.compactStatusElapsed.textContent = sec + "s";
+  }
+
+  function showCompactStatusBar(msg) {
+    const bar = els.compactStatusBar;
+    if (!bar) return;
+    const sid = msg && msg.sessionId ? String(msg.sessionId) : null;
+    const before = sanitizeCompactToken(msg && msg.tokensBefore);
+    // Restart timer only when newly started (or different session).
+    if (
+      _compactStatusTimer == null ||
+      (sid && _compactStatusSessionId && sid !== _compactStatusSessionId)
+    ) {
+      if (_compactStatusTimer != null) {
+        clearInterval(_compactStatusTimer);
+        _compactStatusTimer = null;
+      }
+      _compactStatusStartedAt = Date.now();
+      _compactStatusSessionId = sid;
+      _compactStatusTimer = setInterval(tickCompactStatusElapsed, 1000);
+    }
+    bar.classList.remove("hidden");
+    bar.setAttribute("aria-busy", "true");
+    if (els.compactStatusLabel) {
+      els.compactStatusLabel.textContent = "Compacting conversation…";
+    }
+    tickCompactStatusElapsed();
+    if (els.compactStatusDetail) {
+      els.compactStatusDetail.textContent =
+        before != null ? "from " + formatTokenCompact(before) : "";
+    }
+    setUsageSegCompacting(true);
+  }
+
   function handleCompactEvent(msg) {
     const sid = msg.sessionId || null;
     const st = String(msg.state || "");
@@ -5953,7 +6191,10 @@
       : String(sid || "") + ":" + st + ":" + String(before) + ":" + String(after);
     // Prefer one "Compacting…" line; ignore duplicate started for same session.
     if (st === "started" && state._lastCompactKey === dedupeKey) {
-      return;
+      // Keep status bar visible if a second started arrives while active.
+      if (els.compactStatusBar && !els.compactStatusBar.classList.contains("hidden")) {
+        return;
+      }
     }
     // Full-event dedupe (replay spam / dual emit with same terminal text).
     if (state._lastCompactKey === dedupeKey && st !== "started") {
@@ -5978,6 +6219,9 @@
     };
 
     if (st === "started") {
+      if (applyToSelected) {
+        showCompactStatusBar(msg);
+      }
       if (applyToSelected && allowCompactSystemLine(sid, "started")) {
         reportInfo("Compacting conversation…", {
           sessionId: sid,
@@ -5986,6 +6230,16 @@
         appendSys("Compacting conversation…");
       }
       return;
+    }
+
+    // Any terminal compact outcome for the active strip session ends it.
+    if (
+      isTerminal &&
+      (!_compactStatusSessionId ||
+        !sid ||
+        String(sid) === String(_compactStatusSessionId))
+    ) {
+      hideCompactStatusBar();
     }
 
     if (st === "completed") {
@@ -6264,7 +6518,14 @@
       seen.add(id);
       if (!force && state.subscribedSessions.has(id)) continue;
       state.subscribedSessions.add(id);
-      sendWs({ type: "subscribe", sessionId: id });
+      const msg = { type: "subscribe", sessionId: id };
+      const resume = resumeParamsFor(id);
+      if (resume) {
+        msg.sinceSeq = resume.sinceSeq;
+        msg.bootId = resume.bootId;
+        registerResumeWaiter(id);
+      }
+      sendWs(msg);
     }
   }
 
@@ -6308,7 +6569,7 @@
       if (state.hubSessionIds.indexOf(viewId) < 0) {
         state.hubSessionIds = [viewId, ...state.hubSessionIds].slice(0, 50);
       }
-      state.livePromptSessionId = liveId;
+      setLivePromptSessionId(liveId);
       if (!switched) {
         setSessionMode("live-remote", { attachSwitched: false });
       }
@@ -6382,7 +6643,7 @@
     }
     updateLatencyHintBanner();
     // Reset live prompt target until attach reports (or same-id hub session).
-    state.livePromptSessionId = isHubCreatedSession(viewId) ? viewId : null;
+    setLivePromptSessionId(isHubCreatedSession(viewId) ? viewId : null);
     if (!(state.turnRunning && viewId === liveKeep)) {
       state.promptQueueLength = 0;
     }
@@ -6529,7 +6790,7 @@
         const attachReason = String(attached.reason || "").trim();
 
         // Always remember where prompts should go
-        state.livePromptSessionId = liveId;
+        setLivePromptSessionId(liveId);
 
         if (switched) {
           // Dead view (resume_failed / dead_view): force UI + pin onto liveId so
@@ -6563,7 +6824,7 @@
           }
         } else {
           setSessionMode("live-remote", { attachSwitched: false });
-          state.livePromptSessionId = liveId;
+          setLivePromptSessionId(liveId);
         }
       } catch (err) {
         toast("Attach failed: " + err, "danger");
@@ -6673,6 +6934,7 @@
         const snap = snapshotLiveClientForRestart();
         state._pendingRestartInterrupt = snapshotHadLive(snap);
         clearLiveClientStateAfterProcessRestart("bootId changed");
+        resetSequenceTracking();
         state._hubProcessRestarted = true;
         state._resumeAfterReconnect = true;
         // One hard reload so phone/desktop never mix old JS with new Python.
@@ -6734,13 +6996,13 @@
           clearTimeout(state.reconnectTimer);
           state.reconnectTimer = null;
         }
-        connectWs();
+        connectWs({ force: true });
       }
     }
   }
 
   function probeHubHealth() {
-    fetch("/health", { method: "GET", cache: "no-store" })
+    fetch(apiUrl("/health"), { method: "GET", cache: "no-store" })
       .then((r) => {
         if (!r.ok) throw new Error("health " + r.status);
         return r.json();
@@ -6837,6 +7099,7 @@
       beginHistoryBatch();
       try {
         v.pane.innerHTML = "";
+        notePaneRebuilt(sessionId, v);
         if (!list.length) {
           appendMessage({
             role: "system",
@@ -6896,7 +7159,7 @@
   /** Merge server-truth live state from /health before multi-session resume. */
   async function mergeHealthIntoState() {
     try {
-      const r = await fetch("/health", { method: "GET", cache: "no-store" });
+      const r = await fetch(apiUrl("/health"), { method: "GET", cache: "no-store" });
       if (!r.ok) return null;
       const j = await r.json();
       if (!j) return null;
@@ -7008,7 +7271,7 @@
               const liveId = attached.liveId;
               const attachReason = String(attached.reason || "").trim();
               const switched = !!attached.switched && liveId !== viewWas;
-              state.livePromptSessionId = liveId;
+              setLivePromptSessionId(liveId);
               if (
                 switched &&
                 (attachReason === "resume_failed" ||
@@ -7073,10 +7336,14 @@
     setComposerEnabled(true);
     forceComposerUnlocked();
 
+    // Replayed panes are already complete; only the rest reload from disk (ADR-029).
+    const replayed = await awaitReplayedSessions(resumeIds, RESUME_ANSWER_TIMEOUT_MS);
+
     const hydrates = [];
     let selectedMidTurn = false;
     for (let i = 0; i < resumeIds.length; i++) {
       const sid = resumeIds[i];
+      if (replayed.has(sid)) continue;
       const isSelected = sid === state.selectedId;
       // After process-restart clear, flags are idle — do not treat as mid-turn.
       const st = sessionLiveStatus(sid);
@@ -7110,9 +7377,9 @@
           state._reconnectScrollFreeze = false;
           state._suppressStickyScroll = false;
           state._resumeAfterReconnect = false;
-          // Always force-refresh selected history after freeze lifts so completed
-          // disk messages appear even if the live stream was incomplete / zombie.
-          if (state.selectedId) {
+          // Force-refresh selected history after the freeze lifts so completed disk
+          // messages appear even if the live stream was incomplete, unless replay completed it.
+          if (state.selectedId && !replayed.has(state.selectedId)) {
             refreshHistory(state.selectedId, { force: true });
           }
         });
@@ -7178,7 +7445,12 @@
     finish();
   }
 
-  function connectWs() {
+  function connectWs(opts) {
+    const force = !!(opts && opts.force);
+    const prev = state.ws;
+    const prevLive =
+      prev && (prev.readyState === WebSocket.CONNECTING || prev.readyState === WebSocket.OPEN);
+    if (prevLive && !force) return;
     if (state.reconnectTimer) {
       clearTimeout(state.reconnectTimer);
       state.reconnectTimer = null;
@@ -7188,29 +7460,42 @@
 
     const ws = new WebSocket(wsUrl());
     state.ws = ws;
+    if (prevLive) {
+      try {
+        prev.close();
+      } catch (_) {}
+    }
 
     ws.addEventListener("open", () => {
+      if (state.ws !== ws) return;
       const wasReconnect =
         state.reconnectAttempt > 0 || state.wsState === "reconnecting";
       state.wsState = "open";
       updateStatusPill();
       sendWs({ type: "hello" });
+      sendPresence({ force: true });
+      if (!state.push.loaded) loadPushState();
+      resetSocketResumeState();
       resumeAfterReconnect({ wasReconnect });
     });
 
     ws.addEventListener("message", (ev) => {
+      if (state.ws !== ws) return;
       let msg;
       try {
         msg = JSON.parse(ev.data);
       } catch {
         return;
       }
-      onHubMessage(msg);
+      receiveHubMessage(msg);
     });
 
     ws.addEventListener("close", () => {
+      if (state.ws !== ws) return;
       state.wsState = "reconnecting";
       if (state.subscribedSessions) state.subscribedSessions.clear();
+      resetSocketResumeState();
+      releaseApprovalAnswers();
       startHealthProbe();
       updateStatusPill();
       setComposerEnabled(false);
@@ -7235,6 +7520,157 @@
     state.reconnectTimer = setTimeout(connectWs, delay);
   }
 
+  // Sequenced events and resume (ADR-029)
+  const SEQUENCED_TYPES = new Set(["acp", "turn", "system", "terminal_out", "compact", "usage", "commands"]);
+  const RESUME_ANSWER_TIMEOUT_MS = 1500;
+  const SEEN_SEQ_WINDOW = 512;
+
+  // Seqs from two viewers can arrive out of order, so dedupe by membership, not a high-water mark.
+  function seqSeen(v, seq) {
+    return seq <= (v.seqFloor || 0) || !!(v.seenSeqs && v.seenSeqs.has(seq));
+  }
+
+  function rememberSeq(v, seq) {
+    if (!v.seenSeqs) v.seenSeqs = new Set();
+    v.seenSeqs.add(seq);
+    if (seq > (v.lastSeq || 0)) v.lastSeq = seq;
+    if (v.seenSeqs.size <= SEEN_SEQ_WINDOW) return;
+    const oldest = v.seenSeqs.values().next().value;
+    v.seenSeqs.delete(oldest);
+    if (oldest > (v.seqFloor || 0)) v.seqFloor = oldest;
+  }
+
+  /** Drop a stamped event the pane already holds; a session without a pane is never gated. */
+  function admitSequenced(msg) {
+    if (!SEQUENCED_TYPES.has(msg.type) || !msg.sessionId) return true;
+    const seq = Number(msg.seq);
+    if (!(seq > 0)) return true;
+    const v = state.sessionViews.get(msg.sessionId);
+    return !(v && seqSeen(v, seq));
+  }
+
+  function noteSequenced(msg) {
+    if (!SEQUENCED_TYPES.has(msg.type) || !msg.sessionId) return;
+    const seq = Number(msg.seq);
+    const v = seq > 0 ? state.sessionViews.get(msg.sessionId) : null;
+    if (v) rememberSeq(v, seq);
+  }
+
+  function receiveHubMessage(msg) {
+    if (!msg || typeof msg !== "object" || !admitSequenced(msg)) return;
+    try {
+      onHubMessage(msg);
+    } finally {
+      noteSequenced(msg);
+    }
+  }
+
+  function noteSnapshotSeq(sessionId, seq) {
+    const v = sessionId ? state.sessionViews.get(sessionId) : null;
+    const n = Number(seq);
+    if (!v || !(n > 0)) return;
+    if (n > (v.lastSeq || 0)) v.lastSeq = n;
+    if (n <= (v.seqFloor || 0)) return;
+    v.seqFloor = n;
+    if (v.seenSeqs) {
+      for (const s of [...v.seenSeqs]) if (s <= n) v.seenSeqs.delete(s);
+    }
+  }
+
+  /** Resume only from a pane that holds a snapshot plus every event since it. */
+  function resumeParamsFor(sessionId) {
+    const v = state.sessionViews.get(sessionId);
+    if (!v || !v.historyLoaded || !(v.lastSeq > 0) || !state.bootId) return null;
+    return { sinceSeq: v.lastSeq, bootId: state.bootId };
+  }
+
+  /** One wake may skip its reload per replay; later wakes on the same socket reload again. */
+  function takeReplayMark(sessionId) {
+    const v = sessionId ? state.sessionViews.get(sessionId) : null;
+    if (!v || !v.replayed) return false;
+    v.replayed = false;
+    return true;
+  }
+
+  function registerResumeWaiter(sessionId) {
+    if (!state.resumeWaiters) state.resumeWaiters = new Map();
+    if (state.resumeWaiters.has(sessionId)) return;
+    const waiter = { paneRebuilt: false };
+    waiter.promise = new Promise((resolve) => {
+      waiter.resolve = resolve;
+    });
+    state.resumeWaiters.set(sessionId, waiter);
+  }
+
+  /** A pane redrawn from disk no longer matches the resume point its pending request asked for. */
+  function notePaneRebuilt(sessionId, v) {
+    v.lastSeq = 0;
+    const waiter = state.resumeWaiters && state.resumeWaiters.get(sessionId);
+    if (waiter) waiter.paneRebuilt = true;
+  }
+
+  function settleResumeWaiter(sessionId, outcome) {
+    const waiter = sessionId && state.resumeWaiters ? state.resumeWaiters.get(sessionId) : null;
+    if (!waiter) return;
+    state.resumeWaiters.delete(sessionId);
+    waiter.resolve(outcome);
+  }
+
+  function settleAllResumeWaiters(outcome) {
+    if (!state.resumeWaiters) return;
+    for (const sid of [...state.resumeWaiters.keys()]) settleResumeWaiter(sid, outcome);
+  }
+
+  /** Bounded wait for the hub's answer to each resume request; returns the ids it replayed. */
+  async function awaitReplayedSessions(ids, timeoutMs) {
+    const replayed = new Set();
+    const waits = ids.map(async (sid) => {
+      const waiter = state.resumeWaiters && state.resumeWaiters.get(sid);
+      if (!waiter) {
+        const v = state.sessionViews.get(sid);
+        if (v && v.replayed) replayed.add(sid);
+        return;
+      }
+      let timer = null;
+      const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      });
+      if ((await Promise.race([waiter.promise, timeout])) === "replay") replayed.add(sid);
+      clearTimeout(timer);
+    });
+    await Promise.all(waits);
+    return replayed;
+  }
+
+  function onReplay(msg) {
+    const sid = msg.sessionId || null;
+    const waiter = sid && state.resumeWaiters ? state.resumeWaiters.get(sid) : null;
+    if (waiter && waiter.paneRebuilt) {
+      settleResumeWaiter(sid, "stale");
+      return;
+    }
+    const events = Array.isArray(msg.events) ? msg.events : [];
+    for (let i = 0; i < events.length; i++) receiveHubMessage(events[i]);
+    const v = sid ? state.sessionViews.get(sid) : null;
+    if (v) v.replayed = true;
+    settleResumeWaiter(sid, "replay");
+  }
+
+  function resetSocketResumeState() {
+    for (const v of state.sessionViews.values()) v.replayed = false;
+    settleAllResumeWaiters("reset");
+  }
+
+  function resetSequenceTracking() {
+    for (const v of state.sessionViews.values()) {
+      v.lastSeq = 0;
+      v.seqFloor = 0;
+      v.seenSeqs = new Set();
+      v.replayed = false;
+    }
+  }
+  // End sequenced events
+
   function onHubMessage(msg) {
     const type = msg.type;
     if (type === "status") {
@@ -7247,6 +7683,7 @@
         acpHealAttempts:
           msg.acpHealAttempts != null ? Number(msg.acpHealAttempts) || 0 : 0,
         acpHealError: msg.acpHealError || null,
+        acpHealExhausted: !!msg.acpHealExhausted,
         bind: msg.bind || "local",
         tailscaleIp: msg.tailscaleIp || null,
         loadedSessionId: msg.loadedSessionId || null,
@@ -7437,6 +7874,7 @@
           updateTurnStrip();
         }
       }
+      applyStatusApprovals(msg);
       updateVersionBadge();
       updateStatusPill();
       scheduleSessionPills();
@@ -7467,15 +7905,22 @@
       return;
     }
     if (type === "history") {
+      settleResumeWaiter(msg.sessionId, "history");
       if (msg.sessionId === state.selectedId) {
         // Never wipe a live stream with a disk dump mid-turn.
         if (turnRunningOnSelected()) return;
         const histMsgs = msg.messages || [];
         applyHistoryMessages(histMsgs, { jump: false });
         rehydrateGoalFromHistory(msg.sessionId, histMsgs);
+        noteSnapshotSeq(msg.sessionId, msg.seq);
       } else if (msg.sessionId) {
         hydrateSessionPane(msg.sessionId, msg.messages || []);
+        noteSnapshotSeq(msg.sessionId, msg.seq);
       }
+      return;
+    }
+    if (type === "replay") {
+      onReplay(msg);
       return;
     }
     if (type === "acp") {
@@ -7537,7 +7982,7 @@
         if (state.hubSessionIds.indexOf(toId) < 0) {
           state.hubSessionIds = [toId, ...state.hubSessionIds].slice(0, 50);
         }
-        state.livePromptSessionId = toId;
+        setLivePromptSessionId(toId);
         setSessionMode("live-remote", {
           attachSwitched: !!(fromId && fromId !== toId),
         });
@@ -7550,7 +7995,7 @@
       if (!state.selectedId) {
         applySessionSwitch(fromId, toId, msg.reason || "", msg.message || "");
       } else {
-        state.livePromptSessionId = state.livePromptSessionId || toId;
+        setLivePromptSessionId(state.livePromptSessionId || toId);
         subscribeSessionIds(state.selectedId, toId, liveTurnId());
       }
       return;
@@ -7578,6 +8023,9 @@
       // Track turn globally so session list + offscreen pane stay live during switches.
       const busyIdle =
         msg.state === "idle" && msg.error && /busy/i.test(String(msg.error));
+      if (!busyIdle && (msg.state === "running" || msg.state === "idle")) {
+        noteTurnState(sid, msg.state === "running");
+      }
       // Old hub "busy" idle+error: keep turnRunning (server still mid-turn) and unlock composer.
       if (busyIdle) {
         if (msg.error) {
@@ -7718,6 +8166,14 @@
     }
     if (type === "user_question_resolved") {
       onUserQuestionResolved(msg);
+      return;
+    }
+    if (type === "approval_request") {
+      onApprovalRequest(msg);
+      return;
+    }
+    if (type === "approval_resolved") {
+      onApprovalResolved(msg);
       return;
     }
     if (type === "terminal_out") {
@@ -7985,6 +8441,890 @@
     }
     closeAskUserModal();
   }
+
+  // Approvals (ADR-027): card above the composer, rail badge, per-session mode.
+  const APPROVAL_MODES = ["balanced", "strict", "trusted"];
+  const APPROVAL_KIND_LABELS = {
+    shell: "Shell command",
+    file: "File change",
+    tool: "Tool",
+  };
+  const APPROVAL_OFFLINE_TEXT = "Not connected; answer not sent";
+  const APPROVAL_ANSWER_TIMEOUT_MS = 10000;
+  const APPROVAL_SUMMARY_LINES = 6;
+  const APPROVAL_CHARS_PER_LINE = 36;
+  const APPROVAL_TRUSTED_CONFIRM =
+    "Trusted mode never asks before running commands, changing files outside " +
+    "the project, or using tools. Switch this session to Trusted?";
+
+  function normalizeApproval(raw) {
+    if (!raw || !raw.id) return null;
+    const expiresAt = Number(raw.expiresAt) || 0;
+    const serverNow = Number(raw.serverNow);
+    const skew = Number.isFinite(serverNow) ? serverNow - Date.now() / 1000 : 0;
+    return {
+      deadline: expiresAt ? expiresAt - skew : 0,
+      id: String(raw.id),
+      sessionId: raw.sessionId ? String(raw.sessionId) : null,
+      kind: APPROVAL_KIND_LABELS[raw.kind] ? raw.kind : "tool",
+      summary: String(raw.summary || ""),
+      cwd: raw.cwd ? String(raw.cwd) : "",
+      category: String(raw.category || ""),
+      similarRule: raw.similarRule ? String(raw.similarRule) : null,
+      createdAt: Number(raw.createdAt) || 0,
+      expiresAt,
+    };
+  }
+
+  function approvalSessionId() {
+    return promptSessionId();
+  }
+
+  function isApprovalOnScreen(req) {
+    if (!req.sessionId) return true;
+    return (
+      req.sessionId === state.selectedId ||
+      (!!state.selectedId && req.sessionId === state.livePromptSessionId)
+    );
+  }
+
+  function onApprovalRequest(msg) {
+    const req = normalizeApproval(msg);
+    if (!req) return;
+    state.pendingApprovals.set(req.id, req);
+    notifyApproval(req);
+    renderApprovals();
+  }
+
+  function applyStatusApprovals(msg) {
+    if (msg.approvalModes && typeof msg.approvalModes === "object") {
+      state.approvalModes = msg.approvalModes;
+    }
+    if (APPROVAL_MODES.indexOf(msg.approvalDefaultMode) >= 0) {
+      state.approvalDefaultMode = msg.approvalDefaultMode;
+    }
+    if (Array.isArray(msg.pendingApprovals)) {
+      const next = new Map();
+      for (const raw of msg.pendingApprovals) {
+        const req = normalizeApproval(raw);
+        if (req) next.set(req.id, req);
+      }
+      state.pendingApprovals = next;
+      Array.from(state.approvalAnswering).forEach((id) => {
+        if (!next.has(id)) stopAnswering(id);
+      });
+      pruneApprovalIds(state.approvalNotified, next);
+      next.forEach((req) => notifyApproval(req));
+    }
+    renderApprovals();
+  }
+
+  function pruneApprovalIds(ids, live) {
+    Array.from(ids).forEach((id) => {
+      if (!live.has(id)) ids.delete(id);
+    });
+  }
+
+  function onApprovalResolved(msg) {
+    const id = String(msg.id || "");
+    if (!id) return;
+    const req = state.pendingApprovals.get(id);
+    state.pendingApprovals.delete(id);
+    stopAnswering(id);
+    state.approvalNotified.delete(id);
+    renderApprovals();
+    if (!req) return;
+    const sid = (msg.sessionId && String(msg.sessionId)) || req.sessionId;
+    appendApprovalNote(sid, approvalOutcomeText(msg, req));
+  }
+
+  function approvalOutcomeText(msg, req) {
+    const summary = req.summary || "request";
+    if (msg.decision === "allow") {
+      if (msg.scope === "project" && req.similarRule) {
+        return "Allowed for this project: " + req.similarRule;
+      }
+      return "Allowed by you: " + summary;
+    }
+    if (msg.by === "timeout") return "Timed out, denied: " + summary;
+    if (msg.by === "cancelled") return "Cancelled: " + summary;
+    return "Denied: " + summary;
+  }
+
+  function appendApprovalNote(sessionId, text) {
+    const write = () => appendMessage({ role: "system", text });
+    if (!sessionId || sessionId === state.selectedId) {
+      if (state.selectedId) write();
+    } else if (shouldApplyAcpToSession(sessionId)) {
+      withSessionTarget(sessionId, write);
+    }
+  }
+
+  function notifyApproval(req) {
+    if (state.approvalNotified.has(req.id)) return;
+    state.approvalNotified.add(req.id);
+    if (isApprovalOnScreen(req) && state.mainMode === "chat") return;
+    const sid = req.sessionId || state.selectedId;
+    toast("Approval needed: " + approvalSessionTitle(sid), "", 15000, {
+      onTap: () => focusApprovalSession(sid),
+    });
+  }
+
+  function approvalSessionTitle(sessionId) {
+    const row = (state.sessions || []).find((s) => s && s.sessionId === sessionId);
+    return (row && row.title) || shortSessionId(sessionId) || "this session";
+  }
+
+  async function focusApprovalSession(sessionId) {
+    await openSessionById(sessionId);
+    renderApprovalStack();
+  }
+
+  function stopAnswering(id) {
+    state.approvalAnswering.delete(id);
+    const timer = state.approvalAnswerTimers.get(id);
+    if (timer) clearTimeout(timer);
+    state.approvalAnswerTimers.delete(id);
+  }
+
+  function releaseApprovalAnswers() {
+    if (!state.approvalAnswering.size) return;
+    Array.from(state.approvalAnswering).forEach(stopAnswering);
+    renderApprovalStack();
+  }
+
+  function startAnswerWatchdog(id) {
+    const timer = setTimeout(() => {
+      state.approvalAnswerTimers.delete(id);
+      if (!state.approvalAnswering.has(id)) return;
+      stopAnswering(id);
+      renderApprovalStack();
+      if (state.pendingApprovals.has(id)) {
+        toast("No confirmation from the hub; tap again", "danger");
+      }
+    }, APPROVAL_ANSWER_TIMEOUT_MS);
+    state.approvalAnswerTimers.set(id, timer);
+  }
+
+  function answerApproval(id, decision, scope) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      toast(APPROVAL_OFFLINE_TEXT, "danger");
+      return;
+    }
+    stopAnswering(id);
+    state.approvalAnswering.add(id);
+    sendWs({ type: "approval_answer", id, decision, scope });
+    startAnswerWatchdog(id);
+    renderApprovalStack();
+  }
+
+  function renderApprovals() {
+    renderApprovalStack();
+    renderApprovalMode();
+    syncApprovalBadges();
+  }
+
+  function visibleApprovals() {
+    return Array.from(state.pendingApprovals.values())
+      .filter(isApprovalOnScreen)
+      .sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  function renderApprovalStack() {
+    const host = els.approvalStack;
+    if (!host) return;
+    const existing = new Map();
+    host.querySelectorAll(".approval-card").forEach((card) => {
+      existing.set(card.dataset.approvalId, card);
+    });
+    const cards = visibleApprovals().map(
+      (req) => existing.get(req.id) || buildApprovalCard(req)
+    );
+    existing.forEach((card) => {
+      if (cards.indexOf(card) < 0) card.remove();
+    });
+    cards.forEach((card, i) => {
+      if (host.children[i] !== card) host.insertBefore(card, host.children[i] || null);
+      setApprovalCardBusy(card, state.approvalAnswering.has(card.dataset.approvalId));
+    });
+    const wasHidden = host.classList.contains("hidden");
+    host.classList.toggle("hidden", cards.length === 0);
+    cards.forEach(syncApprovalSummary);
+    updateApprovalCountdowns();
+    syncApprovalTicker(cards.length > 0);
+    if (cards.length && wasHidden) scrollIfSticky();
+  }
+
+  function buildApprovalCard(req) {
+    const card = document.createElement("section");
+    card.className = "approval-card";
+    card.dataset.approvalId = req.id;
+    card.dataset.kind = req.kind;
+    card.setAttribute("aria-label", "Approval needed: " + APPROVAL_KIND_LABELS[req.kind]);
+    card.append(
+      buildApprovalHead(req),
+      buildApprovalSummary(req),
+      buildApprovalMeta(req),
+      buildApprovalActions(req)
+    );
+    return card;
+  }
+
+  function buildApprovalHead(req) {
+    const head = document.createElement("div");
+    head.className = "approval-head";
+    const kind = document.createElement("span");
+    kind.className = "approval-kind";
+    kind.textContent = APPROVAL_KIND_LABELS[req.kind];
+    const countdown = document.createElement("span");
+    countdown.className = "approval-countdown";
+    // Ticks every second; keep the assertive stack from announcing each tick.
+    countdown.setAttribute("aria-live", "off");
+    head.append(kind, countdown);
+    return head;
+  }
+
+  function buildApprovalSummary(req) {
+    const wrap = document.createElement("div");
+    wrap.className = "approval-summary-wrap";
+    const summary = document.createElement("div");
+    summary.className = "approval-summary collapsed";
+    summary.textContent = req.summary;
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "approval-more hidden";
+    more.addEventListener("click", () => {
+      summary.classList.toggle("collapsed");
+      syncApprovalSummary(wrap);
+    });
+    wrap.append(summary, more);
+    return wrap;
+  }
+
+  function syncApprovalSummary(container) {
+    const summary = container.querySelector(".approval-summary");
+    const more = container.querySelector(".approval-more");
+    if (!summary || !more) return;
+    if (!summary.classList.contains("collapsed")) {
+      more.classList.remove("hidden");
+      more.textContent = "Show less";
+      return;
+    }
+    const hidden = hiddenSummaryLines(summary);
+    more.classList.toggle("hidden", hidden <= 0);
+    more.textContent = "+" + hidden + (hidden === 1 ? " more line" : " more lines");
+  }
+
+  // Cards built while #chat-panel is hidden have no layout, so estimate from text.
+  function hiddenSummaryLines(summary) {
+    if (summary.clientHeight > 0) {
+      const cs = getComputedStyle(summary);
+      const lineH = parseFloat(cs.lineHeight) || 18;
+      const pad = parseFloat(cs.paddingBottom) || 0;
+      return Math.max(0, Math.round((summary.scrollHeight - summary.clientHeight - pad) / lineH));
+    }
+    const lines = summary.textContent.split("\n").reduce(
+      (n, line) => n + Math.max(1, Math.ceil(line.length / APPROVAL_CHARS_PER_LINE)),
+      0
+    );
+    return lines - APPROVAL_SUMMARY_LINES;
+  }
+
+  function buildApprovalMeta(req) {
+    const meta = document.createElement("div");
+    meta.className = "approval-meta";
+    if (req.cwd) {
+      const folder = document.createElement("button");
+      folder.type = "button";
+      folder.className = "approval-folder";
+      folder.title = req.cwd;
+      folder.textContent = basename(req.cwd);
+      folder.setAttribute("aria-label", "Folder " + req.cwd);
+      folder.addEventListener("click", () => {
+        const full = folder.textContent === req.cwd;
+        folder.textContent = full ? basename(req.cwd) : req.cwd;
+        folder.classList.toggle("expanded", !full);
+      });
+      meta.appendChild(folder);
+    }
+    if (req.category) {
+      const category = document.createElement("span");
+      category.className = "approval-category";
+      category.textContent = req.category;
+      meta.appendChild(category);
+    }
+    return meta;
+  }
+
+  function buildApprovalActions(req) {
+    const actions = document.createElement("div");
+    actions.className = "approval-actions";
+    actions.append(
+      approvalButton("Deny", "btn btn-ghost approval-deny", () =>
+        answerApproval(req.id, "deny", "once")
+      ),
+      approvalButton("Allow", "btn btn-accent approval-allow", () =>
+        answerApproval(req.id, "allow", "once")
+      )
+    );
+    if (req.similarRule) {
+      actions.appendChild(
+        approvalButton(
+          "Always allow " + req.similarRule + " in this project",
+          "btn btn-ghost approval-always",
+          () => answerApproval(req.id, "allow", "project")
+        )
+      );
+    }
+    return actions;
+  }
+
+  function approvalButton(label, className, onClick) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = className;
+    btn.textContent = label;
+    btn.addEventListener("click", onClick);
+    return btn;
+  }
+
+  function setApprovalCardBusy(card, busy) {
+    card.classList.toggle("busy", busy);
+    card.querySelectorAll(".approval-actions .btn").forEach((btn) => {
+      btn.disabled = busy;
+    });
+  }
+
+  function formatApprovalCountdown(deadline, nowMs) {
+    const left = Math.max(0, Math.ceil(deadline - nowMs / 1000));
+    const secs = String(left % 60).padStart(2, "0");
+    return "Auto-deny in " + Math.floor(left / 60) + ":" + secs;
+  }
+
+  function updateApprovalCountdowns() {
+    if (!els.approvalStack) return;
+    const now = Date.now();
+    els.approvalStack.querySelectorAll(".approval-card").forEach((card) => {
+      const req = state.pendingApprovals.get(card.dataset.approvalId);
+      const node = card.querySelector(".approval-countdown");
+      if (!req || !node || !req.deadline) return;
+      node.textContent = formatApprovalCountdown(req.deadline, now);
+      node.classList.toggle("urgent", req.deadline - now / 1000 < 60);
+    });
+  }
+
+  function tickApprovals() {
+    updateApprovalCountdowns();
+    if (els.approvalStack) {
+      els.approvalStack.querySelectorAll(".approval-card").forEach(syncApprovalSummary);
+    }
+  }
+
+  function syncApprovalTicker(on) {
+    if (on && !state.approvalTick) {
+      state.approvalTick = setInterval(tickApprovals, 1000);
+    } else if (!on && state.approvalTick) {
+      clearInterval(state.approvalTick);
+      state.approvalTick = null;
+    }
+  }
+
+  function sessionHasApproval(sessionId) {
+    for (const req of state.pendingApprovals.values()) {
+      if (req.sessionId === sessionId) return true;
+    }
+    return false;
+  }
+
+  function syncApprovalBadges() {
+    if (!els.sessionList) return;
+    els.sessionList.querySelectorAll(".session-row[data-session-id]").forEach((row) => {
+      const has = sessionHasApproval(row.getAttribute("data-session-id"));
+      row.classList.toggle("has-approval", has);
+      const titleRow = row.querySelector(".title-row");
+      if (!titleRow) return;
+      const pill = titleRow.querySelector(".session-pill.status-approval");
+      if (has && !pill) titleRow.insertBefore(approvalPill(), titleRow.children[1] || null);
+      else if (!has && pill) pill.remove();
+    });
+  }
+
+  function approvalPill() {
+    const pill = document.createElement("span");
+    pill.className = "session-pill status-approval";
+    pill.textContent = "Approve";
+    return pill;
+  }
+
+  function currentApprovalMode() {
+    const sid = approvalSessionId();
+    const mode = sid ? state.approvalModes[sid] : null;
+    return APPROVAL_MODES.indexOf(mode) >= 0 ? mode : state.approvalDefaultMode;
+  }
+
+  function renderApprovalMode() {
+    const box = els.approvalMode;
+    if (!box) return;
+    box.classList.toggle("hidden", !state.selectedId);
+    const mode = currentApprovalMode();
+    box.dataset.mode = mode;
+    box.querySelectorAll("[data-mode]").forEach((opt) => {
+      opt.setAttribute("aria-pressed", opt.dataset.mode === mode ? "true" : "false");
+    });
+  }
+
+  function setApprovalMode(mode) {
+    const sid = approvalSessionId();
+    if (!sid || APPROVAL_MODES.indexOf(mode) < 0) return;
+    if (mode === currentApprovalMode()) return;
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      toast("Not connected; mode not changed", "danger");
+      return;
+    }
+    if (mode === "trusted" && !window.confirm(APPROVAL_TRUSTED_CONFIRM)) return;
+    sendWs({ type: "set_approval_mode", sessionId: approvalSessionId(), mode });
+    state.approvalModes = Object.assign({}, state.approvalModes, { [sid]: mode });
+    renderApprovalMode();
+  }
+  // End approvals
+
+  // Push and phone setup (ADR-028): service worker, notifications, presence, QR.
+  const PRESENCE_HEARTBEAT_MS = 60000;
+  const SW_READY_TIMEOUT_MS = 10000;
+  const USER_IDLE_MS = 120000;
+  const USER_IDLE_CHECK_MS = 10000;
+  const USER_INPUT_EVENTS = ["pointerdown", "pointermove", "keydown", "touchstart", "wheel", "scroll"];
+
+  async function hubJson(path, init) {
+    const res = await fetch(apiUrl(path), init);
+    let data = null;
+    try {
+      data = await res.json();
+    } catch (_) {}
+    return { ok: res.ok, status: res.status, data: data || {} };
+  }
+
+  function postJson(path, body) {
+    return hubJson(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+  }
+
+  async function openSessionById(sessionId) {
+    if (sessionId && sessionId !== state.selectedId) {
+      const row = (state.sessions || []).find((s) => s && s.sessionId === sessionId);
+      await openSession(row || { sessionId });
+    }
+    if (state.mainMode === "file") closeFileMode({ force: false });
+  }
+
+  function consumeSessionDeepLink() {
+    let url;
+    try {
+      url = new URL(location.href);
+    } catch (_) {
+      return null;
+    }
+    const sessionId = (url.searchParams.get("session") || "").trim();
+    if (!sessionId) return null;
+    url.searchParams.delete("session");
+    try {
+      history.replaceState(history.state, "", url.pathname + url.search + url.hash);
+    } catch (_) {}
+    return sessionId;
+  }
+
+  async function loadWhoami() {
+    try {
+      const res = await fetch(apiUrl("/api/whoami"));
+      if (res.ok) {
+        state.whoami = await res.json();
+        state.authNeeded = false;
+      } else if (res.status === 401 || res.status === 403 || res.status === 404) {
+        state.authNeeded = true;
+      }
+    } catch (_) {}
+    updateAuthTokenBanner();
+  }
+
+  function registerServiceWorker() {
+    if (!(window.isSecureContext && "serviceWorker" in navigator)) return;
+    navigator.serviceWorker.addEventListener("message", onServiceWorkerMessage);
+    navigator.serviceWorker.startMessages();
+    navigator.serviceWorker.register("/sw.js", { scope: "/" }).catch(() => {});
+  }
+
+  function onServiceWorkerMessage(event) {
+    const data = event.data || {};
+    if (data.type !== "open-url") return;
+    noteUserInput();
+    try {
+      const url = new URL(String(data.url || "/"), location.origin);
+      if (url.origin !== location.origin) return;
+      const sessionId = url.searchParams.get("session");
+      if (sessionId) openSessionById(sessionId);
+    } catch (_) {}
+  }
+
+  function serviceWorkerReady() {
+    return Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("service worker not ready")), SW_READY_TIMEOUT_MS)
+      ),
+    ]);
+  }
+
+  function isIosDevice() {
+    const ua = navigator.userAgent || "";
+    return /iPhone|iPad|iPod/.test(ua) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  }
+
+  function isStandaloneApp() {
+    if (navigator.standalone === true) return true;
+    return !!(window.matchMedia && window.matchMedia("(display-mode: standalone)").matches);
+  }
+
+  function pushDeviceLabel() {
+    const ua = navigator.userAgent || "";
+    let device = "Browser";
+    if (/iPhone/.test(ua)) device = "iPhone";
+    else if (isIosDevice()) device = "iPad";
+    else if (/Android/.test(ua)) device = "Android";
+    else if (/Windows/.test(ua)) device = "Windows";
+    else if (/Macintosh/.test(ua)) device = "Mac";
+    else if (/Linux/.test(ua)) device = "Linux";
+    return device + (isStandaloneApp() ? " app" : " browser");
+  }
+
+  function urlBase64ToUint8Array(value) {
+    const padded = value + "=".repeat((4 - (value.length % 4)) % 4);
+    const raw = atob(padded.replace(/-/g, "+").replace(/_/g, "/"));
+    return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+  }
+
+  function computePushState() {
+    const p = state.push;
+    if (!window.isSecureContext) return "insecure";
+    if (isIosDevice() && !isStandaloneApp()) return "home-screen";
+    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+      return "unsupported";
+    }
+    if (!p.config) return "checking";
+    if (!p.config.enabled) return "disabled";
+    if (p.permission === "denied") return "blocked";
+    return p.subscribed ? "on" : "off";
+  }
+
+  function pushStateText(st) {
+    switch (st) {
+      case "insecure":
+        return {
+          label: "Notifications unavailable",
+          detail: "Open the https Tailscale address (ends in .ts.net) to get notifications here.",
+        };
+      case "home-screen":
+        return {
+          label: "Add to Home Screen first",
+          detail: "In Safari tap Share, then Add to Home Screen, and open Grok Hub from there.",
+        };
+      case "unsupported":
+        return { label: "Notifications unavailable", detail: "This browser does not support web push." };
+      case "disabled":
+        return {
+          label: "Notifications unavailable",
+          detail: (state.push.config && state.push.config.reason) || "Push is turned off on the hub.",
+        };
+      case "blocked":
+        return {
+          label: "Notifications blocked",
+          detail: isIosDevice()
+            ? "Turn them back on in iOS Settings, Notifications, Grok Hub."
+            : "Allow notifications for this site in the browser's site settings, then reload.",
+        };
+      case "on":
+        return { label: "Notifications on", detail: "" };
+      case "off":
+        return { label: "Notifications off", detail: "" };
+      default:
+        return { label: "Notifications", detail: "" };
+    }
+  }
+
+  function renderPushControl() {
+    if (!els.pushControl) return;
+    const st = computePushState();
+    const text = pushStateText(st);
+    els.pushControl.dataset.state = st;
+    els.pushLabel.textContent = text.label;
+    els.pushDetail.textContent = text.detail;
+    els.pushDetail.classList.toggle("hidden", !text.detail);
+    els.btnPushOn.classList.toggle("hidden", st !== "off");
+    els.btnPushTest.classList.toggle("hidden", st !== "on");
+    els.btnPushOff.classList.toggle("hidden", st !== "on");
+    [els.btnPushOn, els.btnPushTest, els.btnPushOff].forEach((btn) => {
+      btn.disabled = state.push.busy;
+    });
+  }
+
+  async function loadPushState() {
+    const p = state.push;
+    if (!p.loaded) {
+      try {
+        const res = await hubJson("/api/push/config");
+        if (res.ok) {
+          p.config = res.data;
+          p.loaded = true;
+        } else {
+          p.config = { enabled: false, reason: "Could not load push settings from the hub." };
+        }
+      } catch (_) {
+        p.config = { enabled: false, reason: "Could not reach the hub for push settings." };
+      }
+    }
+    if ("Notification" in window) p.permission = Notification.permission;
+    if (window.isSecureContext && "serviceWorker" in navigator && "PushManager" in window) {
+      try {
+        const reg = await navigator.serviceWorker.getRegistration("/");
+        const sub = reg ? await reg.pushManager.getSubscription() : null;
+        p.subscribed = !!sub;
+        if (sub) await syncPushSubscription(reg, sub);
+      } catch (_) {}
+    }
+    renderPushControl();
+  }
+
+  function normalizeBase64Url(value) {
+    return String(value || "").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function subscriptionKey(sub) {
+    const key = sub.options && sub.options.applicationServerKey;
+    if (!key) return "";
+    let raw = "";
+    new Uint8Array(key).forEach((b) => {
+      raw += String.fromCharCode(b);
+    });
+    return normalizeBase64Url(btoa(raw));
+  }
+
+  // Once per page load: heal a hub key rotation or a wiped subscription store.
+  async function syncPushSubscription(reg, sub) {
+    const p = state.push;
+    if (p.synced || Notification.permission !== "granted") return;
+    if (!p.config || !p.config.enabled || !p.config.publicKey) return;
+    p.synced = true;
+    let current = sub;
+    try {
+      if (subscriptionKey(sub) !== normalizeBase64Url(p.config.publicKey)) {
+        await sub.unsubscribe();
+        current = null;
+        current = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(p.config.publicKey),
+        });
+      }
+      await postJson("/api/push/subscribe", {
+        subscription: current.toJSON(),
+        device: pushDeviceLabel(),
+      });
+    } catch (_) {}
+    p.subscribed = !!current;
+  }
+
+  async function enablePush() {
+    const p = state.push;
+    if (p.busy || !p.config || !p.config.publicKey) return;
+    p.busy = true;
+    renderPushControl();
+    let sub = null;
+    try {
+      p.permission = await Notification.requestPermission();
+      if (p.permission !== "granted") return;
+      const reg = await serviceWorkerReady();
+      const options = {
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(p.config.publicKey),
+      };
+      try {
+        sub = await reg.pushManager.subscribe(options);
+      } catch (err) {
+        const stale = await reg.pushManager.getSubscription();
+        if (!stale) throw err;
+        await stale.unsubscribe();
+        sub = await reg.pushManager.subscribe(options);
+      }
+      const res = await postJson("/api/push/subscribe", {
+        subscription: sub.toJSON(),
+        device: pushDeviceLabel(),
+      });
+      if (!res.ok) throw new Error("hub answered " + res.status);
+      p.subscribed = true;
+      p.synced = true;
+      toast("Notifications on for this device", "");
+    } catch (err) {
+      if (sub) sub.unsubscribe().catch(() => {});
+      toast("Could not turn on notifications: " + ((err && err.message) || "error"), "danger");
+    } finally {
+      p.busy = false;
+      renderPushControl();
+    }
+  }
+
+  async function disablePush() {
+    const p = state.push;
+    if (p.busy) return;
+    p.busy = true;
+    renderPushControl();
+    try {
+      const reg = await navigator.serviceWorker.getRegistration("/");
+      const sub = reg && (await reg.pushManager.getSubscription());
+      if (sub) {
+        const endpoint = sub.endpoint;
+        await sub.unsubscribe();
+        await postJson("/api/push/unsubscribe", { endpoint });
+      }
+      p.subscribed = false;
+      toast("Notifications off for this device", "");
+    } catch (_) {
+      toast("Could not turn off notifications", "danger");
+    } finally {
+      p.busy = false;
+      renderPushControl();
+    }
+  }
+
+  async function sendPushTest() {
+    try {
+      const res = await postJson("/api/push/test", {});
+      if (!res.ok) throw new Error(String(res.status));
+      const sent = Number(res.data.sent) || 0;
+      toast(sent ? "Test sent to " + sent + (sent === 1 ? " device" : " devices") : "No devices are subscribed", sent ? "" : "danger");
+    } catch (_) {
+      toast("Could not send a test notification", "danger");
+    }
+  }
+
+  function pageVisible() {
+    return document.visibilityState === "visible" && document.hasFocus() && !state.userIdle;
+  }
+
+  function noteUserInput() {
+    state.lastInputAt = Date.now();
+    if (!state.userIdle) return;
+    state.userIdle = false;
+    sendPresence();
+  }
+
+  function checkUserIdle() {
+    if (state.userIdle || Date.now() - state.lastInputAt < USER_IDLE_MS) return;
+    state.userIdle = true;
+    sendPresence();
+  }
+
+  function sendPresence(opts) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    const msg = { type: "presence", visible: pageVisible(), sessionId: approvalSessionId() || null };
+    const key = msg.visible + "|" + msg.sessionId;
+    if (key === state.presenceSent && !(opts && opts.force)) return;
+    state.presenceSent = key;
+    sendWs(msg);
+  }
+
+  function onPresenceVisibilityChange() {
+    if (document.visibilityState === "visible") noteUserInput();
+    sendPresence();
+    if (document.visibilityState === "visible") loadPushState();
+  }
+
+  function bindPresence() {
+    window.addEventListener("focus", () => {
+      noteUserInput();
+      sendPresence();
+    });
+    window.addEventListener("blur", () => sendPresence());
+    USER_INPUT_EVENTS.forEach((name) => {
+      // Capture so scrolls inside inner panes (which do not bubble) still count.
+      document.addEventListener(name, noteUserInput, { capture: true, passive: true });
+    });
+    setInterval(checkUserIdle, USER_IDLE_CHECK_MS);
+    setInterval(() => {
+      if (document.visibilityState === "visible") sendPresence({ force: true });
+    }, PRESENCE_HEARTBEAT_MS);
+  }
+
+  async function openPhoneSetup() {
+    if (!els.modalPhoneSetup) return;
+    renderPhoneSetup(null);
+    els.modalPhoneSetup.classList.remove("hidden");
+    try {
+      const res = await hubJson("/api/phone-setup");
+      renderPhoneSetup(res.ok ? res.data : { error: true });
+    } catch (_) {
+      renderPhoneSetup({ error: true });
+    }
+  }
+
+  function closePhoneSetup() {
+    if (els.modalPhoneSetup) els.modalPhoneSetup.classList.add("hidden");
+  }
+
+  function renderPhoneSetup(data) {
+    const loading = !data;
+    data = data || {};
+    const url = typeof data.url === "string" ? data.url : "";
+    const qr =
+      typeof data.qrDataUri === "string" &&
+      /^data:image\/(svg\+xml|png);base64,/.test(data.qrDataUri)
+        ? data.qrDataUri
+        : "";
+    els.phoneSetupQr.classList.toggle("hidden", !qr);
+    if (qr) els.phoneSetupQr.src = qr;
+    else els.phoneSetupQr.removeAttribute("src");
+    els.phoneSetupUrl.textContent = loading ? "Loading…" : url || "No HTTPS address yet";
+    els.phoneSetupUrl.dataset.url = url;
+    els.btnPhoneSetupCopy.disabled = !url;
+    let warning = "";
+    if (data.error) warning = "Could not load phone setup from the hub";
+    else if (data.serveActive === false) warning = "HTTPS address is not active yet";
+    els.phoneSetupWarning.textContent = warning;
+    els.phoneSetupWarning.classList.toggle("hidden", !warning);
+    const steps = Array.isArray(data.steps) ? data.steps : [];
+    els.phoneSetupSteps.replaceChildren(
+      ...steps.map((step) => {
+        const li = document.createElement("li");
+        li.textContent = String(step);
+        return li;
+      })
+    );
+  }
+
+  async function copyPhoneSetupUrl() {
+    const url = els.phoneSetupUrl.dataset.url || "";
+    if (!url) return;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast("Address copied", "");
+    } catch (_) {
+      const range = document.createRange();
+      range.selectNodeContents(els.phoneSetupUrl);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      toast("Address selected; press Ctrl+C to copy", "");
+    }
+  }
+
+  function bindPushControls() {
+    if (els.btnPushOn) els.btnPushOn.addEventListener("click", enablePush);
+    if (els.btnPushTest) els.btnPushTest.addEventListener("click", sendPushTest);
+    if (els.btnPushOff) els.btnPushOff.addEventListener("click", disablePush);
+    if (els.btnPhoneSetup) els.btnPhoneSetup.addEventListener("click", openPhoneSetup);
+    if (els.btnPhoneSetupCopy) els.btnPhoneSetupCopy.addEventListener("click", copyPhoneSetupUrl);
+  }
+  // End push
 
   function updateComposerPlaceholder() {
     const ta = els.input;
@@ -8388,8 +9728,8 @@
         toast(data.error || `Preview failed (HTTP ${res.status})`, "danger");
         return;
       }
-      const previewUrl = data.previewUrl || "/preview-site/";
-      sitePreviewUrl = apiUrl(previewUrl);
+      // Capability URL: subresources need no hub token (ADR-026).
+      sitePreviewUrl = data.previewUrl || "";
       if (els.sitePreviewFrame) {
         els.sitePreviewFrame.src = sitePreviewUrl;
       }
@@ -8499,6 +9839,7 @@
   function renderPlanMarkdown(source) {
     if (!els.planBody) return;
     const text = source || "";
+    state._lastPlanMarkdown = text;
     if (typeof window.marked === "undefined" || typeof window.DOMPurify === "undefined") {
       els.planBody.textContent = text || "(empty plan)";
       return;
@@ -8518,6 +9859,74 @@
     } catch (err) {
       els.planBody.textContent = "Preview failed: " + err + "\n\n" + text;
     }
+  }
+
+  async function copyPlanMarkdown() {
+    const fromState =
+      (state.sessionPlan && state.sessionPlan.markdown) ||
+      state._lastPlanMarkdown ||
+      "";
+    let text = String(fromState || "");
+    if (!text.trim() && els.planBody) {
+      text = els.planBody.innerText || els.planBody.textContent || "";
+    }
+    if (!text.trim()) {
+      toast("Nothing to copy", "danger");
+      return;
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        toast("Plan copied", "");
+        return;
+      }
+    } catch (_) {}
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      toast("Plan copied", "");
+    } catch (err) {
+      toast("Could not copy plan", "danger");
+    }
+  }
+
+  async function fetchSessionRecap(sessionId) {
+    const sid = String(sessionId || state.selectedId || "").trim();
+    if (!sid) {
+      toast("Select a session first", "danger");
+      return null;
+    }
+    try {
+      const res = await fetch(
+        apiUrl(`/api/sessions/${encodeURIComponent(sid)}/recap`)
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        toast(data.error || "Catch up failed", "danger");
+        return null;
+      }
+      return data;
+    } catch (err) {
+      toast("Catch up failed: " + err, "danger");
+      return null;
+    }
+  }
+
+  async function showCatchUp() {
+    const data = await fetchSessionRecap(state.selectedId);
+    if (!data) return;
+    if (data.empty || !data.summary) {
+      toast("No recent messages to catch up on", "");
+      return;
+    }
+    toast(String(data.summary), "", 12000);
   }
 
   function updatePlanStatusChip(plan) {
@@ -8591,6 +10000,12 @@
     renderPlanMarkdown(plan.markdown || "");
     updatePlanStatusChip(plan);
     if (els.modalPlan) els.modalPlan.classList.remove("hidden");
+    // Render mermaid after plan body is filled and modal is visible.
+    try {
+      if (els.planBody) await renderMermaidBlocks(els.planBody);
+    } catch (err) {
+      console.warn("plan mermaid render failed", err);
+    }
   }
 
   function injectPlanComposerText(text) {
@@ -8729,14 +10144,14 @@
         return;
       }
       toast("Open full size, then long-press to save");
-      window.open(rawFsUrl(root, rel, { download: 1 }), "_blank", "noopener");
+      window.open(rawFsUrl(root, rel, { download: 1 }), "_blank", "noopener,noreferrer");
     } catch (err) {
       if (err && (err.name === "AbortError" || err.name === "NotAllowedError")) {
         return;
       }
       toast("Share failed: " + (err && err.message ? err.message : err), "danger");
       try {
-        window.open(rawFsUrl(root, rel, { download: 1 }), "_blank", "noopener");
+        window.open(rawFsUrl(root, rel, { download: 1 }), "_blank", "noopener,noreferrer");
       } catch (_) {}
     }
   }
@@ -10076,7 +11491,10 @@
     try {
       let health = null;
       try {
-        const r = await fetch("/health", { method: "GET", cache: "no-store" });
+        const r = await fetch(apiUrl("/health"), {
+          method: "GET",
+          cache: "no-store",
+        });
         if (r.ok) health = await r.json();
       } catch (_) {
         health = null;
@@ -10749,6 +12167,12 @@
         openUploadPicker();
       });
     }
+    if (els.approvalMode) {
+      els.approvalMode.addEventListener("click", (e) => {
+        const opt = e.target && e.target.closest && e.target.closest("[data-mode]");
+        if (opt) setApprovalMode(opt.dataset.mode);
+      });
+    }
     if (els.composerFileInput) {
       els.composerFileInput.addEventListener("change", () => {
         const list = els.composerFileInput.files;
@@ -10823,6 +12247,11 @@
           closeLightbox();
           return;
         }
+        if (els.modalPhoneSetup && !els.modalPhoneSetup.classList.contains("hidden")) {
+          e.preventDefault();
+          closePhoneSetup();
+          return;
+        }
         if (
           els.modalSitePreview &&
           !els.modalSitePreview.classList.contains("hidden")
@@ -10864,11 +12293,24 @@
         startRenameSession(state.selectedId, title, els.chatTitle);
       });
     }
+    if (els.btnCatchUp) {
+      els.btnCatchUp.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        void showCatchUp();
+      });
+    }
     if (els.btnViewPlan) {
       els.btnViewPlan.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
         openPlanModal();
+      });
+    }
+    if (els.btnPlanCopy) {
+      els.btnPlanCopy.addEventListener("click", (e) => {
+        e.preventDefault();
+        void copyPlanMarkdown();
       });
     }
     if (els.btnPlanApprove) {
@@ -10896,8 +12338,10 @@
         if (id === "modal-ask-user") cancelAskUserQuestion();
         if (id === "modal-site-preview") stopSitePreview();
         if (id === "modal-plan") closePlanModal();
+        if (id === "modal-phone-setup") closePhoneSetup();
       });
     });
+    bindPushControls();
     $$(".site-preview-preset").forEach((btn) => {
       btn.addEventListener("click", () => {
         setSitePreviewDevice(btn.getAttribute("data-device") || "desktop");
@@ -11107,29 +12551,10 @@
     els.btnStop.addEventListener("click", () => {
       if (!state.selectedId) return;
       const sid = state.livePromptSessionId || state.selectedId;
+      const epoch = turnEpoch(sid);
       sendWs({ type: "cancel", sessionId: sid });
-      // Fallback if hub/agent cancel leaves turn stuck (older hubs without force-clear).
-      setTimeout(async () => {
-        if (!state.turnRunning) return;
-        if (state.selectedId !== sid && state.livePromptSessionId !== sid) return;
-        try {
-          const res = await fetch(apiUrl("/api/admin/reset-turn"), {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ sessionId: sid }),
-          });
-          if (res.ok) {
-            toast("Turn force-cleared (Stop fallback)", "");
-          } else {
-            toast(
-              "Stop did not clear the turn. Try Stop again.",
-              "danger"
-            );
-          }
-        } catch (err) {
-          toast("Stop fallback failed: " + err, "danger");
-        }
-      }, 1500);
+      // Last resort only: the hub already waits about 2s for the agent, then force-clears.
+      setTimeout(() => runStopFallback(sid, epoch), 4000);
     });
 
     els.transcript.addEventListener("scroll", () => {
@@ -11170,6 +12595,7 @@
     }
 
     document.addEventListener("visibilitychange", () => {
+      onPresenceVisibilityChange();
       if (document.visibilityState !== "visible") return;
       scheduleWakeReconcile("visibility");
     });
@@ -11214,7 +12640,7 @@
     state._reconnectScrollFreeze = true;
     try {
       await reconcileTurnAfterWake(reason);
-      if (state.selectedId) {
+      if (state.selectedId && !takeReplayMark(state.selectedId)) {
         await refreshHistory(state.selectedId, {
           force: true,
           visibilityOnly: true,
@@ -11721,12 +13147,19 @@
     }
     updateStatusPill();
     updateVersionBadge();
+    updateAuthTokenBanner();
     updateSessionBanner();
     setComposerEnabled(false);
     updateTurnStrip();
     hideUsageBar();
     startHistoryPoll();
     startUsagePoll();
+    const deepLinkId = consumeSessionDeepLink();
+    registerServiceWorker();
+    bindPresence();
+    renderPushControl();
+    loadWhoami();
+    loadPushState();
 
     try {
       if (localStorage.getItem("grh.railCollapsed") === "1" && !isMobile()) {
@@ -11781,8 +13214,9 @@
         subscribeActiveChildrenOfSelected();
         // Restore last selected chat across refresh (desktop + mobile).
         // If id is missing from top-N list, open by id when history exists (P1.11).
-        const saved = loadSelectedSessionMeta();
-        const savedId = saved && saved.sessionId;
+        const stored = loadSelectedSessionMeta();
+        const savedId = deepLinkId || (stored && stored.sessionId);
+        const saved = stored && stored.sessionId === savedId ? stored : null;
         if (savedId && Array.isArray(state.sessions)) {
           const row = state.sessions.find((s) => s && s.sessionId === savedId);
           // Cap restore so a hung attach never blocks connectWs forever.
@@ -11803,7 +13237,7 @@
                 apiUrl(`/api/sessions/${encodeURIComponent(savedId)}/history`)
               );
               if (hRes.status === 404) {
-                clearSelectedSession();
+                if (saved) clearSelectedSession();
               } else if (hRes.ok) {
                 await openWithCap({
                   sessionId: savedId,

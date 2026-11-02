@@ -49,6 +49,11 @@ Grok plan mode leaves `plan_mode.json` with `awaiting_plan_approval: true` / `st
 - Unit: merge actions, apply roundtrip, UI contract for `/plan/action` and inject strings.
 - Manual: awaiting plan → Approve → `awaitingApproval` false and continue prompt sent.
 
+## Notes (2026-08-08)
+
+Mobile plan copy / Mermaid on open and session search + Catch up recap recorded
+in **ADR-025** (does not change disk approve handshake).
+
 ## Related
 
 - ADR-001 (session lifecycle), Hub plan viewer Unreleased notes

@@ -9,6 +9,52 @@ This file is the **public narrative**. Session chat context is not required to u
 
 ## [Unreleased]
 
+### Security
+- **Host and Origin guard (ADR-026)**: every request must name this hub in `Host` (blocks DNS rebinding); `/ws` and mutating requests must be same-origin when the browser sends `Origin` (blocks cross-site WebSocket hijacking and CSRF, including against a tokenless loopback hub). New `hub.allowed_hosts` / `hub.allowed_origins` for proxies. Constant-time token compare; `Referrer-Policy`, `nosniff`, `frame-ancestors 'self'` on responses.
+- **Sandboxed site preview**: served at a random per-start `/preview-site/<key>/` URL with `Content-Security-Policy: sandbox` (opaque origin), so previewed HTML cannot read the hub token or call the API. Iframe no longer combines `allow-scripts` with `allow-same-origin`. Fixes preview CSS/JS returning 401 in token mode. Apps that need `localStorage` should use `tools/preview-hub`.
+- **Raw HTML/SVG/XML file responses** carry `Content-Security-Policy: sandbox`.
+- **Agent secrets no longer reach browsers**: MCP server `env`/`headers` values (e.g. API keys in `_x.ai/mcp/servers_updated`) and secret-named fields are redacted before WebSocket fan-out. Redaction also covers dict-form `env`/`headers`, secret flags in `args`, and URL credentials or secret query values.
+- **Token cannot leak to previews by referrer**: `Referrer-Policy: no-referrer` hub-wide and on the preview iframe; the SPA URL can carry `?token=`.
+- **Raw file responses are sandboxed unless known inert** (images other than SVG, audio, video, PDF, plain text) instead of a list of script-capable types.
+- **Empty `hub_token` refused when `allowed_hosts` names a non-loopback host**, since Tailscale Serve forwards tailnet requests from loopback.
+- **Approval gate hardening (ADR-027 amendments)**: commands are lexed as PowerShell (comments, here-strings, backtick escapes, Unicode quotes and dashes, `$( )` and script blocks, assignments, redirection, parameter abbreviations, positional commands), and syntax the lexer does not model asks instead of running. Catches PowerShell recursive deletes (`rd -r`, `del -Recurse`, piped `Remove-Item`), `git checkout -f` / `switch --discard-changes`, git code-execution routes (`config` writes, `--upload-pack`, `grep -O`) and package installs behind leading flags. Strict mode is an allowlist by syntax. "Always allow" saves the exact command for flag-led commands and nested shells, never covers groups, escapes or redirection, file rules cover one folder (not subfolders), and match-all or program-wide shell rules are rejected. Writes to the hub's own `data/` and `config.toml` always ask, however the path is spelled. The 300 s deadline counts from arrival, the hook endpoint refuses requests proxied by Tailscale Serve, and deleting a session denies its open cards.
+
+### Added
+- **Replay on reconnect (ADR-029)**: session events carry a sequence number and the hub keeps a bounded in-memory log; a reconnecting browser (phone wake, network blip) receives just the missed events instead of reloading full history, and duplicates are dropped exactly by sequence.
+- **Phone app and push (ADR-028)**: `tailscale serve` HTTPS address trusted by the owner's Tailscale login (no token), Home Screen web app, web push for approvals, agent questions and 60 s+ turns when no visible page shows the session (idle 2 min counts as away), lock-screen text without commands, and a desktop **Set up phone** QR panel. Adds `pywebpush` and `segno`.
+- **Phone approvals (ADR-027)**: the hub injects a Grok `PreToolUse` HTTP hook into its agent (`--plugin-dir`) and holds risky steps (push/history rewrite, recursive delete, package install, network transfer, system change, writes outside the session folder) until you Allow or Deny from any connected browser; no answer in 5 minutes denies. Balanced / Strict / Trusted per session (`hub.approval_mode` default), "Allow similar" rules per project in `data/approval-rules.json`, and an executor backstop that refuses unapproved shell commands and outside writes. Requires one `restart-hub.ps1 -KillAgent` after upgrade.
+- **Stop honesty (bg stamps)** — `AcpClient.end_turn` pops per-session (or clears all) bg activity after cancel+clear so Working/Stuck does not linger after Stop; residual documented (parent sessionId cancel; nested subagents depend on agent ACP). WS Stop rebroadcasts status; soft notice when agent does not confirm cancel after local clear.
+- **Session search `?q=`** — pure `session_matches_query` (title / session id / cwd basename) on `GET /api/sessions`; SPA filter matches session id substring.
+- **Catch up recap** — `GET /api/sessions/{id}/recap` + topbar **Catch up** control (last user + assistant, bounded).
+- **Plan Copy** — plan modal **Copy plan** + mermaid render when opening the plan viewer.
+- **ADR-023** — always-approve remote risk + `grok --resume <session-id>` desktop handoff; SECURITY.md / README updated. Topology default tests (ADR-022) in `tests/test_topology_default.py`.
+- **Experimental `agent.backend=leader` (opt-in only)** — hub can attach ACP via `grok agent --leader stdio` to a shared `grok agent leader` process (NDJSON); default remains `serve` so normal CLI without `--leader` is untouched. Health/status expose `agentBackend`. See ADR-021 and `docs/exp-leader-lab.md`.
+- **Startup hub_token gate** — empty `hub_token` is refused when any bind host is non-loopback (Tailscale dual-bind); loopback-only still allows tokenless local dev (`hub.harden_policy.require_hub_token`).
+- **Public liveness `/health`** — with `hub_token` set, unauthenticated clients get only `ok` / `bootId` / `uptimeSeconds` / `pid` / `port` / `hubVersion` (watchdog-safe); full diagnostics via authenticated `/health` or `/api/admin/diagnostics`.
+- **Heal exhaust signal** — durable `acpHealExhausted` on status/health; optional config `hub.auto_restart_agent_on_heal_exhaust` (default off) for one KillAgent-style restart after exhaust when not mid-turn.
+- **Policy lockstep test** — `tests/test_policy_lockstep.py` asserts SPA wake/stall constants match `CLIENT_STALL_WARN_SECONDS` and wake-clear quality gates.
+- **Compact status bar** — slim `#compact-status-bar` while compacting (pulse track + elapsed seconds); CTX segment subtle pulse via `usage-seg-compacting`.
+
+### Fixed
+- **Stop now stops the agent (ADR-031)**. The hub sent `session/cancel` as a request, which Grok rejects, so the agent kept working after Stop while the hub only cleared its own state. Stop now sends the ACP notification, kills the command the agent is waiting on (background commands keep running), and waits up to 2 s for the agent to end the turn before force-clearing. Stop also no longer shows "Agent stalled mid-turn".
+- **Stop ends the whole command and keeps other sessions live (ADR-031 amendment)**: Stop kills the command's process tree (`npm test`, `pytest` and other shell-wrapped commands, not just the PowerShell wrapper), `terminal/wait_for_exit` no longer blocks the ACP receive loop (one session's long command froze every other session's stream), and a stall the agent honours shows the stall or no-output message and auto-retries again instead of ending silently.
+- **Phones signed in by Tailscale login get the full `/health`**, so waking the phone no longer clears a running turn's view.
+- **Two viewers, slow replays and Stop follow-ups**: events arriving out of order between viewers are no longer dropped, a replay that lands after the pane was redrawn is ignored instead of duplicating the transcript, and the Stop fallback no longer resets a follow-up prompt or another project's turn.
+- **One WebSocket per page**: opening a session link no longer starts a second socket that doubled every live event.
+- **Full tool output after a turn ends**: the end-of-turn history reload kept only a 120-character snippet of each tool's output; it now keeps up to 4,000 characters (the tail, with a count of omitted lines).
+- **Agent shell commands run in PowerShell on Windows**, like Grok's own Shell tool (pwsh if installed, else Windows PowerShell, `-ExecutionPolicy Bypass`, no console window, UTF-8 output). The hub used cmd.exe, so cmdlets such as `Remove-Item` failed with "not recognized" in hub sessions.
+- **Compact honesty when signals lag** — hub stashes agent compact tokens under the hub gate, merges them into `/compact` outcome, and reports `agent_reduced_signals_stale` (completed, not “already minimal”) when the agent shrank but `signals.json` is still flat; CTX bar remains signals SoT.
+- **Agent recycle → ACP reconnect reliability** — restart-agent no longer treats TCP port-up as success; multi-attempt reconnect with `reset_maintain=True` cancels maintain backoff sleep after kill; success only when process up **and** ACP chat-connected; heal budget left at 0 after partial recycle so auto-heal remains usable (ADR-014).
+
+### Changed
+- **History revalidates instead of refetching**: `GET /api/sessions/{id}/history` sends an `ETag` and answers `304` while the session log is unchanged, so idle polling costs a few hundred bytes instead of the full transcript.
+- **Per-session runtime state in one object (ADR-030)**: internal refactor; turn, load, warm, stall and background bookkeeping now live on one `SessionRuntime` per session.
+- **SPA static assets exempt from hub_token** — GET/HEAD for `/`, `/app.js`, `/app.css`, `/vendor/*`, favicons, and similar static extensions load without token so remote UI works after `?token=` navigation; API/WS/preview remain protected (`is_public_unauthenticated_path`).
+- **Long-lived silent health watchdog** — primary external watchdog is `python -m hub.watchdog` via `pythonw` (logon task `GrokRemoteHubWatch` + `watchdog-hidden.vbs`), not every-2-minute PowerShell. Same `logs/watch-hub-state.json` keys and `restart-hub.ps1 -KeepAgent` policy; `start-hub.ps1` ensures the daemon is running; full `stop-hub` stops the watchdog so the hub stays down, while `-KeepAgent` (restart path) leaves it running. Optional `watch-hub.ps1` is a thin `--once` wrapper (ADR-019 amendment).
+- **`stop-hub.ps1` bind_port** — listener kill uses `bind_port` from `config.toml` (default 8787), not a hardcoded sole path.
+- **SPA `/health` fetches** — `probeHubHealth` / `mergeHealthIntoState` / wake reconcile use `apiUrl("/health")` so token query param unlocks rich health when configured.
+- **config.toml UTF-8 BOM** — `load_config` uses `utf-8-sig` so PowerShell-edited configs no longer fail tomllib at start.
+
 ---
 
 ## [0.4.0] — 2026-07-19

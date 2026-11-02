@@ -283,12 +283,45 @@ def test_server_has_acp_heal_hook() -> None:
     assert "_on_acp_connection" in src
     # Successful connect resets heal attempts
     on_conn = src[src.find("async def _on_acp_connection") :]
-    on_conn = on_conn[:1200]
+    on_conn = on_conn[:1600]
     assert "_acp_heal_attempts = 0" in on_conn
     assert "ACP heal" in on_conn or "heal" in on_conn.lower()
+    assert "_acp_heal_auto_restarts_used = 0" in on_conn
     acp = (ROOT / "hub" / "acp_client.py").read_text(encoding="utf-8")
     assert "async def maybe_probe_liveness" in acp
     assert "AcpTrace" in acp
+
+
+def test_heal_exhaust_operator_fields_and_auto_restart_policy() -> None:
+    from hub.harden_policy import (
+        heal_exhaust_operator_fields,
+        should_auto_restart_agent_on_heal_exhaust,
+    )
+
+    fields = heal_exhaust_operator_fields(
+        heal_attempts=3,
+        max_attempts=3,
+        agent_process_up=True,
+        acp_connected=False,
+        last_error="x",
+    )
+    assert fields["acpHealExhausted"] is True
+    assert fields["acpHealError"] == "x"
+    assert (
+        should_auto_restart_agent_on_heal_exhaust(
+            enabled=True,
+            agent_process_up=True,
+            acp_connected=False,
+            heal_attempts=3,
+            max_attempts=3,
+            turn_active=True,
+            auto_restarts_used=0,
+        )
+        is False
+    )
+    src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
+    assert "acpHealExhausted" in src
+    assert "should_auto_restart_agent_on_heal_exhaust" in src
 
 
 def test_suppress_tool_call_during_load() -> None:
@@ -502,10 +535,11 @@ def test_server_records_bg_activity_and_activity_event() -> None:
     assert "note_bg_activity" in acp
     assert "live_bg_activity_sessions" in acp
     assert "on_session_activity" in acp
-    assert "_bg_activity_at" in acp
-    assert "_bg_activity_started_at" in acp
-    assert "_bg_activity_kind" in acp
-    assert "_bg_activity_rich_at" in acp
+    runtime = (ROOT / "hub" / "session_runtime.py").read_text(encoding="utf-8")
+    assert "class BackgroundActivity" in runtime
+    for stamp in ("last_at", "started_at", "kind", "rich_at"):
+        assert stamp in runtime
+    assert "rt.background" in acp
     assert "def bg_activity_ages" in acp
     assert "def bg_activity_status_map" in acp
     assert "def clear_bg_activity" in acp
@@ -649,7 +683,7 @@ def test_acp_client_load_suppress_quiet_period_structural() -> None:
     assert "LOAD_SUPPRESS_QUIET_S" in acp
     assert "LOAD_SUPPRESS_MAX_S" in acp
     assert "_rearm_load_suppress_release" in acp
-    assert "_load_suppress_deadline" in acp
+    assert "suppress_deadline" in acp
     assert "call_later(0.3" not in acp
     # Adaptive quiet helper for initial arm + rearm (not hard-coded only).
     assert "load_suppress_quiet_s_for_count" in acp
@@ -657,7 +691,7 @@ def test_acp_client_load_suppress_quiet_period_structural() -> None:
     # suppress branch rearms
     assert "self._rearm_load_suppress_release(key)" in acp
     # release clears deadline
-    assert "_load_suppress_deadline.pop" in acp
+    assert "load.suppress_deadline = None" in acp
     assert "def is_load_suppressing" in acp
 
 
@@ -671,7 +705,7 @@ def test_wait_load_suppress_settled_returns_after_release() -> None:
     sid = "wait-load-sid"
 
     async def run() -> None:
-        client._loading_sessions.add(sid)
+        client.runtimes.get_or_create(sid).load.loading = True
         # Release after a short delay (simulates quiet timer).
         async def release_soon() -> None:
             await asyncio.sleep(0.08)
@@ -680,7 +714,7 @@ def test_wait_load_suppress_settled_returns_after_release() -> None:
         task = asyncio.create_task(release_soon())
         await client.wait_load_suppress_settled(sid, timeout=2.0)
         await task
-        assert sid not in client._loading_sessions
+        assert not client.is_load_suppressing(sid)
 
     asyncio.run(run())
 
@@ -695,9 +729,9 @@ def test_wait_load_suppress_settled_timeout_force_releases() -> None:
     sid = "wait-load-timeout-sid"
 
     async def run() -> None:
-        client._loading_sessions.add(sid)
+        client.runtimes.get_or_create(sid).load.loading = True
         await client.wait_load_suppress_settled(sid, timeout=0.12)
-        assert sid not in client._loading_sessions
+        assert not client.is_load_suppressing(sid)
 
     asyncio.run(run())
 
@@ -724,10 +758,10 @@ def test_rearm_without_deadline_does_not_force_release() -> None:
     async def _case() -> None:
         client = AcpClient(Config(), secret="test")
         sid = "sess-no-deadline"
-        client._loading_sessions.add(sid)
+        client.runtimes.get_or_create(sid).load.loading = True
         # deliberately no deadline
         client._rearm_load_suppress_release(sid)
-        assert sid in client._loading_sessions
+        assert client.is_load_suppressing(sid)
         client.release_load_suppress(sid)
 
     asyncio.run(_case())
@@ -743,9 +777,10 @@ def test_rearm_past_deadline_releases() -> None:
     async def _past() -> None:
         client = AcpClient(Config(), secret="test")
         sid = "sess-past"
-        client._loading_sessions.add(sid)
-        client._load_suppress_deadline[sid] = time.monotonic() - 1.0  # already past
+        load = client.runtimes.get_or_create(sid).load
+        load.loading = True
+        load.suppress_deadline = time.monotonic() - 1.0  # already past
         client._rearm_load_suppress_release(sid)
-        assert sid not in client._loading_sessions
+        assert not client.is_load_suppressing(sid)
 
     asyncio.run(_past())

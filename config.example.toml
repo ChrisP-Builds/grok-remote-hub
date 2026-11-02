@@ -6,8 +6,26 @@
 bind_host = ""
 bind_port = 8787
 
-# Optional shared secret for HTTP/WS (Authorization: Bearer or ?token=)
+# Shared secret for HTTP/WS (Authorization: Bearer or ?token=).
+# Required when binding non-loopback / Tailscale; empty allowed for loopback-only.
 hub_token = ""
+
+# Requests must name this hub: Host must be loopback, a bind host, or this
+# machine's Tailscale name; browser Origin must match Host. Add extras here.
+# allowed_hosts = ["my-reverse-proxy.example"]
+# allowed_origins = ["https://desk.tailnet-name.ts.net"]
+
+# Opening the hub through Tailscale Serve (https://<pc>.<tailnet>.ts.net/) needs no token
+# for the PC owner's Tailscale login (ADR-028). Trust more logins here.
+# allowed_tailscale_logins = ["partner@example.com"]
+
+# Optional: after ACP heal attempts exhaust (process up, ACP down, no live turn),
+# KillAgent-style restart once per hub process. Default off (manual pill / admin).
+# auto_restart_agent_on_heal_exhaust = false
+
+# Phone approvals (ADR-027): balanced asks before risky steps, strict also asks about
+# anything not routine, trusted never asks. Switchable per session in the UI.
+# approval_mode = "balanced"
 
 sessions_root = "~/.grok/sessions"
 # Folder that contains your project directories (New Session picker).
@@ -22,3 +40,6 @@ projects_root = "~/Projects"
 bind = "127.0.0.1"
 port = 2419
 # secret_path = "data/agent.secret"
+# EXPERIMENT only. Default serve. leader = hub attaches via stdio to grok agent leader.
+# Desktop CLI can use: grok --leader  (same leader). Do not enable for normal use.
+# backend = "serve"

@@ -2,14 +2,35 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import socket
+import subprocess
 import sys
 from pathlib import Path
 
 from aiohttp import web
 
-from hub.config import load_config
-from hub.server import Hub, resolve_bind_hosts
+from hub.config import TAILSCALE_EXE, load_config
+from hub.harden_policy import require_hub_token
+from hub.http_guard import build_allowed_hosts, normalize_host, tailscale_owner_login
+from hub.server import Hub, resolve_bind_hosts, tailscale_dns_names
+
+
+def _tailscale_owner_login() -> str | None:
+    for exe in (str(TAILSCALE_EXE), "tailscale"):
+        try:
+            proc = subprocess.run(
+                [exe, "status", "--json"], capture_output=True, text=True, timeout=5, check=False
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+        if proc.returncode == 0:
+            try:
+                return tailscale_owner_login(json.loads(proc.stdout.lstrip("﻿")))
+            except ValueError:
+                return None
+    return None
 
 
 def _setup_logging(log_dir: Path) -> None:
@@ -97,10 +118,41 @@ def main(argv: list[str] | None = None) -> int:
         log.error("%s", exc)
         return 2
 
+    token_ok, token_err = require_hub_token(
+        hosts, config.hub_token or "", allowed_hosts=config.allowed_hosts
+    )
+    if not token_ok:
+        log.error("%s", token_err)
+        return 2
+    if str(config.hub_token or "").strip():
+        log.info("hub_token configured (remote auth required)")
+    else:
+        log.warning("hub_token empty; allowed for loopback-only bind")
+
     hub.bind_hosts = hosts
     hub.bind_host = ts_ip if ts_ip and ts_ip in hosts else hosts[0]
     hub.bind_mode = mode
     hub.tailscale_ip = ts_ip
+    dns_names = tailscale_dns_names() if ts_ip else []
+    hub.guard.allowed_hosts = build_allowed_hosts(
+        hosts,
+        ts_ip,
+        dns_names,
+        [*config.allowed_hosts, socket.gethostname()],
+    )
+    log.info("Accepted Host names: %s", ", ".join(sorted(hub.guard.allowed_hosts)))
+    owner = _tailscale_owner_login() if ts_ip else None
+    hub.guard.serve_hosts = frozenset(normalize_host(n) for n in dns_names)
+    hub.guard.tailscale_logins = frozenset(
+        login.casefold() for login in [owner or "", *config.allowed_tailscale_logins] if login
+    )
+    hub.serve_url = f"https://{normalize_host(dns_names[0])}/" if dns_names else None
+    log.info(
+        "Tailscale Serve: %s; %d login(s) trusted without token (owner %s)",
+        hub.serve_url or "no DNS name",
+        len(hub.guard.tailscale_logins),
+        "found" if owner else "not found",
+    )
 
     log.info(
         "Starting Grok Remote Hub on %s (%s)",

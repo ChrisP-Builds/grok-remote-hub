@@ -5,14 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
   <meta name="theme-color" content="#0a0c10" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="Grok Hub" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
-  <link rel="apple-touch-icon" href="/favicon.svg" />
+  <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png" />
   <title>Grok Remote Hub</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/app.css?v=20260726a" />
+  <link rel="stylesheet" href="/app.css?v=20261102a" />
 </head>
 <body style="background:#0a0c10;color:#d6deea">
   <div id="app">
@@ -55,6 +58,21 @@
           <p>Open a session to browse its project.</p>
         </div>
       </div>
+      <div id="device-bar" class="device-bar">
+        <div id="push-control" class="push-control" data-state="checking" aria-live="polite">
+          <div class="push-status">
+            <span class="push-icon" aria-hidden="true">🔔</span>
+            <span id="push-label" class="push-label">Notifications</span>
+          </div>
+          <p id="push-detail" class="push-detail muted hidden"></p>
+          <div class="push-actions">
+            <button type="button" id="btn-push-on" class="btn btn-accent btn-sm hidden">Turn on notifications</button>
+            <button type="button" id="btn-push-test" class="btn btn-ghost btn-sm hidden">Send test</button>
+            <button type="button" id="btn-push-off" class="btn btn-ghost btn-sm hidden">Turn off</button>
+          </div>
+        </div>
+        <button type="button" id="btn-phone-setup" class="btn btn-ghost btn-sm phone-setup-btn">Set up phone</button>
+      </div>
       <div id="version-badge" class="version-badge" title="Hub and CLI compatibility">
         <span id="compat-dot" class="compat-dot" data-state="unknown" aria-hidden="true"></span>
         <span id="version-label" class="version-label">Hub · CLI</span>
@@ -70,8 +88,14 @@
           <div class="topbar-title-row">
             <h1 id="chat-title" class="chat-title">Select a session</h1>
             <button type="button" id="btn-rename-session" class="session-rename-btn topbar-rename hidden" aria-label="Rename session" title="Rename session">✎</button>
+            <button type="button" id="btn-catch-up" class="btn btn-ghost btn-sm topbar-catch-up hidden" title="Catch up: last user + assistant" aria-label="Catch up">Catch up</button>
           </div>
           <div class="chat-sub" id="chat-sub">
+            <div id="approval-mode" class="approval-mode hidden" role="group" aria-label="Approval mode">
+              <button type="button" class="approval-mode-opt" data-mode="balanced" aria-pressed="false" title="Asks before risky commands and file changes outside the project">Balanced</button>
+              <button type="button" class="approval-mode-opt" data-mode="strict" aria-pressed="false" title="Asks unless a command is routine">Strict</button>
+              <button type="button" class="approval-mode-opt" data-mode="trusted" aria-pressed="false" title="Never asks (commands, file changes, tools)">Trusted</button>
+            </div>
             <span id="chat-project" class="chip chip-project meta-chip hidden" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Project details"></span>
             <span id="chat-model" class="chip meta-chip hidden" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Model details"></span>
             <span id="chat-cwd" class="cwd muted meta-chip" tabindex="0" role="button" aria-expanded="false" aria-controls="meta-popover" aria-label="Project path"></span>
@@ -115,6 +139,10 @@
         </div>
       </div>
 
+      <div id="auth-token-banner" class="auth-token-banner hidden" role="alert" aria-live="polite">
+        <span id="auth-token-banner-text"></span>
+      </div>
+
       <div id="chat-panel" class="chat-panel">
         <div id="capacity-banner" class="capacity-banner hidden" data-state="idle" aria-live="polite">
           <span id="capacity-banner-text"></span>
@@ -123,6 +151,13 @@
         <div id="latency-hint-banner" class="latency-hint-banner hidden" data-kind="" aria-live="polite">
           <span id="latency-hint-banner-text"></span>
           <button type="button" id="btn-latency-hint-dismiss" class="btn btn-ghost btn-sm latency-hint-dismiss hidden" aria-label="Dismiss">Dismiss</button>
+        </div>
+
+        <div id="compact-status-bar" class="compact-status-bar hidden" aria-live="polite" aria-busy="false">
+          <span class="compact-status-track" aria-hidden="true"><span class="compact-status-pulse"></span></span>
+          <span id="compact-status-label" class="compact-status-label">Compacting conversation…</span>
+          <span id="compact-status-elapsed" class="compact-status-elapsed muted"></span>
+          <span id="compact-status-detail" class="compact-status-detail muted"></span>
         </div>
 
         <div id="session-banner" class="session-banner hidden" data-mode="none" aria-live="polite">
@@ -163,6 +198,7 @@
             <span id="turn-strip-cursor" class="term-cursor hidden" aria-hidden="true">▋</span>
           </div>
           <div id="slash-palette" class="slash-palette hidden" role="listbox" aria-label="Slash commands"></div>
+          <div id="approval-stack" class="approval-stack hidden" role="region" aria-label="Approvals needed" aria-live="assertive"></div>
           <form id="composer-form" class="composer">
             <span class="composer-prompt" aria-hidden="true">&gt;</span>
             <textarea
@@ -315,7 +351,8 @@
               id="site-preview-frame"
               class="site-preview-frame"
               title="Site preview"
-              sandbox="allow-scripts allow-same-origin allow-forms allow-modals"
+              sandbox="allow-scripts allow-forms allow-modals"
+              referrerpolicy="no-referrer"
             ></iframe>
           </div>
         </div>
@@ -337,9 +374,31 @@
       <p class="muted modal-help plan-soft-note">Approve clears Hub plan-mode gate (writes plan_mode.json) and continues the session. Not the stock TUI a-key.</p>
       <div class="modal-actions plan-actions">
         <button type="button" id="btn-plan-close" class="btn btn-ghost" data-close="modal-plan">Close</button>
+        <button type="button" id="btn-plan-copy" class="btn btn-ghost">Copy plan</button>
         <button type="button" id="btn-plan-quit" class="btn btn-ghost">Quit plan</button>
         <button type="button" id="btn-plan-request-changes" class="btn btn-ghost">Request changes</button>
         <button type="button" id="btn-plan-approve" class="btn btn-accent">Approve</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal-phone-setup" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="modal-phone-setup-title">
+    <div class="modal-backdrop" data-close="modal-phone-setup"></div>
+    <div class="modal-card modal-card-phone">
+      <header class="modal-header">
+        <h2 id="modal-phone-setup-title">Set up your phone</h2>
+        <button type="button" class="btn btn-ghost btn-icon" data-close="modal-phone-setup" aria-label="Close">×</button>
+      </header>
+      <p id="phone-setup-warning" class="phone-setup-warning hidden" role="alert">HTTPS address is not active yet</p>
+      <div class="phone-setup-body">
+        <img id="phone-setup-qr" class="phone-setup-qr hidden" alt="QR code for the hub address" width="200" height="200" />
+        <div class="phone-setup-info">
+          <div class="phone-setup-url-row">
+            <code id="phone-setup-url" class="phone-setup-url"></code>
+            <button type="button" id="btn-phone-setup-copy" class="btn btn-ghost btn-sm">Copy</button>
+          </div>
+          <ol id="phone-setup-steps" class="phone-setup-steps"></ol>
+        </div>
       </div>
     </div>
   </div>
@@ -357,6 +416,6 @@
   <script src="/vendor/marked.min.js"></script>
   <script src="/vendor/purify.min.js"></script>
   <!-- cache-bust: blank-page fix; mermaid loads on demand from app.js when needed -->
-  <script src="/app.js?v=20260726a"></script>
+  <script src="/app.js?v=20261102a"></script>
 </body>
 </html>

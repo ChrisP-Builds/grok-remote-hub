@@ -1047,7 +1047,7 @@ def test_js_session_pills_near_streaming() -> None:
     # Rows carry data-session-id for in-place updates
     render_idx = js.find("function renderSessions")
     assert render_idx >= 0
-    render_chunk = js[render_idx : render_idx + 2500]
+    render_chunk = js[render_idx : render_idx + 4000]
     assert "data-session-id" in render_chunk
 
     # Stream path marks activity for offscreen sessions via allowlist helper
@@ -1478,6 +1478,28 @@ def test_latency_hint_loading_and_large_session_structural() -> None:
     loading_line = [ln for ln in js.splitlines() if "Loading session into agent" in ln]
     assert loading_line
     assert "stuck" not in loading_line[0].lower()
+
+
+def test_compact_status_bar_structural() -> None:
+    """Compact lifecycle status strip: HTML/CSS + handleCompactEvent wiring."""
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert 'id="compact-status-bar"' in html
+    assert 'id="compact-status-label"' in html
+    assert 'id="compact-status-elapsed"' in html
+    assert ".compact-status-bar" in css
+    assert "compact-status-indeterminate" in css or "compact-status-pulse" in css
+    assert "usage-seg-compacting" in css
+    assert "function showCompactStatusBar" in js
+    assert "function hideCompactStatusBar" in js
+    assert "Compacting conversation…" in js
+    hce = js.find("function handleCompactEvent")
+    assert hce > 0
+    hce_chunk = js[hce : hce + 4500]
+    assert "showCompactStatusBar" in hce_chunk
+    assert "hideCompactStatusBar" in hce_chunk
+    assert 'st === "started"' in hce_chunk
 
 
 def test_js_history_batch_depth() -> None:
@@ -1913,8 +1935,10 @@ def test_session_plan_viewer_contract() -> None:
 
     assert "/api/sessions/{id}/plan" in server
     assert "/api/sessions/{id}/plan/action" in server
+    assert "/api/sessions/{id}/recap" in server
     assert "handle_session_plan" in server
     assert "handle_session_plan_action" in server
+    assert "handle_session_recap" in server
     assert "read_session_plan" in server
     assert "apply_plan_action" in server
     assert "PlanViewError" in server
@@ -1936,6 +1960,8 @@ def test_session_plan_viewer_contract() -> None:
     assert 'id="btn-plan-approve"' in html
     assert 'id="btn-plan-request-changes"' in html
     assert 'id="btn-plan-quit"' in html
+    assert 'id="btn-plan-copy"' in html
+    assert 'id="btn-catch-up"' in html
     assert 'id="plan-await-banner"' in html
     assert (
         "Approve clears Hub plan-mode gate (writes plan_mode.json) and continues the session. Not the stock TUI a-key."
@@ -1945,11 +1971,15 @@ def test_session_plan_viewer_contract() -> None:
     assert "btnViewPlan" in js
     assert "modalPlan" in js or "modal-plan" in js
     assert "openPlanModal" in js
+    assert "copyPlanMarkdown" in js
+    assert "renderMermaidBlocks" in js
+    assert "showCatchUp" in js
     assert "hardApprovePlan" in js
     assert "hardRequestPlanChanges" in js
     assert "hardQuitPlan" in js
     assert "postPlanAction" in js
     assert "/plan/action" in js
+    assert "/recap" in js
     assert "refreshSessionPlan" in js
     assert "/api/sessions/" in js and "/plan" in js
     assert "approved — implement the plan in plan.md" in js
@@ -2198,3 +2228,30 @@ def test_js_mermaid_lazy_loaded() -> None:
     assert "Promise.race" in boot_chunk
     assert "12000" in boot_chunk
     assert "connectWs()" in boot_chunk
+
+
+def test_spa_hub_token_persist() -> None:
+    """Query token persists to localStorage; stored token used when URL has no ?token=."""
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    css = (STATIC / "app.css").read_text(encoding="utf-8")
+    assert "grh.hubToken" in js
+    assert "function hubToken" in js
+    assert "function tokenFromQuery" in js
+    assert "replaceState" in js
+    api_idx = js.find("function apiUrl")
+    assert api_idx >= 0
+    api_chunk = js[api_idx : api_idx + 280]
+    assert "hubToken" in api_chunk
+    ws_idx = js.find("function wsUrl")
+    assert ws_idx >= 0
+    ws_chunk = js[ws_idx : ws_idx + 300]
+    assert "hubToken" in ws_chunk
+    assert 'id="auth-token-banner"' in html
+    assert 'id="auth-token-banner-text"' in html
+    assert ".auth-token-banner" in css
+    assert "Add ?token=" in js
+    boot_idx = js.find("async function bootstrap")
+    assert boot_idx >= 0
+    boot_chunk = js[boot_idx : boot_idx + 800]
+    assert "updateAuthTokenBanner" in boot_chunk

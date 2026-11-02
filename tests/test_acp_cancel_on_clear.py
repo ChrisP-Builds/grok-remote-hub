@@ -24,71 +24,160 @@ def _client() -> AcpClient:
     return AcpClient(Config(), secret="test-secret-cancel-on-clear")
 
 
-def test_notify_agent_cancel_exists_and_does_not_force_clear() -> None:
-    """notify_agent_cancel is public async API and leaves local turn alone."""
+def test_notify_agent_cancel_sends_acp_notification() -> None:
+    """ACP session/cancel is a notification: no id, and the agent never replies to it."""
     client = _client()
-    assert hasattr(client, "notify_agent_cancel")
     assert inspect.iscoroutinefunction(client.notify_agent_cancel)
 
     async def run() -> None:
-        sid = "cancel-only-sid"
+        sid = "cancel-notify-sid"
         client._register_active_turn(sid)
-        # request always fails → returns False, no force_clear
-        client.request = AsyncMock(side_effect=RuntimeError("no agent"))  # type: ignore[method-assign]
-        ok = await client.notify_agent_cancel(sid)
-        assert ok is False
+        sent: list[dict] = []
+
+        async def send(payload: dict) -> None:
+            sent.append(payload)
+
+        client._send = send  # type: ignore[method-assign]
+        client.request = AsyncMock(side_effect=AssertionError("cancel is not a request"))  # type: ignore[method-assign]
+        assert await client.notify_agent_cancel(sid) is True
+        assert sent == [
+            {"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}}
+        ]
         assert sid in client.active_turns
-        assert client.turn_running is True
-        # Methods tried (same set as former session_cancel)
-        methods = [c.args[0] for c in client.request.await_args_list]
-        assert "session/cancel" in methods
-        assert "session/prompt/cancel" in methods
 
     asyncio.run(run())
 
 
-def test_notify_agent_cancel_returns_true_on_first_success() -> None:
+def test_notify_agent_cancel_false_when_send_fails() -> None:
     async def run() -> None:
         client = _client()
-        sid = "cancel-ok-sid"
-        client.request = AsyncMock(return_value={})  # type: ignore[method-assign]
-        ok = await client.notify_agent_cancel(sid)
-        assert ok is True
-        assert client.request.await_count == 1
-        assert client.request.await_args.args[0] == "session/cancel"
-        assert client._cancel_method == "session/cancel"
+        sid = "cancel-send-fail-sid"
+        client._register_active_turn(sid)
+        client._send = AsyncMock(side_effect=ConnectionError("ACP not connected"))  # type: ignore[method-assign]
+        assert await client.notify_agent_cancel(sid) is False
+        assert sid in client.active_turns
 
     asyncio.run(run())
 
 
-def test_notify_agent_cancel_caches_method() -> None:
-    """Successful cancel method is preferred on the next call."""
+def test_end_turn_waits_for_the_agent_to_end_the_turn() -> None:
+    """The agent answers the prompt with stopReason cancelled; the hub has nothing to force-clear."""
 
     async def run() -> None:
         client = _client()
-        sid = "cancel-cache-sid"
-        # First success on second method in the default list.
-        calls: list[str] = []
+        sid = "cancel-acked-sid"
+        client._register_active_turn(sid)
 
-        async def request(method: str, *args: object, **kwargs: object) -> dict:
-            calls.append(method)
-            if method == "session/prompt/cancel":
-                return {}
-            raise RuntimeError(f"nope {method}")
+        async def send(payload: dict) -> None:
+            asyncio.get_running_loop().call_later(0.05, client._clear_active_turn, sid)
+
+        client._send = send  # type: ignore[method-assign]
+        result = await client.end_turn(sid, "user cancel", cancel_timeout=2.0)
+        assert result["cancelled"] is True
+        assert result["cleared"] is False
+        assert client.last_force_clear_reason is None
+        assert sid not in client.active_turns
+
+    asyncio.run(run())
+
+
+def test_end_turn_kills_the_command_the_agent_is_blocked_on() -> None:
+    """Grok waits on terminal/wait_for_exit through a cancel; the hub ends that command."""
+
+    async def run() -> None:
+        client = _client()
+        sid = "cancel-blocked-sid"
+        client._register_active_turn(sid)
+        client._send = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        killed: list[str] = []
+
+        async def kill_awaited(session_id: str) -> int:
+            killed.append(session_id)
+            client._clear_active_turn(session_id)
+            return 1
+
+        client._terminals.kill_awaited = kill_awaited  # type: ignore[method-assign]
+        result = await client.end_turn(sid, "user cancel", cancel_timeout=2.0)
+        assert killed == [sid]
+        assert result["cancelled"] is True
+        assert result["cleared"] is False
+
+    asyncio.run(run())
+
+
+def test_end_turn_leaves_a_follow_up_turn_alone() -> None:
+    """The agent ends turn A on cancel and a queued prompt starts B before end_turn resumes."""
+
+    async def run() -> None:
+        client = _client()
+        sid = "replaced-turn-sid"
+        client._register_active_turn(sid)
+        first = client.active_turns[sid]
+
+        def agent_ends_a_then_b_starts() -> None:
+            client._clear_active_turn(sid)
+            client._register_active_turn(sid)
+
+        async def send(payload: dict) -> None:
+            asyncio.get_running_loop().call_later(0.02, agent_ends_a_then_b_starts)
+
+        client._send = send  # type: ignore[method-assign]
+        result = await client.end_turn(sid, "user cancel", cancel_timeout=2.0)
+        assert result["cancelled"] is True
+        assert result["cleared"] is False
+        second = client.active_turns.get(sid)
+        assert second is not None and second is not first
+        assert client.last_force_clear_reason is None
+
+    asyncio.run(run())
+
+
+def test_session_prompt_cleanup_leaves_a_replacement_turn_alone() -> None:
+    """A force-clear ends this prompt's turn and a new prompt registers before the task resumes."""
+
+    async def run() -> None:
+        client = _client()
+        sid = "prompt-replaced-sid"
+        replacement_watchdog = asyncio.create_task(asyncio.sleep(30))
+
+        async def request(method: str, params: dict | None = None, timeout: float = 120.0, *, session_id=None):
+            client.force_clear_turn("no ACP session/update for 60.0s after prompt", session_id=sid)
+            client._register_active_turn(sid)
+            client.runtimes.get(sid).stall_watchdog = replacement_watchdog
+            raise TimeoutError("Turn force-cleared: no ACP session/update for 60.0s after prompt")
 
         client.request = request  # type: ignore[method-assign]
-        ok = await client.notify_agent_cancel(sid)
-        assert ok is True
-        assert client._cancel_method == "session/prompt/cancel"
-        assert "session/cancel" in calls
-        assert calls[-1] == "session/prompt/cancel"
+        try:
+            try:
+                await client.session_prompt(sid, "hi", allow_load=False)
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError("force-cleared prompt must raise")
+            rt = client.runtimes.get(sid)
+            assert rt is not None and rt.turn is not None
+            assert rt.stall_watchdog is replacement_watchdog
+            assert not replacement_watchdog.cancelled()
+        finally:
+            replacement_watchdog.cancel()
+            try:
+                await replacement_watchdog
+            except asyncio.CancelledError:
+                pass
 
-        # Second call should try cached method first and succeed once.
-        calls.clear()
-        ok2 = await client.notify_agent_cancel(sid)
-        assert ok2 is True
-        assert calls[0] == "session/prompt/cancel"
-        assert len(calls) == 1
+    asyncio.run(run())
+
+
+def test_end_turn_force_clears_when_the_agent_ignores_cancel() -> None:
+    async def run() -> None:
+        client = _client()
+        sid = "cancel-ignored-sid"
+        client._register_active_turn(sid)
+        client._send = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        result = await client.end_turn(sid, "user cancel", cancel_timeout=0.05)
+        assert result["cancelled"] is False
+        assert result["cleared"] is True
+        assert sid not in client.active_turns
 
     asyncio.run(run())
 
@@ -115,8 +204,8 @@ def test_end_turn_cancel_before_clear_order() -> None:
         client.notify_agent_cancel = track_cancel  # type: ignore[method-assign]
         client.force_clear_turn = track_clear  # type: ignore[method-assign]
 
-        result = await client.end_turn(sid, "test end_turn order")
-        assert result["cancelled"] is True
+        result = await client.end_turn(sid, "test end_turn order", cancel_timeout=0.05)
+        assert result["cancelled"] is False
         assert result["cleared"] is True
         assert result["reason"] == "test end_turn order"
         assert order == [
@@ -222,19 +311,19 @@ def test_no_output_heal_forces_reload_no_warm_skip() -> None:
     assert "release_load_suppress" not in block
     acp = (ROOT / "hub" / "acp_client.py").read_text(encoding="utf-8")
     assert "def forget_warm_session" in acp
-    assert "_warm_sessions.discard" in acp
+    assert "rt.warm = False" in acp
     assert "async def wait_load_suppress_settled" in acp
 
 
 
-def test_no_output_auto_retry_uses_end_turn_no_auto_restart() -> None:
-
+def test_no_output_auto_retry_ends_no_turn_and_never_restarts() -> None:
+    """The failed prompt ended its own turn; any turn on the session now is a newer one (ADR-031)."""
     src = (ROOT / "hub" / "server.py").read_text(encoding="utf-8")
     idx = src.find("async def _no_output_auto_retry")
     assert idx >= 0
     end = src.find("\n    async def ", idx + 1)
     block = src[idx : end if end > idx else idx + 5000]
-    assert "end_turn" in block
+    assert "end_turn(" not in block
     # First-byte + retry thresholds wired from session_policy
     assert "NO_OUTPUT_RETRY_SECONDS" in block
     assert "no_output_seconds_for_session" in block

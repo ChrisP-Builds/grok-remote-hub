@@ -295,3 +295,128 @@ def test_subagent_events_as_system(tmp_path: Path) -> None:
     assert "subagent spawned" in msgs[0]["text"]
     assert "child-1" in msgs[0]["text"]
     assert "subagent finished" in msgs[1]["text"]
+
+
+def _tool_output_lines(tmp_path: Path, output: str) -> dict:
+    path = tmp_path / "updates.jsonl"
+    content = [{"type": "content", "content": {"type": "text", "text": output}}]
+    path.write_text(
+        _line("tool_call", toolCallId="t1", title="run_terminal_command", rawInput={"command": "x"}) + "\n"
+        + _line("tool_call_update", toolCallId="t1", status="completed", content=content) + "\n",
+        encoding="utf-8",
+    )
+    return parse_updates_jsonl(path)[0]["meta"]
+
+
+def test_tool_output_detail_keeps_full_short_output(tmp_path: Path) -> None:
+    """The turn-end history reload used to replace 30 live output lines with a 120-char snippet."""
+    meta = _tool_output_lines(tmp_path, "\r\n".join(f"n{i}" for i in range(1, 31)))
+    assert meta["detail"].split() == [f"n{i}" for i in range(1, 31)]
+    assert len(meta["summary"]) <= 120
+
+
+def test_tool_output_detail_keeps_tail_of_long_output(tmp_path: Path) -> None:
+    meta = _tool_output_lines(tmp_path, "\n".join(f"line {i}" for i in range(1, 2001)))
+    detail = meta["detail"]
+    assert len(detail) <= 4100
+    assert detail.rstrip().endswith("line 2000")
+    assert "earlier lines omitted" in detail
+    assert "line 1\n" not in detail
+
+def test_history_etag_changes_with_file_and_format(tmp_path: Path) -> None:
+    """The 4 s idle poll re-downloads full history; an ETag lets the browser get a 304 instead."""
+    from hub.history import history_etag
+
+    session = tmp_path / "sessions" / "s1"
+    session.mkdir(parents=True)
+    updates = session / "updates.jsonl"
+    updates.write_text(_line("agent_message_chunk", content={"type": "text", "text": "hi"}) + "\n", encoding="utf-8")
+    first = history_etag(tmp_path / "sessions", "s1", session, 800)
+    assert first and first.startswith('"') and first == history_etag(tmp_path / "sessions", "s1", session, 800)
+    assert history_etag(tmp_path / "sessions", "s1", session, 50) != first, "cap is part of the content"
+    with updates.open("a", encoding="utf-8") as f:
+        f.write(_line("agent_message_chunk", content={"type": "text", "text": "more"}) + "\n")
+    assert history_etag(tmp_path / "sessions", "s1", session, 800) != first
+    assert history_etag(tmp_path / "sessions", "missing", None, 800) is None
+
+def test_history_endpoint_resolves_the_session_once_off_the_event_loop(tmp_path: Path, monkeypatch) -> None:
+    """Every history poll globbed and parsed each summary.json on the loop thread before the ETag check."""
+    import asyncio
+    import threading
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import hub.server as server_mod
+    from hub.history import resolve_history
+    from tests.test_ws_resume import _hub
+
+    session = tmp_path / "sessions" / "s-thread"
+    session.mkdir(parents=True)
+    (session / "summary.json").write_text("{}", encoding="utf-8")
+    (session / "updates.jsonl").write_text(_line("agent_message_chunk", content={"type": "text", "text": "hi"}) + "\n", encoding="utf-8")
+    _, app = _hub(tmp_path, monkeypatch)
+
+    def no_scan(*args, **kwargs):
+        raise AssertionError("history must not scan every session summary")
+
+    resolver_threads: list[int] = []
+
+    def counted_resolve(*args, **kwargs):
+        resolver_threads.append(threading.get_ident())
+        return resolve_history(*args, **kwargs)
+
+    monkeypatch.setattr(server_mod, "find_session", no_scan)
+    monkeypatch.setattr(server_mod, "resolve_history", counted_resolve)
+
+    async def run() -> None:
+        loop_thread = threading.get_ident()
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            first = await client.get("/api/sessions/s-thread/history")
+            assert first.status == 200
+            assert (await first.json())["messages"][0]["text"] == "hi"
+            again = await client.get("/api/sessions/s-thread/history", headers={"If-None-Match": first.headers["ETag"]})
+            assert again.status == 304
+            missing = await client.get("/api/sessions/nope/history")
+            assert missing.status == 200 and (await missing.json())["messages"] == []
+        finally:
+            await client.close()
+        assert len(resolver_threads) == 3, "one disk pass per request"
+        assert loop_thread not in resolver_threads
+
+    asyncio.run(run())
+
+
+def test_history_endpoint_answers_304_when_unchanged(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from tests.test_ws_resume import _hub
+
+    session = tmp_path / "sessions" / "s-etag"
+    session.mkdir(parents=True)
+    (session / "summary.json").write_text("{}", encoding="utf-8")
+    updates = session / "updates.jsonl"
+    updates.write_text(_line("agent_message_chunk", content={"type": "text", "text": "hi"}) + "\n", encoding="utf-8")
+    _, app = _hub(tmp_path, monkeypatch)
+
+    async def run() -> None:
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            first = await client.get("/api/sessions/s-etag/history")
+            etag = first.headers.get("ETag")
+            assert first.status == 200 and etag
+            assert "no-cache" in first.headers.get("Cache-Control", "")
+            again = await client.get("/api/sessions/s-etag/history", headers={"If-None-Match": etag})
+            assert again.status == 304
+            with updates.open("a", encoding="utf-8") as f:
+                f.write(_line("agent_message_chunk", content={"type": "text", "text": "more"}) + "\n")
+            changed = await client.get("/api/sessions/s-etag/history", headers={"If-None-Match": etag})
+            assert changed.status == 200 and changed.headers.get("ETag") != etag
+        finally:
+            await client.close()
+
+    asyncio.run(run())

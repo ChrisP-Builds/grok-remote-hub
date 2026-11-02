@@ -23,12 +23,67 @@ if (-not (Test-Path $Python)) {
 New-Item -ItemType Directory -Force -Path $Logs | Out-Null
 
 function Get-HubProcesses {
+    # Main hub only: -m hub, not -m hub.watchdog / hub.* submodules.
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object {
             $_.CommandLine -and
-            $_.CommandLine -match '-m\s+hub' -and
+            $_.CommandLine -match '-m\s+hub(\s|$)' -and
+            $_.CommandLine -notmatch 'hub\.watchdog' -and
             ($_.CommandLine -like "*Grok Remote Hub*" -or $_.CommandLine -like "*$Root*")
         }
+}
+
+function Test-WatchdogRunning {
+    $wdPidFile = Join-Path $Logs "watchdog.pid"
+    if (Test-Path -LiteralPath $wdPidFile) {
+        $raw = (Get-Content -LiteralPath $wdPidFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($raw -match '^\d+$') {
+            $wp = [int]$raw
+            $proc = Get-Process -Id $wp -ErrorAction SilentlyContinue
+            if ($proc) {
+                $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$wp" -ErrorAction SilentlyContinue
+                if ($cim -and $cim.CommandLine -and $cim.CommandLine -match 'hub\.watchdog') {
+                    return $true
+                }
+            }
+        }
+    }
+    $hits = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.CommandLine -and
+            $_.CommandLine -match 'hub\.watchdog' -and
+            ($_.CommandLine -like "*Grok Remote Hub*" -or $_.CommandLine -like "*$Root*")
+        })
+    return ($hits.Count -gt 0)
+}
+
+function Start-WatchdogSilent {
+    # Prefer pythonw via WMI Win32_Process.Create (survives job objects; no console).
+    $venvPyw = Join-Path $Venv "Scripts\pythonw.exe"
+    $venvPy = Join-Path $Venv "Scripts\python.exe"
+    $pyw = $null
+    if (Test-Path -LiteralPath $venvPyw) {
+        $pyw = (Resolve-Path $venvPyw).Path
+    } elseif (Test-Path -LiteralPath $venvPy) {
+        # Fallback: python.exe still works; hidden via WMI detach.
+        $pyw = (Resolve-Path $venvPy).Path
+    } else {
+        $pyw = "pythonw.exe"
+    }
+    $cmdLine = "`"$pyw`" -m hub.watchdog"
+    try {
+        $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+            CommandLine      = $cmdLine
+            CurrentDirectory = $Root
+        }
+        if ($r.ReturnValue -ne 0 -or -not $r.ProcessId) {
+            Write-Host "WARN: watchdog failed to start (WMI ReturnValue=$($r.ReturnValue))"
+            return
+        }
+        Write-Host "Started watchdog PID $($r.ProcessId) (detached, silent)"
+    } catch {
+        Write-Host "WARN: watchdog failed to start: $($_.Exception.Message)"
+    }
 }
 
 function Test-HubHealth([string]$HostAddr, [int]$PortNum) {
@@ -158,5 +213,13 @@ if ($tsIp) {
     Write-Host "Phone (Tailscale Connected): http://${tsIp}:${port}"
     # MagicDNS name is machine-specific; print IP only (run: tailscale status)
 }
+
+# Ensure long-lived silent health watchdog is running (warn only on failure).
+if (Test-WatchdogRunning) {
+    Write-Host "Watchdog already running."
+} else {
+    Start-WatchdogSilent
+}
+
 Write-Host ""
 exit 0

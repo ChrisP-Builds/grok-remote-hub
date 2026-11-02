@@ -1,2 +1,4 @@
 aiohttp>=3.9.0
 websockets>=12.0
+pywebpush==2.5.0
+segno==1.6.6

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import time
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
@@ -19,6 +20,13 @@ from hub.acp_permissions import pick_permission_option
 from hub.acp_terminal import TerminalManager
 from hub.acp_trace import AcpTrace, session_id_slice
 from hub.config import Config
+from hub.session_runtime import (
+    BackgroundActivity,
+    RuntimeFieldMap,
+    SessionRuntime,
+    SessionRuntimes,
+    turn_map,
+)
 from hub.session_policy import (
     BG_ACTIVITY_MAX_S,
     BG_ACTIVITY_TTL_S,
@@ -52,9 +60,49 @@ log = logging.getLogger("hub.acp")
 
 MessageCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
 
+# Agent requests that block for the lifetime of a command run off the receive loop (ADR-031).
+_OFF_LOOP_CLIENT_METHODS = frozenset({"terminal/wait_for_exit", "terminal/waitForExit"})
+
+
+class TurnEndedError(RuntimeError):
+    """The hub ended this turn (Stop, watchdog, admin) and the agent confirmed it; see ADR-031."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"Turn ended by hub: {reason}")
+        self.reason = reason
+
+
+def _running_task() -> asyncio.Task | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+def _bg_phase(
+    bg: BackgroundActivity | None,
+    now: float,
+    *,
+    ttl: float = BG_ACTIVITY_TTL_S,
+    max_s: float = BG_ACTIVITY_MAX_S,
+) -> str:
+    if bg is None:
+        return "idle"
+    return bg_activity_phase(
+        started_at=bg.started_at,
+        last_at=bg.last_at,
+        rich_at=bg.rich_at,
+        now=now,
+        ttl=ttl,
+        max_s=max_s,
+    )
+
+
 # Re-export for callers/tests that still import from acp_client.
 __all__ = (
     "AcpClient",
+    "StdioJsonRpcTransport",
+    "TurnEndedError",
     "NO_OUTPUT_SECONDS",
     "MID_TURN_STALL_SECONDS",
     "MAX_TURN_SECONDS",
@@ -65,8 +113,130 @@ __all__ = (
 )
 
 
+class StdioJsonRpcTransport:
+    """NDJSON JSON-RPC over a subprocess stdin/stdout (leader --leader stdio).
+
+    Compatible with AcpClient wire usage: ``send(str)``, async-iterate lines,
+    ``close()``, and a process-alive ``ping()`` for liveness probes.
+    """
+
+    def __init__(self, proc: asyncio.subprocess.Process) -> None:
+        self._proc = proc
+        self._closed = False
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._reader_task: asyncio.Task | None = None
+
+    @property
+    def process(self) -> asyncio.subprocess.Process:
+        return self._proc
+
+    def start_reader(self) -> None:
+        if self._reader_task is None:
+            self._reader_task = asyncio.create_task(
+                self._read_stdout(), name="acp-stdio-reader"
+            )
+
+    async def _read_stdout(self) -> None:
+        stdout = self._proc.stdout
+        if stdout is None:
+            await self._queue.put(None)
+            return
+        try:
+            while True:
+                line = await stdout.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if text:
+                    await self._queue.put(text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("stdio reader ended: %s", exc)
+        finally:
+            try:
+                await self._queue.put(None)
+            except Exception:
+                pass
+
+    async def send(self, data: str) -> None:
+        if self._closed or self._proc.stdin is None:
+            raise ConnectionError("ACP stdio closed")
+        if self._proc.returncode is not None:
+            raise ConnectionError("ACP stdio process exited")
+        payload = data if data.endswith("\n") else data + "\n"
+        self._proc.stdin.write(payload.encode("utf-8"))
+        await self._proc.stdin.drain()
+
+    def __aiter__(self) -> "StdioJsonRpcTransport":
+        return self
+
+    async def __anext__(self) -> str:
+        item = await self._queue.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+    async def ping(self) -> asyncio.Future:
+        """Process-alive stand-in for WebSocket ping (returns resolved future)."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        if self._closed or self._proc.returncode is not None:
+            fut.set_exception(ConnectionError("ACP stdio process not alive"))
+        else:
+            fut.set_result(None)
+        return fut
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._proc.stdin is not None:
+                try:
+                    self._proc.stdin.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if self._reader_task is not None and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        self._reader_task = None
+        try:
+            if self._proc.returncode is None:
+                self._proc.terminate()
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    try:
+                        self._proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await self._proc.wait()
+                    except Exception:
+                        pass
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            log.debug("stdio transport close: %s", exc)
+        try:
+            await self._queue.put(None)
+        except Exception:
+            pass
+
+
 class AcpClient:
-    """Sole ACP WebSocket client to grok agent serve.
+    """Sole ACP client to the agent backend (serve WS or leader stdio).
+
+    Default: WebSocket to ``grok agent serve``. Opt-in ``agent_backend=leader``:
+    long-lived ``grok agent --always-approve --leader stdio`` NDJSON.
 
     Multi-session concurrent turns: the hub does not globally block one project
     because another is mid-turn. Concurrent session/prompt awaits share one
@@ -85,6 +255,7 @@ class AcpClient:
         *,
         log_dir: Any = None,
         trace: AcpTrace | None = None,
+        runtimes: SessionRuntimes | None = None,
     ):
         self.config = config
         self.secret = secret
@@ -101,27 +272,11 @@ class AcpClient:
         self._stop = asyncio.Event()
         self.connected = False
         self.loaded_session_id: str | None = None
-        # session ids successfully session/new or session/load'd this process (ACP up).
-        self._warm_sessions: set[str] = set()
-        # Single-flight: sid -> Future while session/load is in progress.
-        self._load_inflight: dict[str, asyncio.Future] = {}
-        # session/load: suppress historical session/update fanout (UI strobe).
-        self._loading_sessions: set[str] = set()
-        # Optional once-per-load suppress counts for trace (sid -> count).
-        self._load_suppress_counts: dict[str, int] = {}
-        # Delayed release handles for load suppress (sid -> Handle).
-        self._load_release_handles: dict[str, asyncio.TimerHandle] = {}
-        # Quiet-period load suppress: max wall deadline (monotonic) per sid.
-        self._load_suppress_deadline: dict[str, float] = {}
         self.available_commands: list[dict[str, Any]] = []
-        # session_id -> {started_at, last_activity, saw_update, first_update_at,
-        #                cwd_key, prompt_req_id?}
-        self.active_turns: dict[str, dict[str, Any]] = {}
-        self._stall_watchdogs: dict[str, asyncio.Task] = {}
-        # Single-flight locks for end_turn (cancel-then-clear) per session.
-        self._end_turn_locks: dict[str, asyncio.Lock] = {}
-        # Last cancel RPC method that succeeded (tried first next time).
-        self._cancel_method: str | None = None
+        # Per-session runtime state shared with the Hub: ADR-030.
+        self.runtimes = runtimes if runtimes is not None else SessionRuntimes()
+        self._active_turns = turn_map(self.runtimes)
+        self._end_all_turns_lock = asyncio.Lock()
         # Last watchdog/admin force-clear (Hub may broadcast idle from these).
         self.last_force_clear_reason: str | None = None
         self.last_force_clear_session: str | None = None
@@ -133,8 +288,7 @@ class AcpClient:
         self._terminals = TerminalManager()
         # Pending _x.ai/ask_user_question futures keyed by str(msg_id).
         self._pending_user_questions: dict[str, asyncio.Future] = {}
-        # request_id -> session_id for pending questions
-        self._pending_user_question_sessions: dict[str, str] = {}
+        self._client_request_tasks: set[asyncio.Task] = set()
         # Hub sets this to fan out user_question events to the web UI.
         self.on_user_question: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None
         # Hub sets this to fan out live terminal/* pump deltas to the web UI.
@@ -146,14 +300,8 @@ class AcpClient:
         ) = None
         # Hub ops: (reason, session_id_or_None) when a force-clear actually clears.
         self.on_force_clear: Callable[[str, str | None], None] | None = None
-        # session_id -> monotonic last notification activity (orphan/bg work).
-        self._bg_activity_at: dict[str, float] = {}
-        # session_id -> monotonic first stamp of current bg episode (continuous age).
-        self._bg_activity_started_at: dict[str, float] = {}
-        # session_id -> last activity kind (stable UI label).
-        self._bg_activity_kind: dict[str, str] = {}
-        # session_id -> last rich (non-heartbeat) activity stamp in this episode.
-        self._bg_activity_rich_at: dict[str, float] = {}
+        # (kind "shell"|"file", session_id, command|path) -> refusal reason or None. ADR-027.
+        self.exec_gate: Callable[[str, str, str], str | None] | None = None
         # Wire terminal pump → hub fanout
         self._terminals.on_output = self._on_terminal_output_chunk
         # ACP wire liveness (half-open / zombie detection for status quality).
@@ -174,6 +322,9 @@ class AcpClient:
             if resolved_log is None:
                 resolved_log = getattr(config, "log_dir", None)
             self.trace = AcpTrace(log_dir=resolved_log)
+
+    def _is_leader_backend(self) -> bool:
+        return bool(getattr(self.config, "uses_leader_backend", False))
 
     def _trace(self, event: str, **fields: Any) -> None:
         tr = getattr(self, "trace", None)
@@ -320,6 +471,11 @@ class AcpClient:
     # --- back-compat properties over multi-session active_turns ---
 
     @property
+    def active_turns(self) -> RuntimeFieldMap[dict[str, Any]]:
+        """session_id -> turn meta (started_at, last_activity, saw_update, first_update_at, cwd_key)."""
+        return self._active_turns
+
+    @property
     def turn_running(self) -> bool:
         return bool(self.active_turns)
 
@@ -418,7 +574,13 @@ class AcpClient:
         return str(session_id or "") in self.active_turns
 
     def sessions_with_pending_questions(self) -> set[str]:
-        return set(self._pending_user_question_sessions.values())
+        return {sid for sid, rt in self.runtimes.items() if rt.pending_question_ids}
+
+    def _loading_session_ids(self) -> frozenset[str]:
+        return frozenset(sid for sid, rt in self.runtimes.items() if rt.load.loading)
+
+    def _warm_session_ids(self) -> frozenset[str]:
+        return frozenset(sid for sid, rt in self.runtimes.items() if rt.warm)
 
     def turn_age_seconds(self, session_id: str | None = None) -> float | None:
         sid = session_id or self.turn_session_id
@@ -518,12 +680,13 @@ class AcpClient:
 
     def _force_clear_one(self, session_id: str, reason: str) -> bool:
         sid = str(session_id or "")
-        has_turn = sid in self.active_turns
-        has_q = any(s == sid for s in self._pending_user_question_sessions.values())
+        rt = self.runtimes.get(sid)
+        has_turn = rt is not None and rt.turn is not None
+        has_q = rt is not None and bool(rt.pending_question_ids)
         scoped_reqs = [rid for rid, s in self._pending_session.items() if s == sid]
         if not has_turn and not has_q and not scoped_reqs:
             return False
-        meta = self.active_turns.get(sid) or {}
+        meta = (rt.turn if rt is not None else None) or {}
         started = meta.get("started_at")
         age = (time.monotonic() - float(started)) if started is not None else None
         log.warning(
@@ -568,15 +731,20 @@ class AcpClient:
         if session_id is None:
             self._cancel_all_stall_watchdogs()
             return
-        wd = self._stall_watchdogs.pop(str(session_id), None)
-        if wd is not None and not wd.done():
-            wd.cancel()
+        rt = self.runtimes.get(str(session_id))
+        if rt is not None:
+            self._detach_stall_watchdog(rt)
 
     def _cancel_all_stall_watchdogs(self) -> None:
-        for sid, wd in list(self._stall_watchdogs.items()):
-            if wd is not None and not wd.done():
-                wd.cancel()
-        self._stall_watchdogs.clear()
+        for _sid, rt in self.runtimes.items():
+            self._detach_stall_watchdog(rt)
+
+    def _detach_stall_watchdog(self, rt: SessionRuntime) -> None:
+        wd = rt.stall_watchdog
+        rt.stall_watchdog = None
+        if wd is not None and not wd.done() and wd is not _running_task():
+            wd.cancel()
+        self.runtimes.prune(rt.session_id)
 
     # Back-compat alias for older call sites / tests.
     def _cancel_no_output_watchdog(self) -> None:
@@ -627,38 +795,34 @@ class AcpClient:
         kind: str | None = None,
         now: float | None = None,
     ) -> bool:
-        """Stamp background activity for a session (even when not in active_turns).
+        """Stamp background activity for a session (even without an active turn).
 
-        Returns True when the session was not already within the bg TTL (became live).
-        Invokes on_session_activity when set (sync or schedules async).
-
-        Episode semantics: first pulse (or first after TTL expiry) sets
-        ``_bg_activity_started_at``; subsequent pulses only refresh last-at so
-        continuous age does not reset on every subagent_progress.
-
-        Heartbeat-only kinds (subagent_progress) refresh last-at only.
-        Rich kinds also stamp ``_bg_activity_rich_at`` so phase stays working.
+        Returns True when a new bg episode started (session was not within TTL).
+        Heartbeat kinds refresh last_at only; rich kinds also stamp rich_at.
         """
         sid = str(session_id or "").strip()
         if not sid:
             return False
         ts = time.monotonic() if now is None else float(now)
-        prev = self._bg_activity_at.get(sid)
-        was_live = bg_activity_is_live(prev, ts)
+        rt = self.runtimes.get_or_create(sid)
+        bg = rt.background
+        was_live = bg is not None and bg_activity_is_live(bg.last_at, ts)
         is_rich = notification_is_rich_activity(kind)
-        if not was_live:
-            # New bg episode: continuous age starts here.
-            self._bg_activity_started_at[sid] = ts
-            # Clear prior rich stamp unless this note itself is rich.
+        if bg is None:
+            bg = BackgroundActivity(last_at=ts, started_at=ts)
+            rt.background = bg
+        elif not was_live:
+            # Expired episode: continuous age restarts; stale rich stamp goes.
+            bg.started_at = ts
             if not is_rich:
-                self._bg_activity_rich_at.pop(sid, None)
-        self._bg_activity_at[sid] = ts
+                bg.rich_at = None
+        bg.last_at = ts
         if is_rich:
-            self._bg_activity_rich_at[sid] = ts
+            bg.rich_at = ts
         if kind is not None:
             k = str(kind).strip()
             if k:
-                self._bg_activity_kind[sid] = k
+                bg.kind = k
         if self.on_session_activity:
             try:
                 result = self.on_session_activity(sid, kind)
@@ -677,19 +841,21 @@ class AcpClient:
 
     def _pop_bg_activity(self, session_id: str) -> None:
         sid = str(session_id or "").strip()
-        if not sid:
+        rt = self.runtimes.get(sid)
+        if rt is None:
             return
-        self._bg_activity_at.pop(sid, None)
-        self._bg_activity_started_at.pop(sid, None)
-        self._bg_activity_kind.pop(sid, None)
-        self._bg_activity_rich_at.pop(sid, None)
+        rt.background = None
+        self.runtimes.prune(sid)
 
     def clear_bg_activity(self) -> None:
         """Drop all background activity stamps (e.g. agent process restart)."""
-        self._bg_activity_at.clear()
-        self._bg_activity_started_at.clear()
-        self._bg_activity_kind.clear()
-        self._bg_activity_rich_at.clear()
+        for sid, rt in self.runtimes.items():
+            rt.background = None
+            self.runtimes.prune(sid)
+
+    def _background_for(self, session_id: str) -> BackgroundActivity | None:
+        rt = self.runtimes.get(session_id)
+        return rt.background if rt is not None else None
 
     def bg_activity_ages(
         self,
@@ -708,25 +874,17 @@ class AcpClient:
         if not sid:
             return (None, None)
         ts = time.monotonic() if now is None else float(now)
-        last = self._bg_activity_at.get(sid)
-        if last is None or not bg_activity_is_live(last, ts, ttl):
+        bg = self._background_for(sid)
+        if bg is None or not bg_activity_is_live(bg.last_at, ts, ttl):
             return (None, None)
-        started = self._bg_activity_started_at.get(sid)
-        start = float(started) if started is not None else float(last)
-        age = float(ts) - start
-        if age < 0.0:
-            age = 0.0
-        silence = float(ts) - float(last)
-        if silence < 0.0:
-            silence = 0.0
+        age = max(0.0, float(ts) - float(bg.started_at))
+        silence = max(0.0, float(ts) - float(bg.last_at))
         return (age, silence)
 
     def bg_activity_kind(self, session_id: str | None) -> str | None:
         """Last recorded bg activity kind for ``session_id``, if any."""
-        sid = str(session_id or "").strip()
-        if not sid:
-            return None
-        return self._bg_activity_kind.get(sid)
+        bg = self._background_for(str(session_id or "").strip())
+        return bg.kind if bg is not None else None
 
     def bg_activity_phase_for(
         self,
@@ -739,13 +897,7 @@ class AcpClient:
         if not sid:
             return "idle"
         ts = time.monotonic() if now is None else float(now)
-        return bg_activity_phase(
-            started_at=self._bg_activity_started_at.get(sid),
-            last_at=self._bg_activity_at.get(sid),
-            rich_at=self._bg_activity_rich_at.get(sid),
-            now=ts,
-            ttl=ttl,
-        )
+        return _bg_phase(self._background_for(sid), ts, ttl=ttl)
 
     def prune_expired_bg_activity(
         self,
@@ -756,32 +908,22 @@ class AcpClient:
         """Drop idle stamps and stuck-past-max episodes. Returns auto-cleared sids."""
         ts = time.monotonic() if now is None else float(now)
         cleared: list[str] = []
-        for sid in list(self._bg_activity_at.keys()):
-            last = self._bg_activity_at.get(sid)
-            started = self._bg_activity_started_at.get(sid)
-            rich = self._bg_activity_rich_at.get(sid)
-            phase = bg_activity_phase(
-                started_at=started,
-                last_at=last,
-                rich_at=rich,
-                now=ts,
-                ttl=ttl,
-                max_s=max_s,
-            )
+        for sid, rt in self.runtimes.items():
+            bg = rt.background
+            if bg is None:
+                continue
+            phase = _bg_phase(bg, ts, ttl=ttl, max_s=max_s)
             if phase == "idle":
                 self._pop_bg_activity(sid)
                 continue
             if phase == "stuck":
-                start = float(started) if started is not None else float(last or ts)
-                age = float(ts) - start
-                if age < 0.0:
-                    age = 0.0
+                age = max(0.0, float(ts) - float(bg.started_at))
                 if age >= float(max_s):
                     log.warning(
                         "bg activity auto-cleared (max age) session=%s age=%.0fs kind=%s",
                         sid[:16],
                         age,
-                        self._bg_activity_kind.get(sid) or "",
+                        bg.kind or "",
                     )
                     self._pop_bg_activity(sid)
                     cleared.append(sid)
@@ -803,6 +945,7 @@ class AcpClient:
                                 sid,
                                 exc_info=True,
                             )
+        self.runtimes.prune(now=ts)
         return cleared
 
     def bg_activity_status_map(
@@ -814,14 +957,10 @@ class AcpClient:
         ts = time.monotonic() if now is None else float(now)
         self.prune_expired_bg_activity(now=ts, ttl=ttl)
         out: dict[str, str] = {}
-        for sid in list(self._bg_activity_at.keys()):
-            phase = bg_activity_phase(
-                started_at=self._bg_activity_started_at.get(sid),
-                last_at=self._bg_activity_at.get(sid),
-                rich_at=self._bg_activity_rich_at.get(sid),
-                now=ts,
-                ttl=ttl,
-            )
+        for sid, rt in self.runtimes.items():
+            if rt.background is None:
+                continue
+            phase = _bg_phase(rt.background, ts, ttl=ttl)
             if phase in ("working", "stuck"):
                 out[sid] = phase
         return out
@@ -877,30 +1016,67 @@ class AcpClient:
             self._maintain_task = None
         await self._close_ws()
 
-    async def reconnect(self, timeout: float = 10.0) -> None:
+    async def reconnect(
+        self, timeout: float = 10.0, *, reset_maintain: bool = False
+    ) -> None:
         """Close the current ACP WebSocket so the maintain loop reconnects.
 
         Waits until connected (and initialized) or raises TimeoutError.
-        Used by no-output heal; does not session/new.
+        Used by no-output heal and agent recycle; does not session/new.
+
+        When ``reset_maintain`` is True (restart-agent path): cancel any
+        in-flight maintain task (including backoff sleep) and start a fresh
+        loop so exponential backoff does not block reconnect after kill.
+        When False: only revive maintain if the task is missing or done.
         """
         was_connected = self.connected
-        log.info("ACP reconnect requested (was_connected=%s)", was_connected)
-        self._trace("disconnect", reason="reconnect_requested", was_connected=was_connected)
+        log.info(
+            "ACP reconnect requested (was_connected=%s reset_maintain=%s)",
+            was_connected,
+            reset_maintain,
+        )
+        self._trace(
+            "disconnect",
+            reason="reconnect_requested",
+            was_connected=was_connected,
+            reset_maintain=reset_maintain,
+        )
         try:
             await self._close_ws()
         except Exception as exc:
             log.warning("ACP reconnect close failed: %s", exc)
-        # If maintain died (e.g. prior cancel race) or was never started, revive it.
-        if self._maintain_task is None or self._maintain_task.done():
+
+        if reset_maintain:
+            # Cancel stalled maintain (e.g. mid exponential backoff after kill)
+            # and start a fresh loop so backoff resets to 1.0s.
+            old = self._maintain_task
+            if old is not None and not old.done():
+                old.cancel()
+                try:
+                    await old
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    log.warning("ACP maintain cancel after reset: %s", exc)
+            self._maintain_task = None
             if not self._stop.is_set():
-                log.warning(
-                    "ACP maintain not running; restarting loop for reconnect"
-                )
+                log.info("ACP maintain reset; starting fresh loop for reconnect")
                 self._maintain_task = asyncio.create_task(
                     self._maintain(), name="acp-client"
                 )
+        else:
+            # If maintain died (e.g. prior cancel race) or was never started, revive it.
+            if self._maintain_task is None or self._maintain_task.done():
+                if not self._stop.is_set():
+                    log.warning(
+                        "ACP maintain not running; restarting loop for reconnect"
+                    )
+                    self._maintain_task = asyncio.create_task(
+                        self._maintain(), name="acp-client"
+                    )
+
         deadline = time.monotonic() + max(0.5, float(timeout))
-        # If already mid-reconnect, wait for the next connected edge.
+        # Wait for connected + initialize done (self.connected set after initialize).
         while time.monotonic() < deadline:
             if self.connected and self._ws is not None:
                 log.info("ACP reconnect complete")
@@ -964,6 +1140,67 @@ class AcpClient:
             self._cancel_all_pending_user_questions()
 
     async def _maintain(self) -> None:
+        """Dispatch: leader uses stdio; default serve uses WebSocket."""
+        if self._is_leader_backend():
+            await self._maintain_stdio_leader()
+            return
+        await self._maintain_ws()
+
+    async def _maintain_session_cleanup(self, *, disconnect_reason: str) -> None:
+        """Shared post-session cleanup for WS and stdio maintain loops."""
+        self._ws = None
+        self.loaded_session_id = None
+        for sid, rt in self.runtimes.items():
+            rt.warm = False
+            inflight = rt.load.inflight
+            rt.load.inflight = None
+            if inflight is not None and not inflight.done():
+                inflight.set_exception(ConnectionError("ACP disconnected"))
+            self.runtimes.prune(sid)
+        if (
+            self.active_turns
+            or self._pending
+            or self._pending_user_questions
+        ):
+            # Wire already dead: cancel RPC cannot work; unlock locally.
+            self.force_clear_turn("acp disconnected")
+        else:
+            self.active_turns.clear()
+            self._cancel_all_stall_watchdogs()
+        if self._recv_task and not self._recv_task.done():
+            self._recv_task.cancel()
+            try:
+                await self._recv_task
+            except asyncio.CancelledError:
+                pass
+        self._recv_task = None
+        for task in list(self._client_request_tasks):
+            task.cancel()
+        self._client_request_tasks.clear()
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(ConnectionError("ACP connection closed"))
+        self._pending.clear()
+        self._pending_session.clear()
+        self._cancel_all_pending_user_questions()
+        if self.connected:
+            self._trace("disconnect", reason=disconnect_reason)
+            await self._set_connected(False)
+
+    def _maintain_cancelled_should_reraise(self) -> bool:
+        """True when CancelledError means this maintain task is stopping."""
+        if self._stop.is_set():
+            return True
+        cur = asyncio.current_task()
+        cancelling = 0
+        if cur is not None and hasattr(cur, "cancelling"):
+            try:
+                cancelling = int(cur.cancelling())  # type: ignore[attr-defined]
+            except Exception:
+                cancelling = 0
+        return bool(cancelling)
+
+    async def _maintain_ws(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
             try:
@@ -987,57 +1224,84 @@ class AcpClient:
             except asyncio.CancelledError:
                 # Re-raise only when this task is stopping/cancelled.
                 # Awaiting a cancelled recv (reconnect path) must not kill maintain.
-                if self._stop.is_set():
-                    raise
-                cur = asyncio.current_task()
-                cancelling = 0
-                if cur is not None and hasattr(cur, "cancelling"):
-                    try:
-                        cancelling = int(cur.cancelling())  # type: ignore[attr-defined]
-                    except Exception:
-                        cancelling = 0
-                if cancelling:
+                if self._maintain_cancelled_should_reraise():
                     raise
                 log.info("ACP recv cancelled (reconnect); maintain continues")
             except Exception as exc:
                 log.warning("ACP connection error: %s", exc)
                 self._trace("disconnect", reason="connection_error", error=str(exc)[:200])
             finally:
+                await self._maintain_session_cleanup(disconnect_reason="ws_closed")
+            if self._stop.is_set():
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 15.0)
+
+    async def _maintain_stdio_leader(self) -> None:
+        """Attach ACP via ``grok agent --always-approve --leader stdio`` (NDJSON)."""
+        backoff = 1.0
+        while not self._stop.is_set():
+            transport: StdioJsonRpcTransport | None = None
+            try:
+                log.info(
+                    "Connecting ACP via leader stdio (%s)",
+                    self.config.grok_bin,
+                )
+                self._trace("connect", transport="leader_stdio")
+                kwargs: dict[str, Any] = {
+                    "stdin": asyncio.subprocess.PIPE,
+                    "stdout": asyncio.subprocess.PIPE,
+                    "stderr": asyncio.subprocess.DEVNULL,
+                }
+                if sys.platform == "win32":
+                    # Keep pipes (not detached); hide console window only.
+                    kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+                proc = await asyncio.create_subprocess_exec(
+                    self.config.grok_bin,
+                    "agent",
+                    "--always-approve",
+                    "--leader",
+                    "stdio",
+                    **kwargs,
+                )
+                transport = StdioJsonRpcTransport(proc)
+                transport.start_reader()
+                self._ws = transport
+                # Reader must run before initialize/request awaits responses
+                self._recv_task = asyncio.create_task(
+                    self._recv_loop(transport), name="acp-recv"
+                )
+                await self._initialize()
+                await self._set_connected(True)
+                backoff = 1.0
+                log.info("ACP leader stdio connected and initialized")
+                await self._recv_task
+            except asyncio.CancelledError:
+                if self._maintain_cancelled_should_reraise():
+                    raise
+                log.info("ACP stdio recv cancelled (reconnect); maintain continues")
+            except Exception as exc:
+                log.warning("ACP leader stdio error: %s", exc)
+                self._trace(
+                    "disconnect",
+                    reason="stdio_connection_error",
+                    error=str(exc)[:200],
+                )
+            finally:
+                # Ensure transport/process torn down even if cleanup races.
+                ws = self._ws
                 self._ws = None
-                self.loaded_session_id = None
-                self._warm_sessions.clear()
-                for _fut in self._load_inflight.values():
-                    if not _fut.done():
-                        _fut.set_exception(ConnectionError("ACP disconnected"))
-                self._load_inflight.clear()
-                # Cancel method may no longer apply after reconnect.
-                self._cancel_method = None
-                if (
-                    self.active_turns
-                    or self._pending
-                    or self._pending_user_questions
-                ):
-                    # WS already dead: cancel RPC cannot work; unlock locally.
-                    self.force_clear_turn("acp disconnected")
-                else:
-                    self.active_turns.clear()
-                    self._cancel_all_stall_watchdogs()
-                if self._recv_task and not self._recv_task.done():
-                    self._recv_task.cancel()
+                if transport is not None and ws is transport:
                     try:
-                        await self._recv_task
-                    except asyncio.CancelledError:
+                        await transport.close()
+                    except Exception:
                         pass
-                self._recv_task = None
-                for fut in list(self._pending.values()):
-                    if not fut.done():
-                        fut.set_exception(ConnectionError("ACP connection closed"))
-                self._pending.clear()
-                self._pending_session.clear()
-                self._cancel_all_pending_user_questions()
-                if self.connected:
-                    self._trace("disconnect", reason="ws_closed")
-                    await self._set_connected(False)
+                elif isinstance(ws, StdioJsonRpcTransport):
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                await self._maintain_session_cleanup(disconnect_reason="stdio_closed")
             if self._stop.is_set():
                 break
             await asyncio.sleep(backoff)
@@ -1149,8 +1413,9 @@ class AcpClient:
         sid_str = str(sid) if sid else None
         method_str = str(method) if method else None
         kind_str = str(update_kind) if update_kind else None
+        loading_ids = self._loading_session_ids()
         suppress = should_suppress_session_load_fanout(
-            loading_session_ids=self._loading_sessions,
+            loading_session_ids=loading_ids,
             session_id=sid_str,
             method=method_str,
             update_kind=kind_str,
@@ -1158,11 +1423,9 @@ class AcpClient:
         )
         if suppress:
             # Count for a single end-of-load trace (avoid per-message flood).
-            key = sid_str or next(iter(self._loading_sessions), "")
+            key = sid_str or next(iter(loading_ids), "")
             if key:
-                self._load_suppress_counts[key] = (
-                    self._load_suppress_counts.get(key, 0) + 1
-                )
+                self.runtimes.get_or_create(key).load.suppress_count += 1
                 # Each suppressed frame resets the quiet-period release timer.
                 self._rearm_load_suppress_release(key)
             await self._track_update(msg)
@@ -1182,6 +1445,16 @@ class AcpClient:
             err["data"] = data
         await self._send({"jsonrpc": "2.0", "id": msg_id, "error": err})
 
+    def _exec_refusal(self, kind: str, params: dict[str, Any], value: str) -> str | None:
+        if self.exec_gate is None:
+            return None
+        sid = str(params.get("sessionId") or params.get("session_id") or "")
+        try:
+            return self.exec_gate(kind, sid, value)
+        except Exception:
+            log.exception("exec gate failed; refusing %s", kind)
+            return "Blocked by Grok Remote Hub: approval check failed."
+
     async def _handle_client_request(self, msg: dict[str, Any]) -> None:
         """Respond to agent-initiated JSON-RPC requests (fs, terminal, permission)."""
         msg_id = msg.get("id")
@@ -1196,17 +1469,31 @@ class AcpClient:
         )
         self.note_activity(str(sid) if sid else None)
 
+        # Spawn task so the ACP recv loop keeps processing while the UI answers.
+        if "ask_user_question" in method_l:
+            asyncio.create_task(
+                self._handle_ask_user_question(msg_id, params),
+                name=f"acp-ask-user-{msg_id!s}"[:48],
+            )
+            return
+        if method in _OFF_LOOP_CLIENT_METHODS:
+            self._spawn_client_request(msg_id, method, params)
+            return
+        await self._serve_client_request(msg_id, method, params)
+
+    def _spawn_client_request(self, msg_id: Any, method: str, params: dict[str, Any]) -> None:
+        task = asyncio.create_task(
+            self._serve_client_request(msg_id, method, params),
+            name=f"acp-client-req-{msg_id!s}"[:48],
+        )
+        self._client_request_tasks.add(task)
+        task.add_done_callback(self._client_request_tasks.discard)
+
+    async def _serve_client_request(self, msg_id: Any, method: str, params: dict[str, Any]) -> None:
+        method_l = method.lower()
         try:
             if "permission" in method_l or method_l.endswith("request_permission"):
                 await self._handle_permission(msg_id, params)
-                return
-
-            # Spawn task so the ACP recv loop keeps processing while the UI answers.
-            if "ask_user_question" in method_l:
-                asyncio.create_task(
-                    self._handle_ask_user_question(msg_id, params),
-                    name=f"acp-ask-user-{msg_id!s}"[:48],
-                )
                 return
 
             if method in ("fs/read_text_file", "fs/readTextFile"):
@@ -1215,11 +1502,21 @@ class AcpClient:
                 return
 
             if method in ("fs/write_text_file", "fs/writeTextFile"):
+                refusal = self._exec_refusal("file", params, str(params.get("path") or ""))
+                if refusal:
+                    await self._reply_error(msg_id, -32000, refusal)
+                    return
                 result = await asyncio.to_thread(write_text_file, params)
                 await self._reply_result(msg_id, result)
                 return
 
             if method in ("terminal/create", "terminal/create_terminal"):
+                args = [str(a) for a in params.get("args") or []]
+                command = " ".join([str(params.get("command") or ""), *args]).strip()
+                refusal = self._exec_refusal("shell", params, command)
+                if refusal:
+                    await self._reply_error(msg_id, -32000, refusal)
+                    return
                 result = await self._terminals.create(params)
                 await self._reply_result(msg_id, result)
                 return
@@ -1263,6 +1560,8 @@ class AcpClient:
         except ValueError as exc:
             log.warning("ACP client request %s: %s", method, exc)
             await self._reply_error(msg_id, -32602, str(exc))
+        except ConnectionError as exc:
+            log.debug("ACP client request %s reply dropped, not connected: %s", method, exc)
         except Exception as exc:
             log.exception("ACP client request %s failed: %s", method, exc)
             await self._reply_error(msg_id, -32000, f"{type(exc).__name__}: {exc}")
@@ -1313,17 +1612,21 @@ class AcpClient:
             if not fut.done():
                 fut.set_result(build_cancelled_result())
             self._pending_user_questions.pop(key, None)
-        self._pending_user_question_sessions.clear()
+        for sid, rt in self.runtimes.items():
+            rt.pending_question_ids.clear()
+            self.runtimes.prune(sid)
 
     def _cancel_pending_user_questions_for_session(self, session_id: str) -> None:
-        sid = str(session_id or "")
-        for key, s in list(self._pending_user_question_sessions.items()):
-            if s != sid:
-                continue
+        rt = self.runtimes.get(str(session_id or ""))
+        if rt is None:
+            return
+        keys = list(rt.pending_question_ids)
+        rt.pending_question_ids.clear()
+        for key in keys:
             fut = self._pending_user_questions.pop(key, None)
-            self._pending_user_question_sessions.pop(key, None)
             if fut is not None and not fut.done():
                 fut.set_result(build_cancelled_result())
+        self.runtimes.prune(rt.session_id)
 
     async def _handle_ask_user_question(
         self, msg_id: Any, params: dict[str, Any]
@@ -1350,7 +1653,7 @@ class AcpClient:
         )
         sid_str = str(session_id) if session_id else ""
         if sid_str:
-            self._pending_user_question_sessions[key] = sid_str
+            self.runtimes.get_or_create(sid_str).pending_question_ids.add(key)
         tool_call_id = (
             params.get("toolCallId")
             or params.get("tool_call_id")
@@ -1390,7 +1693,10 @@ class AcpClient:
                 pass
         finally:
             pending = self._pending_user_questions.pop(key, None)
-            self._pending_user_question_sessions.pop(key, None)
+            rt = self.runtimes.get(sid_str)
+            if rt is not None:
+                rt.pending_question_ids.discard(key)
+                self.runtimes.prune(rt.session_id)
             if pending is not None and not pending.done():
                 pending.cancel()
 
@@ -1420,7 +1726,7 @@ class AcpClient:
                 params if isinstance(params, dict) else None
             )
             suppress_n = should_suppress_session_load_fanout(
-                loading_session_ids=self._loading_sessions,
+                loading_session_ids=self._loading_session_ids(),
                 session_id=sid_str,
                 method=method_str,
                 update_kind=kind_n or None,
@@ -1446,7 +1752,7 @@ class AcpClient:
             if isinstance(cmds, list):
                 self.available_commands = cmds
         suppress = should_suppress_session_load_fanout(
-            loading_session_ids=self._loading_sessions,
+            loading_session_ids=self._loading_session_ids(),
             session_id=sid_str,
             method=method_str,
             update_kind=str(kind) if kind else None,
@@ -1573,7 +1879,10 @@ class AcpClient:
         sid = str(session_id or "").strip()
         if not sid:
             return
-        self._warm_sessions.discard(sid)
+        rt = self.runtimes.get(sid)
+        if rt is not None:
+            rt.warm = False
+            self.runtimes.prune(sid)
         if self.loaded_session_id == sid:
             self.loaded_session_id = None
 
@@ -1588,23 +1897,24 @@ class AcpClient:
             raise RuntimeError(f"session/new missing sessionId: {result!r}")
         sid = str(session_id)
         self.loaded_session_id = sid
-        self._warm_sessions.add(sid)
+        self.runtimes.get_or_create(sid).warm = True
         return sid
 
     async def session_load(self, session_id: str, cwd: str) -> Any:
         sid = str(session_id)
         # Already loaded in this process: skip agent session/load (not model prefill).
-        if should_skip_session_load(self._warm_sessions, sid):
+        if should_skip_session_load(self._warm_session_ids(), sid):
             log.info("session/load skip already warm sid=%s", sid[:8])
             self.loaded_session_id = sid
             return {"skipped": True, "sessionId": sid}
+        rt = self.runtimes.get_or_create(sid)
         # Concurrent attach/ensure: join in-flight load for same sid (one RPC).
-        inflight = self._load_inflight.get(sid)
+        inflight = rt.load.inflight
         if inflight is not None and not inflight.done():
             return await inflight
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
-        self._load_inflight[sid] = fut
+        rt.load.inflight = fut
         try:
             # Only block load of this session if it is mid-turn (not other projects).
             if session_id in self.active_turns:
@@ -1614,8 +1924,7 @@ class AcpClient:
                     raise RuntimeError("Turn in progress; cannot load this session")
             # Cancel any prior delayed release for this sid before re-arming.
             self.release_load_suppress(sid)
-            self._loading_sessions.add(sid)
-            self._load_suppress_counts.setdefault(sid, 0)
+            rt.load.loading = True
             try:
                 result = await self.request(
                     "session/load",
@@ -1624,27 +1933,15 @@ class AcpClient:
                     session_id=session_id,
                 )
                 self.loaded_session_id = session_id
-                self._warm_sessions.add(sid)
+                rt.warm = True
             finally:
                 # Quiet-period release: agent may flush historical frames for many
-                # seconds after the RPC result. Keep sid in _loading_sessions; each
+                # seconds after the RPC result. Keep load.loading set; each
                 # suppressed frame rearms the quiet timer until silence or max hold.
                 # Adaptive quiet: tiny flush (few frames) settles faster; fat keeps 1.5s.
-                now = time.monotonic()
-                self._load_suppress_deadline[sid] = now + LOAD_SUPPRESS_MAX_S
-                prev = self._load_release_handles.pop(sid, None)
-                if prev is not None:
-                    prev.cancel()
-
-                def _delayed_release(s: str = sid) -> None:
-                    self._load_release_handles.pop(s, None)
-                    self.release_load_suppress(s)
-
-                quiet_s = load_suppress_quiet_s_for_count(
-                    self._load_suppress_counts.get(sid, 0)
-                )
-                self._load_release_handles[sid] = loop.call_later(
-                    quiet_s, _delayed_release
+                rt.load.suppress_deadline = time.monotonic() + LOAD_SUPPRESS_MAX_S
+                self._schedule_load_suppress_release(
+                    rt, load_suppress_quiet_s_for_count(rt.load.suppress_count), loop
                 )
             if not fut.done():
                 fut.set_result(result)
@@ -1654,24 +1951,35 @@ class AcpClient:
                 fut.set_exception(exc)
             raise
         finally:
-            if self._load_inflight.get(sid) is fut:
-                self._load_inflight.pop(sid, None)
+            if rt.load.inflight is fut:
+                rt.load.inflight = None
+            self.runtimes.prune(sid)
 
     def is_load_suppressing(self, session_id: str) -> bool:
         """True while session/load residual suppress is active for session_id."""
-        sid = str(session_id or "").strip()
-        return bool(sid and sid in self._loading_sessions)
+        rt = self.runtimes.get(str(session_id or "").strip())
+        return rt is not None and rt.load.loading
+
+    def _schedule_load_suppress_release(
+        self, rt: SessionRuntime, delay: float, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        prev = rt.load.release_handle
+        rt.load.release_handle = None
+        if prev is not None:
+            prev.cancel()
+        rt.load.release_handle = loop.call_later(
+            delay, self.release_load_suppress, rt.session_id
+        )
 
     def _rearm_load_suppress_release(self, session_id: str) -> None:
         """Reset quiet-period timer after a suppressed frame; release if past max."""
         sid = str(session_id or "").strip()
-        if not sid or sid not in self._loading_sessions:
+        rt = self.runtimes.get(sid)
+        if rt is None or not rt.load.loading:
             return
         now = time.monotonic()
-        deadline = self._load_suppress_deadline.get(sid)
-        quiet_s = load_suppress_quiet_s_for_count(
-            self._load_suppress_counts.get(sid, 0)
-        )
+        deadline = rt.load.suppress_deadline
+        quiet_s = load_suppress_quiet_s_for_count(rt.load.suppress_count)
         # No deadline yet (mid session/load before finally): do not force-release.
         # Missing deadline must not be treated as held_s=max.
         if deadline is not None:
@@ -1684,7 +1992,8 @@ class AcpClient:
             ):
                 self.release_load_suppress(sid)
                 return
-        prev = self._load_release_handles.pop(sid, None)
+        prev = rt.load.release_handle
+        rt.load.release_handle = None
         if prev is not None:
             prev.cancel()
         remaining = (
@@ -1699,29 +2008,24 @@ class AcpClient:
         except RuntimeError:
             self.release_load_suppress(sid)
             return
-
-        def _delayed_release(s: str = sid) -> None:
-            self._load_release_handles.pop(s, None)
-            self.release_load_suppress(s)
-
-        self._load_release_handles[sid] = loop.call_later(delay, _delayed_release)
+        self._schedule_load_suppress_release(rt, delay, loop)
 
     async def wait_load_suppress_settled(
         self, session_id: str, *, timeout: float | None = None
     ) -> None:
         """Wait until load-replay quiet suppress ends for session_id.
 
-        If sid is not in ``_loading_sessions``, return immediately. Otherwise
-        poll until it leaves or timeout (default ``LOAD_SUPPRESS_MAX_S``).
+        Returns immediately when the session is not load-suppressing. Otherwise
+        poll until it stops or timeout (default ``LOAD_SUPPRESS_MAX_S``).
         On timeout, force-release so callers never hang. Does not force-release
         early on the success path (quiet timer expires naturally).
         """
         sid = str(session_id or "").strip()
-        if not sid or sid not in self._loading_sessions:
+        if not self.is_load_suppressing(sid):
             return
         thr = LOAD_SUPPRESS_MAX_S if timeout is None else float(timeout)
         deadline = time.monotonic() + max(0.0, thr)
-        while sid in self._loading_sessions:
+        while self.is_load_suppressing(sid):
             if time.monotonic() >= deadline:
                 self.release_load_suppress(sid)
                 return
@@ -1730,38 +2034,37 @@ class AcpClient:
     def release_load_suppress(self, session_id: str | None = None) -> None:
         """Immediately stop load-replay suppress so live prompts get activity.
 
-        Discards sid from ``_loading_sessions``, clears quiet/max deadline,
-        emits count trace if any, and cancels a pending delayed release.
+        Clears the session's loading flag, quiet/max deadline and pending delayed
+        release, and emits the suppressed-frame count trace if any.
         Safe if already released. When session_id is None, release all.
         """
         if session_id is None:
-            sids = (
-                list(self._loading_sessions)
-                or list(self._load_release_handles)
-                or list(self._load_suppress_deadline)
-            )
-            for s in sids:
-                self.release_load_suppress(s)
+            for sid, rt in self.runtimes.items():
+                if (
+                    rt.load.loading
+                    or rt.load.release_handle is not None
+                    or rt.load.suppress_deadline is not None
+                ):
+                    self.release_load_suppress(sid)
             return
-        sid = str(session_id).strip()
-        if not sid:
+        rt = self.runtimes.get(str(session_id).strip())
+        if rt is None:
             return
-        handle = self._load_release_handles.pop(sid, None)
+        handle = rt.load.release_handle
+        rt.load.release_handle = None
         if handle is not None:
             handle.cancel()
-        self._load_suppress_deadline.pop(sid, None)
-        count = self._load_suppress_counts.pop(sid, 0)
-        was_loading = sid in self._loading_sessions
-        self._loading_sessions.discard(sid)
+        rt.load.suppress_deadline = None
+        count = rt.load.suppress_count
+        rt.load.suppress_count = 0
+        rt.load.loading = False
+        self.runtimes.prune(rt.session_id)
         if count:
             self._trace(
                 "load_replay_suppressed",
-                sessionId=session_id_slice(sid),
+                sessionId=session_id_slice(rt.session_id),
                 count=count,
             )
-        elif was_loading:
-            # No frames counted; still clear quietly.
-            pass
 
     async def _stall_watchdog_loop(
         self, session_id: str, no_output_seconds: float
@@ -1770,6 +2073,7 @@ class AcpClient:
 
         Per-session: only watches the given session_id.
         """
+        me = asyncio.current_task()
         try:
             while session_id in self.active_turns:
                 await asyncio.sleep(1.0)
@@ -1794,24 +2098,38 @@ class AcpClient:
                     max_turn_seconds=MAX_TURN_SECONDS,
                 )
                 if reason:
-                    # Cancel agent first (bounded), then local clear — never
-                    # unlock-only or fire-and-forget cancel after clear.
-                    await self.end_turn(session_id, reason)
+                    # Shielded: the prompt task cancels this watchdog as soon as the
+                    # agent ends the turn, and end_turn must still finish (ADR-031).
+                    await asyncio.shield(self.end_turn(session_id, reason))
                     return
         except asyncio.CancelledError:
             return
+        finally:
+            rt = self.runtimes.get(session_id)
+            if rt is not None and rt.stall_watchdog is me:
+                rt.stall_watchdog = None
+                self.runtimes.prune(session_id)
 
-    def _register_active_turn(self, session_id: str, cwd_key: str = "") -> None:
+    def _register_active_turn(self, session_id: str, cwd_key: str = "") -> dict[str, Any]:
         now = time.monotonic()
-        self.active_turns[session_id] = {
+        meta: dict[str, Any] = {
             "started_at": now,
             "last_activity": now,
             "saw_update": False,
             "first_update_at": None,
             "cwd_key": str(cwd_key or ""),
         }
+        self.active_turns[session_id] = meta
+        return meta
 
-    def _clear_active_turn(self, session_id: str) -> None:
+    def _turn_meta(self, session_id: str) -> dict[str, Any] | None:
+        rt = self.runtimes.get(session_id)
+        return rt.turn if rt is not None else None
+
+    def _clear_active_turn(self, session_id: str, meta: dict[str, Any] | None = None) -> None:
+        """Pop the session's turn and its watchdog; with meta, only while that is still the turn."""
+        if meta is not None and self._turn_meta(session_id) is not meta:
+            return
         self.active_turns.pop(session_id, None)
         self._cancel_stall_watchdog(session_id)
 
@@ -1889,14 +2207,14 @@ class AcpClient:
 
         key = cwd_key or ""
         # Historical load-replay must quiet-suppress fully before the live turn.
-        if session_id in self._loading_sessions:
+        if self.is_load_suppressing(session_id):
             await self.wait_load_suppress_settled(session_id)
         # Idempotent if quiet timer already released suppress.
         self.release_load_suppress(session_id)
-        self._register_active_turn(session_id, key)
+        meta = self._register_active_turn(session_id, key)
         self._cancel_stall_watchdog(session_id)
         # Always run continuous stall watchdog for mid-turn / max duration.
-        self._stall_watchdogs[session_id] = asyncio.create_task(
+        self.runtimes.get_or_create(session_id).stall_watchdog = asyncio.create_task(
             self._stall_watchdog_loop(session_id, thr),
             name=f"acp-stall-{session_id[:8]}",
         )
@@ -1931,9 +2249,6 @@ class AcpClient:
                 timeout=float(MAX_TURN_SECONDS),
                 session_id=session_id,
             )
-            log.info("Prompt end session=%s ok", session_id)
-            self._trace("prompt_end", sessionId=session_id_slice(session_id), ok=True)
-            return result
         except Exception as exc:
             log.warning("Prompt end session=%s error: %s", session_id, exc)
             self._trace(
@@ -1944,52 +2259,62 @@ class AcpClient:
             )
             raise
         finally:
-            self._clear_active_turn(session_id)
+            self._clear_active_turn(session_id, meta)
+        ended_by_hub = meta.get("end_reason")
+        if ended_by_hub:
+            log.info("Prompt end session=%s ended by hub: %s", session_id, ended_by_hub)
+            self._trace(
+                "prompt_end",
+                sessionId=session_id_slice(session_id),
+                ok=False,
+                error=f"ended by hub: {ended_by_hub}"[:200],
+            )
+            raise TurnEndedError(str(ended_by_hub))
+        log.info("Prompt end session=%s ok", session_id)
+        self._trace("prompt_end", sessionId=session_id_slice(session_id), ok=True)
+        return result
 
     async def notify_agent_cancel(self, session_id: str) -> bool:
-        """Tell the agent to abort its in-flight turn. Does not force_clear locally.
+        """Send the ACP session/cancel notification; True once it is on the wire.
 
-        Prefers the last successful cancel method; short per-method timeout so
-        shotgun cancel stays bounded (~2s total with end_turn). Returns True if
-        any method succeeded. Logs a warning if all fail.
+        The agent acknowledges by answering the open session/prompt with stopReason
+        cancelled, so the caller waits for the turn to end, not for a reply.
         """
-        methods: list[str] = [
-            "session/cancel",
-            "session/prompt/cancel",
-            "x.ai/session/cancel",
-            "_x.ai/session/cancel",
-        ]
-        cached = self._cancel_method
-        if cached and cached in methods:
-            methods = [cached] + [m for m in methods if m != cached]
-        last_exc: Exception | None = None
-        # Short per-method timeout: total cancel budget stays ~2s under end_turn.
-        per_method_timeout = 1.5
-        for method in methods:
-            try:
-                await self.request(
-                    method,
-                    {"sessionId": session_id},
-                    timeout=per_method_timeout,
-                    session_id=session_id,
-                )
-                self._cancel_method = method
-                log.info(
-                    "Agent cancel ok via %s session=%s", method, session_id[:12]
-                )
-                return True
-            except Exception as exc:
-                last_exc = exc
-                if cached and method == cached:
-                    # Cached method failed; stop preferring it until one succeeds.
-                    self._cancel_method = None
-                log.debug("Cancel via %s failed: %s", method, exc)
-        log.warning(
-            "Agent cancel unsupported/failed session=%s: %s",
-            session_id,
-            last_exc or "no method succeeded",
-        )
-        return False
+        try:
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/cancel",
+                    "params": {"sessionId": session_id},
+                }
+            )
+        except Exception as exc:
+            log.warning("Agent cancel not sent session=%s: %s", session_id[:12], exc)
+            return False
+        return True
+
+    async def _cancel_and_await_turn_end(self, session_id: str, timeout: float) -> bool:
+        """True when the agent ends the session's turn within timeout of the cancel."""
+        rt = self.runtimes.get(session_id)
+        waiters = rt.turn_end_waiters if rt is not None and rt.turn is not None else None
+        ended = asyncio.get_running_loop().create_future()
+        if waiters is not None:
+            waiters.append(ended)
+        try:
+            sent = await self.notify_agent_cancel(session_id)
+            # Grok keeps waiting on terminal/wait_for_exit through a cancel.
+            killed = await self._terminals.kill_awaited(session_id)
+            if killed:
+                log.info("cancel killed %d running command(s) session=%s", killed, session_id[:12])
+            if not sent or waiters is None:
+                return sent
+            done, _ = await asyncio.wait({ended}, timeout=float(timeout))
+            return bool(done)
+        finally:
+            if not ended.done():
+                ended.cancel()
+            if waiters is not None and ended in waiters:
+                waiters.remove(ended)
 
     async def end_turn(
         self,
@@ -1998,79 +2323,98 @@ class AcpClient:
         *,
         cancel_timeout: float = 2.0,
     ) -> dict:
-        """Cancel agent then force-clear local turn. Single-flight per session.
+        """Cancel the agent's turn, wait up to cancel_timeout for it to end, force-clear what is left.
 
-        Order is always cancel-before-clear so the agent releases the old prompt
-        before the hub unlocks. Cancel is bounded by cancel_timeout; clear runs
-        even if cancel fails (WS dead, unsupported method, etc.).
+        Single-flight per session; also drops bg activity stamps. Cancel names the parent
+        session only, so stopping nested subagent sessions is up to the agent.
         """
-        sid_key = str(session_id) if session_id is not None else "__all__"
-        lock = self._end_turn_locks.get(sid_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._end_turn_locks[sid_key] = lock
-
-        async with lock:
-            cancelled = False
-            if session_id is not None:
-                try:
-                    cancelled = bool(
-                        await asyncio.wait_for(
-                            self.notify_agent_cancel(str(session_id)),
-                            timeout=float(cancel_timeout),
-                        )
-                    )
-                except asyncio.TimeoutError:
-                    log.warning(
-                        "end_turn: cancel timed out session=%s reason=%s",
-                        str(session_id)[:12],
-                        reason,
-                    )
-                    cancelled = False
-                except Exception as exc:
-                    log.warning(
-                        "end_turn: cancel failed session=%s: %s",
-                        str(session_id)[:12],
-                        exc,
-                    )
-                    cancelled = False
-            else:
-                # All sessions: best-effort cancel each active id within budget.
-                sids = list(self.active_turns.keys())
-                if sids:
-                    per = max(0.3, float(cancel_timeout) / max(len(sids), 1))
-                    any_ok = False
-                    for sid in sids:
-                        try:
-                            ok = await asyncio.wait_for(
-                                self.notify_agent_cancel(sid),
-                                timeout=per,
-                            )
-                            any_ok = any_ok or bool(ok)
-                        except Exception:
-                            pass
-                    cancelled = any_ok
-
-            cleared = self.force_clear_turn(reason, session_id=session_id)
-            if session_id is not None and not cancelled:
-                log.warning(
-                    "end_turn: agent cancel failed session=%s force_cleared=%s reason=%s",
-                    str(session_id)[:12],
-                    cleared,
-                    reason,
+        if session_id is None:
+            lock = self._end_all_turns_lock
+        else:
+            rt = self.runtimes.get_or_create(str(session_id))
+            if rt.end_turn_lock is None:
+                rt.end_turn_lock = asyncio.Lock()
+            lock = rt.end_turn_lock
+        try:
+            async with lock:
+                return await self._end_turn_under_lock(
+                    session_id, reason, cancel_timeout=cancel_timeout
                 )
-            return {
-                "cancelled": cancelled,
-                "cleared": cleared,
-                "reason": reason,
-            }
+        finally:
+            if session_id is not None:
+                self.runtimes.prune(str(session_id))
 
-    async def session_cancel(self, session_id: str) -> None:
+    async def _end_turn_under_lock(
+        self,
+        session_id: str | None,
+        reason: str,
+        *,
+        cancel_timeout: float,
+    ) -> dict:
+        cancelled = False
+        replaced = False
+        if session_id is not None:
+            sid = str(session_id)
+            # The prompt path reads this to report a hub-ended turn even when the
+            # agent answers the cancelled prompt normally (ADR-031).
+            target = self._turn_meta(sid)
+            if target is not None:
+                target.setdefault("end_reason", reason)
+            cancelled = await self._cancel_and_await_turn_end(sid, cancel_timeout)
+            current = self._turn_meta(sid)
+            replaced = target is not None and current is not None and current is not target
+        else:
+            # All sessions: best-effort cancel each active id within budget.
+            sids = list(self.active_turns.keys())
+            for sid in sids:
+                target = self._turn_meta(sid)
+                if target is not None:
+                    target.setdefault("end_reason", reason)
+            if sids:
+                per = max(0.3, float(cancel_timeout) / max(len(sids), 1))
+                any_ok = False
+                for sid in sids:
+                    try:
+                        ok = await asyncio.wait_for(
+                            self.notify_agent_cancel(sid),
+                            timeout=per,
+                        )
+                        any_ok = any_ok or bool(ok)
+                    except Exception:
+                        pass
+                cancelled = any_ok
+
+        if replaced:
+            # The turn we meant to end is gone and a newer one owns the session now.
+            log.info("end_turn: turn already replaced session=%s reason=%s", str(session_id)[:12], reason)
+            return {"cancelled": cancelled, "cleared": False, "reason": reason}
+        cleared = self.force_clear_turn(reason, session_id=session_id)
+        # Stop honesty: clear Working/Stuck bg stamps for ended turn(s).
+        if session_id is not None:
+            self._pop_bg_activity(str(session_id))
+        else:
+            self.clear_bg_activity()
+        if session_id is not None and not cancelled:
+            log.warning(
+                "end_turn: agent cancel failed session=%s force_cleared=%s reason=%s",
+                str(session_id)[:12],
+                cleared,
+                reason,
+            )
+        return {
+            "cancelled": cancelled,
+            "cleared": cleared,
+            "reason": reason,
+        }
+
+    async def session_cancel(self, session_id: str) -> dict:
         """Cancel agent turn for one session and unlock local hub turn state.
 
         Only clears this session's turn and its pending user questions.
         Other projects' turns are left running.
+
+        Returns the end_turn result dict (cancelled/cleared/reason).
+        Never raises after local force-clear: UI must unlock on Stop.
         """
         self._cancel_pending_user_questions_for_session(session_id)
-        await self.end_turn(session_id, "user cancel")
-        # Never raise after local force-clear: UI must unlock on Stop.
+        return await self.end_turn(session_id, "user cancel")

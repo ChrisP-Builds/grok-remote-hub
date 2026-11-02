@@ -59,6 +59,24 @@ def content_type_for(path: Path) -> str:
     return "application/octet-stream"
 
 
+def _is_inert_type(ctype: str) -> bool:
+    base = ctype.split(";", 1)[0].strip().lower()
+    if base.startswith("image/"):
+        return base != "image/svg+xml"
+    return base.startswith(("video/", "audio/")) or base in ("application/pdf", "text/plain")
+
+
+def raw_response_headers(ctype: str) -> dict[str, str]:
+    headers = {
+        "Content-Type": ctype,
+        "Cache-Control": "private, max-age=60",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if not _is_inert_type(ctype):
+        headers["Content-Security-Policy"] = "sandbox"
+    return headers
+
+
 def content_disposition_attachment(filename: str) -> str:
     """Build Content-Disposition attachment header; basename only, no path segments."""
     base = Path(str(filename or "")).name

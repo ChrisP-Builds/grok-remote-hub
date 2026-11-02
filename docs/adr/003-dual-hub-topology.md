@@ -50,8 +50,14 @@ Hub is a **thin remote agent stream**, not a second full CLI.
 - Multi-turn e2e on hub WS: two prompts on same live session both stream and idle.
 - Health shows `productTag: remote-stream`, version/compat badge after CLI upgrades.
 
+## Notes (2026-08-08)
+
+Default topology reaffirmed in **ADR-022**: private `agent serve`, stock CLI independent, dual-live on raw serve rejected, leader opt-in only (ADR-021).
+
 ## Related
 
 - ADR-001: session lifecycle
 - ADR-002: ACP client surface
+- ADR-021: leader multi-client experiment
+- ADR-022: serve default / CLI independent
 - README Product scope

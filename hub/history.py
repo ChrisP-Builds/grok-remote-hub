@@ -155,25 +155,37 @@ def tool_summary(update: dict[str, Any], limit: int = 120) -> str:
         return _truncate(str(raw), limit)
 
 
-def _content_snippet(update: dict[str, Any], limit: int = 120) -> str:
+TOOL_DETAIL_LIMIT = 4000
+
+
+def _content_parts(update: dict[str, Any]) -> list[str]:
     content = update.get("content")
     if content is None:
-        return ""
+        return []
     # ACP content is often list of {type, content: {type, text}}
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                inner = item.get("content")
-                text = _extract_text(inner if inner is not None else item)
-            else:
-                text = _extract_text(item)
-            if text.strip():
-                parts.append(text.strip())
-        if parts:
-            return _truncate(" ".join(parts), limit)
-        return ""
-    return _truncate(_extract_text(content).strip(), limit)
+    items = content if isinstance(content, list) else [content]
+    parts: list[str] = []
+    for item in items:
+        inner = item.get("content") if isinstance(item, dict) else None
+        text = _extract_text(inner if inner is not None else item).strip()
+        if text:
+            parts.append(text)
+    return parts
+
+
+def _content_snippet(update: dict[str, Any], limit: int = 120) -> str:
+    return _truncate(" ".join(_content_parts(update)), limit)
+
+
+def _content_detail(update: dict[str, Any], limit: int = TOOL_DETAIL_LIMIT) -> str:
+    """Tool output for the expanded row; long output keeps its tail, where results usually are."""
+    text = "\n".join(_content_parts(update))
+    if len(text) <= limit:
+        return text
+    tail = text[-limit:]
+    tail = tail[tail.find("\n") + 1 :] if "\n" in tail else tail
+    omitted = text[: len(text) - len(tail)].count("\n")
+    return f"[{omitted} earlier lines omitted]\n{tail}"
 
 
 def _update_from_line(obj: dict[str, Any]) -> dict[str, Any] | None:
@@ -267,9 +279,7 @@ def _message_from_update(update: dict[str, Any]) -> dict[str, Any] | None:
         tool_id = update.get("toolCallId") or ""
         title = update.get("title") or tool_label(update)
         status = normalize_status(update.get("status"))
-        snippet = _content_snippet(update)
-        if not snippet:
-            snippet = tool_summary(update)
+        snippet = _content_snippet(update) or tool_summary(update)
         return {
             "role": "tool",
             "text": str(title),
@@ -277,7 +287,7 @@ def _message_from_update(update: dict[str, Any]) -> dict[str, Any] | None:
                 "toolCallId": tool_id,
                 "status": status,
                 "summary": snippet,
-                "detail": snippet,
+                "detail": _content_detail(update) or snippet,
                 "label": str(title),
                 "kind": "tool_call_update",
             },
@@ -451,21 +461,59 @@ def parse_updates_jsonl(path: Path | str, max_messages: int = 800) -> list[dict[
     return merged
 
 
+# Bump when the history message shape changes so cached responses are not reused.
+HISTORY_FORMAT = "2"
+
+
+def _updates_path(
+    sessions_root: Path, session_id: str, session_path: str | Path | None
+) -> Path | None:
+    if session_path:
+        updates = Path(session_path) / "updates.jsonl"
+        if updates.is_file():
+            return updates
+    root = Path(sessions_root)
+    if not root.is_dir():
+        return None
+    for summary in root.rglob("summary.json"):
+        if summary.parent.name == session_id:
+            return summary.parent / "updates.jsonl"
+    return None
+
+
 def load_session_history(
     sessions_root: Path,
     session_id: str,
     session_path: str | Path | None = None,
     max_messages: int = 800,
 ) -> list[dict[str, Any]]:
-    if session_path:
-        updates = Path(session_path) / "updates.jsonl"
-        if updates.is_file():
-            return parse_updates_jsonl(updates, max_messages=max_messages)
+    updates = _updates_path(sessions_root, session_id, session_path)
+    return parse_updates_jsonl(updates, max_messages=max_messages) if updates else []
 
-    root = Path(sessions_root)
-    if not root.is_dir():
-        return []
-    for summary in root.rglob("summary.json"):
-        if summary.parent.name == session_id:
-            return parse_updates_jsonl(summary.parent / "updates.jsonl", max_messages=max_messages)
-    return []
+
+def _etag_for(updates: Path | None, max_messages: int) -> str | None:
+    if updates is None:
+        return None
+    try:
+        st = updates.stat()
+    except OSError:
+        return None
+    return f'"h{HISTORY_FORMAT}-{st.st_mtime_ns:x}-{st.st_size:x}-{max_messages}"'
+
+
+def history_etag(
+    sessions_root: Path,
+    session_id: str,
+    session_path: str | Path | None,
+    max_messages: int,
+) -> str | None:
+    """Strong ETag for a session's history: the source file's identity plus how it is rendered."""
+    return _etag_for(_updates_path(sessions_root, session_id, session_path), max_messages)
+
+
+def resolve_history(
+    sessions_root: Path, session_id: str, max_messages: int
+) -> tuple[Path | None, str | None]:
+    """One blocking disk pass for the history endpoint: the updates file (or None) and its ETag."""
+    updates = _updates_path(sessions_root, session_id, None)
+    return updates, _etag_for(updates, max_messages)

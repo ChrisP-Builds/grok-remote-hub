@@ -12,8 +12,9 @@ After ACP heal exhaustion the pill said **“Agent hung — restart”** with no
 ## Decision
 
 1. **POST `/api/admin/restart-agent`:** force-clear turns, close ACP, **force-kill** the agent listener (including attached/external serve on the configured port), wait for supervisor respawn, reconnect ACP, broadcast status. Hub process stays up.
-2. **AgentSupervisor.force_kill_agent / force_restart:** kill pid file and/or port occupant (Windows `taskkill /T /F` when needed).
-3. **UI:** when pill state is `acp-hung` or `agent-down`, the status pill is a clickable control (confirm → restart). Not an automatic restart.
+2. **AgentSupervisor.force_kill_agent / force_restart:** kill pid file and/or port occupant (Windows `taskkill /T /F` when needed). Port-open alone is **not** success; force_restart only verifies TCP.
+3. **ACP reconnect after recycle:** after port-up, settle briefly, then multi-attempt `AcpClient.reconnect(..., reset_maintain=True)`. Reset cancels any maintain loop stuck in exponential backoff (failed connects during kill) so backoff restarts at 1s. Success requires `agent_recycle_complete(process_up, acp_connected)` — process up **and** ACP chat-connected. On failure, heal attempts stay at 0 so auto-heal budget remains usable.
+4. **UI:** when pill state is `acp-hung` or `agent-down`, the status pill is a clickable control (confirm → restart). Not an automatic restart.
 
 ## Alternatives considered
 
@@ -34,6 +35,8 @@ After ACP heal exhaustion the pill said **“Agent hung — restart”** with no
 ## Validation
 
 - Structural tests for route and pill wiring.
+- Pure helpers: `agent_recycle_complete`, `agent_recycle_reconnect_plan`.
+- `reconnect(reset_maintain=True)` cancels stalled maintain and waits for connected.
 - Live: hung health → pill click → acpConnected true.
 
 ## Related
@@ -41,3 +44,4 @@ After ACP heal exhaustion the pill said **“Agent hung — restart”** with no
 - ADR-011, ADR-013
 - Scripts: `restart-hub.ps1 -KillAgent`
 - Commits: `bbbc2f3`
+- Helpers: `hub.harden_policy.agent_recycle_complete` / `agent_recycle_reconnect_plan`

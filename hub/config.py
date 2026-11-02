@@ -7,6 +7,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from hub.approval_policy import normalize_mode
+
 if sys.version_info >= (3, 11):
     import tomllib
 else:
@@ -20,6 +22,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.toml"
 DEFAULT_SESSIONS_ROOT = Path.home() / ".grok" / "sessions"
 DEFAULT_AGENT_SECRET_PATH = PROJECT_ROOT / "data" / "agent.secret"
+DEFAULT_HOOK_SECRET_PATH = PROJECT_ROOT / "data" / "hook.secret"
+DEFAULT_GATE_PLUGIN_DIR = PROJECT_ROOT / "data" / "grok-approval-gate"
 DEFAULT_GROK_BIN_CANDIDATES = (
     Path.home() / ".grok" / "bin" / "grok.exe",
     Path.home() / ".grok" / "bin" / "grok",
@@ -78,6 +82,14 @@ class Config:
     sessions_root: Path = field(default_factory=lambda: DEFAULT_SESSIONS_ROOT)
     projects_root: Path = field(default_factory=lambda: DEFAULT_PROJECTS_ROOT)
     hub_token: str = ""
+    # Extra Host names / exact origins the HTTP guard accepts (ADR-026).
+    allowed_hosts: list[str] = field(default_factory=list)
+    allowed_origins: list[str] = field(default_factory=list)
+    # Tailscale logins trusted via Serve besides the machine owner (ADR-028).
+    allowed_tailscale_logins: list[str] = field(default_factory=list)
+    # When True, after ACP heal attempts exhaust with process up / ACP down and
+    # no live turn, call KillAgent-style restart once per process (config-gated).
+    auto_restart_agent_on_heal_exhaust: bool = False
     agent_secret_path: Path = field(default_factory=lambda: DEFAULT_AGENT_SECRET_PATH)
     log_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "logs")
     static_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "static")
@@ -85,25 +97,42 @@ class Config:
     max_history_messages: int = 800
     # Concurrent live turns across different project cwds (default 3).
     max_concurrent_turns: int = 3
+    # EXPERIMENT only: "serve" (default WS agent serve) | "leader" (stdio attach).
+    # Do not set leader for normal use; CLI without --leader stays independent.
+    agent_backend: str = "serve"
+    # Phone approval gate (ADR-027): default mode for new sessions.
+    approval_mode: str = "balanced"
+    gate_plugin_dir: Path = field(default_factory=lambda: DEFAULT_GATE_PLUGIN_DIR)
+    hook_secret_path: Path = field(default_factory=lambda: DEFAULT_HOOK_SECRET_PATH)
 
     @property
     def agent_ws_url(self) -> str:
         return f"ws://{self.agent_bind}:{self.agent_port}/ws"
 
+    @property
+    def uses_leader_backend(self) -> bool:
+        return str(self.agent_backend or "serve").strip().lower() == "leader"
+
     def ensure_agent_secret(self) -> str:
-        path = self.agent_secret_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.is_file():
-            secret = path.read_text(encoding="utf-8").strip()
-            if secret:
-                return secret
-        secret = secrets.token_urlsafe(32)
-        path.write_text(secret + "\n", encoding="utf-8")
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-        return secret
+        return _ensure_secret_file(self.agent_secret_path)
+
+    def ensure_hook_secret(self) -> str:
+        return _ensure_secret_file(self.hook_secret_path)
+
+
+def _ensure_secret_file(path: Path) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        secret = path.read_text(encoding="utf-8").strip()
+        if secret:
+            return secret
+    secret = secrets.token_urlsafe(32)
+    path.write_text(secret + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return secret
 
 
 def _as_path(value: object, default: Path) -> Path:
@@ -112,15 +141,30 @@ def _as_path(value: object, default: Path) -> Path:
     return Path(str(value)).expanduser()
 
 
+def _str_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(v).strip() for v in value if str(v).strip()]
+
+
 def load_config(path: Path | None = None) -> Config:
     cfg_path = path or DEFAULT_CONFIG_PATH
     data: dict = {}
     if cfg_path.is_file():
-        with cfg_path.open("rb") as f:
-            data = tomllib.load(f) or {}
+        # utf-8-sig strips BOM (PowerShell Set-Content -Encoding utf8 writes one;
+        # tomllib binary load fails with "Invalid statement at line 1").
+        with cfg_path.open("r", encoding="utf-8-sig") as f:
+            data = tomllib.loads(f.read()) or {}
 
     hub = data.get("hub", data)
     agent = data.get("agent", {})
+
+    raw_backend = str(
+        agent.get("backend", hub.get("agent_backend", "serve")) or "serve"
+    ).strip().lower()
+    if raw_backend not in ("serve", "leader"):
+        raw_backend = "serve"
+    approval_mode = normalize_mode(hub.get("approval_mode"))
 
     return Config(
         bind_host=str(hub.get("bind_host", "")),
@@ -131,6 +175,12 @@ def load_config(path: Path | None = None) -> Config:
         sessions_root=_as_path(hub.get("sessions_root"), DEFAULT_SESSIONS_ROOT),
         projects_root=_as_path(hub.get("projects_root"), DEFAULT_PROJECTS_ROOT),
         hub_token=str(hub.get("hub_token", "") or ""),
+        allowed_hosts=_str_list(hub.get("allowed_hosts")),
+        allowed_origins=_str_list(hub.get("allowed_origins")),
+        allowed_tailscale_logins=_str_list(hub.get("allowed_tailscale_logins")),
+        auto_restart_agent_on_heal_exhaust=bool(
+            hub.get("auto_restart_agent_on_heal_exhaust", False)
+        ),
         agent_secret_path=_as_path(
             hub.get("agent_secret_path", agent.get("secret_path")),
             DEFAULT_AGENT_SECRET_PATH,
@@ -140,4 +190,6 @@ def load_config(path: Path | None = None) -> Config:
         max_sessions=int(hub.get("max_sessions", 80)),
         max_history_messages=int(hub.get("max_history_messages", 800)),
         max_concurrent_turns=int(hub.get("max_concurrent_turns", 3)),
+        agent_backend=raw_backend,
+        approval_mode=approval_mode,
     )

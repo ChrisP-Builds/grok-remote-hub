@@ -34,7 +34,7 @@ a new ADR.
 | 007 | Classify subagent sessions via session_kind | Accepted | 2026-07-11 |
 | 008 | Persist hub renames as hub_title in summary.json | Accepted | 2026-07-11 |
 | 009 | KeepAgent default + view-first continuity (no no-output fork) | Accepted | 2026-07-12 |
-| 010 | File-first site preview, not cloud or chat artifacts | Accepted | 2026-07-12 |
+| 010 | File-first site preview, not cloud or chat artifacts | Accepted (amended by 026) | 2026-07-12 |
 | 011 | Separate agent process health from ACP connection | Accepted | 2026-07-13 |
 | 012 | Durable Hub plan-mode approval via plan_mode.json | Accepted | 2026-07-14 |
 | 013 | ACP quality beyond process-up and connected boolean | Accepted | 2026-07-14 |
@@ -43,5 +43,16 @@ a new ADR.
 | 016 | Quiet-period session/load suppress before re-prompt | Accepted | 2026-07-17 |
 | 017 | Unresumable dead view forces pin (no blank fork) | Accepted | 2026-07-24 |
 | 018 | Cold ensure vs hot path attribution | Accepted | 2026-07-24 |
-| 019 | External hub health watchdog (scheduled watch-hub) | Accepted | 2026-07-26 |
+| 019 | External hub health watchdog (long-lived pythonw daemon) | Accepted | 2026-07-26 |
 | 020 | Process-local ops metrics and unified diagnostics | Accepted | 2026-07-26 |
+| 021 | Flag-gated leader multi-client experiment | Proposed / Experimental | 2026-07-30 |
+| 022 | Private agent serve remains default; stock CLI stays independent | Accepted | 2026-08-08 |
+| 023 | Always-approve remote risk and CLI resume handoff | Accepted (risk reduced by 027) | 2026-08-08 |
+| 024 | Stop cancels the turn then clears hub bg activity honesty | Accepted (cancel mechanics amended by 031) | 2026-08-08 |
+| 025 | Mobile plan copy/mermaid and session search/recap continuity | Accepted | 2026-08-08 |
+| 026 | Guard Host and Origin, and serve previews as sandboxed capability URLs | Accepted (amended 2026-11-01) | 2026-10-31 |
+| 027 | Approve risky agent actions from the phone via a hub-owned Grok hook | Accepted (amended 2026-11-02) | 2026-10-31 |
+| 028 | Serve over Tailscale HTTPS, trust the Tailscale login, and send web push | Accepted | 2026-11-01 |
+| 029 | Sequence session events and resume reconnects from an in-memory log | Accepted (amended 2026-11-02) | 2026-11-01 |
+| 030 | Keep per-session runtime state in one object per session | Accepted | 2026-11-01 |
+| 031 | Stop sends the ACP cancel notification and ends the command the agent waits on | Accepted (amended 2026-11-02) | 2026-11-01 |

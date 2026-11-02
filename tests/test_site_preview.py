@@ -11,6 +11,7 @@ from hub.site_preview import (
     SitePreviewError,
     SitePreviewManager,
     build_preview_plan,
+    serve_preview,
 )
 
 
@@ -119,74 +120,72 @@ def test_start_replaces_previous(tmp_path: Path) -> None:
 
 
 def test_preview_http_roundtrip(tmp_path: Path) -> None:
-    """start → GET preview assets → stop (aiohttp TestClient, no pytest plugin)."""
+    """start, GET page + subresource via capability URL, stop (real handler)."""
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
 
     projects, root = _site(tmp_path)
     mgr = SitePreviewManager()
 
-    async def start(request: web.Request) -> web.Response:
-        body = await request.json()
-        plan = build_preview_plan(projects, body["root"], body["path"])
-        mgr.start(plan)
-        entry = plan["entry_url_path"]
-        return web.json_response(
-            {
-                "ok": True,
-                "previewUrl": f"/preview-site/{entry}",
-                "hubUrl": "/preview-site/",
-            }
-        )
-
-    async def stop(request: web.Request) -> web.Response:
-        mgr.stop()
-        return web.json_response({"ok": True})
-
-    async def serve(request: web.Request) -> web.Response:
-        if not mgr.active:
-            return web.Response(text="no active preview", status=404)
-        path = request.match_info.get("path") or ""
-        fp = mgr.resolve_file(path)
-        if fp is None:
-            return web.Response(text="not found", status=404)
-        return web.FileResponse(path=fp, headers={"Cache-Control": "no-store"})
+    async def serve(request: web.Request) -> web.StreamResponse:
+        return await serve_preview(mgr, request)
 
     async def run() -> None:
         app = web.Application()
-        app.router.add_post("/api/preview/start", start)
-        app.router.add_post("/api/preview/stop", stop)
-        app.router.add_get("/preview-site", serve)
-        app.router.add_get("/preview-site/", serve)
         app.router.add_get("/preview-site/{path:.*}", serve)
-
-        server = TestServer(app)
-        client = TestClient(server)
+        client = TestClient(TestServer(app))
         await client.start_server()
         try:
-            r = await client.post(
-                "/api/preview/start",
-                json={"root": str(root), "path": "index.html"},
-            )
-            assert r.status == 200
-            data = await r.json()
-            assert data["ok"] is True
-            preview = data["previewUrl"]
+            mgr.start(build_preview_plan(projects, root, "index.html"))
+            url = mgr.preview_url()
+            assert url is not None
+            key = url.split("/")[2]
+            assert url == f"/preview-site/{key}/index.html"
+            assert len(key) >= 20
 
-            page = await client.get(preview)
+            page = await client.get(url)
             assert page.status == 200
-            body = await page.text()
-            assert "css/a.css" in body
+            assert "css/a.css" in await page.text()
+            csp = page.headers.get("Content-Security-Policy", "")
+            assert csp.startswith("sandbox ")
+            assert "allow-scripts" in csp
+            assert "allow-same-origin" not in csp
+            assert page.headers.get("Access-Control-Allow-Origin") == "*"
 
-            css = await client.get("/preview-site/css/a.css")
+            css = await client.get(f"/preview-site/{key}/css/a.css")
             assert css.status == 200
             assert "color" in await css.text()
 
-            stop_r = await client.post("/api/preview/stop")
-            assert stop_r.status == 200
-            gone = await client.get(preview)
-            assert gone.status == 404
+            assert (await client.get("/preview-site/css/a.css")).status == 404
+            assert (await client.get("/preview-site/wrongkey/index.html")).status == 404
+
+            mgr.start(build_preview_plan(projects, root, "index.html"))
+            assert (await client.get(url)).status == 404, "old key must die on restart"
+
+            mgr.stop()
+            assert (await client.get(mgr.preview_url() or url)).status == 404
         finally:
             await client.close()
 
     asyncio.run(run())
+
+
+def test_preview_iframe_sandbox_has_no_same_origin_escape() -> None:
+    """allow-scripts + allow-same-origin lets the framed page drop its sandbox."""
+    import re
+
+    html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r'id="site-preview-frame"[^>]*sandbox="([^"]*)"', html, re.S)
+    assert m, "preview iframe must declare sandbox"
+    assert "allow-scripts" in m.group(1)
+    assert "allow-same-origin" not in m.group(1)
+
+
+def test_preview_iframe_sends_no_referrer() -> None:
+    """The SPA URL carries ?token=, so a framed page must not see it as document.referrer."""
+    import re
+
+    html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r'<iframe[^>]*id="site-preview-frame"[^>]*>', html, re.S)
+    assert m, "preview iframe missing"
+    assert 'referrerpolicy="no-referrer"' in m.group(0)

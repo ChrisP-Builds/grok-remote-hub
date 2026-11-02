@@ -357,7 +357,7 @@ def should_clear_turn_on_wake(
     turn_running: bool,
     silence_seconds: float | None,
     acp_quality: str | None,
-    silence_threshold_s: float = 120.0,
+    silence_threshold_s: float = CLIENT_STALL_WARN_SECONDS,
     has_open_tools: bool = False,
 ) -> bool:
     """True when wake/resume should cancel+clear like CLI interrupt of a dead turn.
@@ -457,6 +457,12 @@ def is_turn_stuck_for_new_prompt(
         )
         is not None
     )
+
+
+def is_user_cancel_error(msg: str | BaseException | None) -> bool:
+    """True when the user ended the turn (Stop or reset-turn), not a stall or failure."""
+    text = str(msg or "").lower()
+    return "user cancel" in text or "reset-turn" in text
 
 
 def is_no_output_error_message(msg: str | BaseException | None) -> bool:

@@ -1437,7 +1437,7 @@ def test_session_load_second_call_skips_request() -> None:
         r1 = await client.session_load("sess-warm-1", r"D:\proj")
         assert r1 == {"ok": True}
         assert client.request.await_count == 1
-        assert "sess-warm-1" in client._warm_sessions
+        assert client.runtimes.get("sess-warm-1").warm is True
         r2 = await client.session_load("sess-warm-1", r"D:\proj")
         assert r2 == {"skipped": True, "sessionId": "sess-warm-1"}
         assert client.request.await_count == 1
@@ -1474,8 +1474,9 @@ def test_session_load_concurrent_single_flight() -> None:
         assert r2 == {"ok": True, "sessionId": "sess-concurrent-1"}
         assert call_count == 1
         assert client.request.await_count == 1
-        assert "sess-concurrent-1" in client._warm_sessions
-        assert "sess-concurrent-1" not in client._load_inflight
+        rt = client.runtimes.get("sess-concurrent-1")
+        assert rt.warm is True
+        assert rt.load.inflight is None
 
     asyncio.run(_run())
 
@@ -1487,16 +1488,16 @@ def test_session_load_warm_skip_structural() -> None:
     assert "should_skip_session_load" in body
     assert "session/load skip already warm" in body
     assert '"skipped": True' in body or "'skipped': True" in body
-    assert "_warm_sessions" in body
+    assert "rt.warm = True" in body
     # session_new marks warm
     new_body = _slice_method(src, "session_new")
-    assert "_warm_sessions.add" in new_body
+    assert ".warm = True" in new_body
     # single-flight concurrent join
-    assert "_load_inflight" in body
+    assert "load.inflight" in body
     # disconnect path clears warm with loaded_session_id
-    assert "_warm_sessions.clear()" in src
+    assert "rt.warm = False" in src
     assert "self.loaded_session_id = None" in src
-    assert "_load_inflight.clear()" in src
+    assert "rt.load.inflight = None" in src
 
 
 def test_session_prompt_hot_path_no_warmup() -> None:
@@ -1656,15 +1657,44 @@ def test_forget_warm_session() -> None:
     from hub.config import Config
 
     client = AcpClient(Config(), secret="test-secret-forget-warm")
-    client._warm_sessions.add("sess-a")
-    client._warm_sessions.add("sess-b")
+
+    def warm(sid: str) -> bool:
+        rt = client.runtimes.get(sid)
+        return rt is not None and rt.warm
+
+    client.runtimes.get_or_create("sess-a").warm = True
+    client.runtimes.get_or_create("sess-b").warm = True
     client.loaded_session_id = "sess-a"
     client.forget_warm_session("sess-a")
-    assert "sess-a" not in client._warm_sessions
-    assert "sess-b" in client._warm_sessions
+    assert not warm("sess-a")
+    assert warm("sess-b")
     assert client.loaded_session_id is None
     client.loaded_session_id = "sess-b"
     client.forget_warm_session("sess-a")  # other sid: loaded unchanged
     assert client.loaded_session_id == "sess-b"
     client.forget_warm_session("")
-    assert "sess-b" in client._warm_sessions
+    assert warm("sess-b")
+
+
+def test_is_user_cancel_error() -> None:
+    from hub.session_policy import is_user_cancel_error
+
+    assert is_user_cancel_error(TimeoutError("Turn force-cleared: user cancel"))
+    assert is_user_cancel_error("Turn force-cleared: user cancel fallback: boom")
+    assert is_user_cancel_error("Turn ended by hub: admin POST /api/admin/reset-turn")
+    assert not is_user_cancel_error(TimeoutError("Turn force-cleared: mid-turn stall 600s"))
+    assert not is_user_cancel_error("Turn ended by hub: no ACP session/update for 60.0s after prompt")
+    assert not is_user_cancel_error(None)
+
+
+def test_stop_is_not_reported_as_a_stall() -> None:
+    """Stop force-clears the turn; the prompt task must end idle without the stall error or a traceback."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "hub" / "server.py").read_text(encoding="utf-8")
+    body = src[src.index("    async def _execute_prompt("):src.index("    async def _drain_prompt_queues(")]
+    resync = src[src.index("    async def _status_resync_loop("):src.index("    async def _maybe_heal_acp(")]
+    assert "not is_user_cancel_error(reason)" in resync
+    handler = body[body.index("user_stop = is_user_cancel_error(exc)"):]
+    assert handler.index("if not user_stop:") < handler.index("log.exception(")
+    assert handler.index("if user_stop:") < handler.index('"force-cleared" in str(exc).lower()')

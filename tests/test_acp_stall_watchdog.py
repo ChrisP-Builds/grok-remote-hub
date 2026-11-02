@@ -13,11 +13,16 @@ import pytest
 
 from hub.acp_client import AcpClient
 from hub.config import Config
-from hub.session_policy import is_no_output_error_message, should_auto_retry_no_output
+from hub.session_policy import is_no_output_error_message, should_auto_retry_no_output  # noqa: F401
 
 
 def _client() -> AcpClient:
     return AcpClient(Config(), secret="test-secret-watchdog")
+
+
+def _bg(client: AcpClient, sid: str):
+    rt = client.runtimes.get(sid)
+    return rt.background if rt is not None else None
 
 
 async def _wait_until_idle(client: AcpClient, timeout: float = 4.0) -> bool:
@@ -78,6 +83,63 @@ def test_stall_watchdog_loop_force_clears_zero_update_turn() -> None:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+    asyncio.run(run())
+
+
+def test_watchdog_end_honoured_by_the_agent_still_reaches_the_prompt_path() -> None:
+    """Grok answers the cancelled prompt normally; the stall must still be reported, retried, and
+    its bg stamps dropped, with no force-clear claimed."""
+
+    async def run() -> None:
+        from hub.acp_client import TurnEndedError
+
+        client = _client()
+        sid = "watchdog-honoured-sid"
+        client.note_bg_activity(sid, kind="tool_call")
+        prompt_reply = asyncio.get_running_loop().create_future()
+
+        async def request(method: str, params: dict | None = None, timeout: float = 120.0, *, session_id=None):
+            assert method == "session/prompt"
+            return await prompt_reply
+
+        async def send(payload: dict) -> None:
+            if payload.get("method") == "session/cancel" and not prompt_reply.done():
+                prompt_reply.set_result({"stopReason": "cancelled"})
+
+        client.request = request  # type: ignore[method-assign]
+        client._send = send  # type: ignore[method-assign]
+        with pytest.raises(TurnEndedError) as info:
+            await client.session_prompt(sid, "hi", allow_load=False, no_output_seconds=0.3)
+        assert "no ACP session/update" in str(info.value)
+        assert is_no_output_error_message(info.value)
+        assert should_auto_retry_no_output(info.value, already_retried=False)
+        assert sid not in client.active_turns
+        assert client.last_force_clear_reason is None
+        for _ in range(40):
+            if _bg(client, sid) is None:
+                break
+            await asyncio.sleep(0.05)
+        assert _bg(client, sid) is None
+        assert client.runtimes.get(sid) is None
+
+    asyncio.run(run())
+
+
+def test_prompt_completed_by_the_agent_returns_its_result() -> None:
+    """Only a hub-ended turn raises; a normal completion still returns the agent's reply."""
+
+    async def run() -> None:
+        client = _client()
+        sid = "completed-sid"
+
+        async def request(method: str, params: dict | None = None, timeout: float = 120.0, *, session_id=None):
+            return {"stopReason": "end_turn"}
+
+        client.request = request  # type: ignore[method-assign]
+        assert await client.session_prompt(sid, "hi", allow_load=False) == {"stopReason": "end_turn"}
+        assert sid not in client.active_turns
+        assert client.runtimes.get(sid) is None
 
     asyncio.run(run())
 
@@ -280,12 +342,12 @@ def test_bg_activity_ages_continuous_within_ttl() -> None:
     sid = "bg-age-continuous-sid"
     became = client.note_bg_activity(sid, kind="subagent_progress", now=100.0)
     assert became is True
-    assert client._bg_activity_started_at[sid] == 100.0
+    assert _bg(client, sid).started_at == 100.0
     assert client.bg_activity_kind(sid) == "subagent_progress"
 
     became2 = client.note_bg_activity(sid, kind="subagent_progress", now=108.0)
     assert became2 is False  # still within TTL episode
-    assert client._bg_activity_started_at[sid] == 100.0  # episode start unchanged
+    assert _bg(client, sid).started_at == 100.0  # episode start unchanged
 
     age, silence = client.bg_activity_ages(sid, now=110.0)
     assert age == pytest.approx(10.0)  # from first stamp
@@ -306,13 +368,12 @@ def test_bg_activity_ages_new_episode_after_ttl() -> None:
     expired_now = 100.0 + float(BG_ACTIVITY_TTL_S) + 1.0
     live = client.live_bg_activity_sessions(now=expired_now)
     assert sid not in live
-    assert sid not in client._bg_activity_started_at
-    assert sid not in client._bg_activity_at
+    assert _bg(client, sid) is None
     assert client.bg_activity_ages(sid, now=expired_now) == (None, None)
 
     # New episode
     client.note_bg_activity(sid, kind="subagent_progress", now=160.0)
-    assert client._bg_activity_started_at[sid] == 160.0
+    assert _bg(client, sid).started_at == 160.0
     age, silence = client.bg_activity_ages(sid, now=165.0)
     assert age == pytest.approx(5.0)
     assert silence == pytest.approx(5.0)
@@ -345,7 +406,7 @@ def test_bg_activity_phase_stuck_and_auto_clear() -> None:
     assert client.bg_activity_phase_for(sid, now=t) == "working"
     assert sid in client.live_bg_working_sessions(now=t)
     assert sid not in client.live_bg_stuck_sessions(now=t)
-    assert client._bg_activity_started_at[sid] == 0.0
+    assert _bg(client, sid).started_at == 0.0
 
     # Continue heartbeats past grace (90s) → stuck at ~150s
     while t < 150.0:
@@ -363,7 +424,7 @@ def test_bg_activity_phase_stuck_and_auto_clear() -> None:
         client.note_bg_activity(sid, kind="subagent_progress", now=t)
     client.note_bg_activity(sid, kind="goal_updated", now=t)
     assert client.bg_activity_phase_for(sid, now=t) == "working"
-    assert client._bg_activity_rich_at[sid] == t
+    assert _bg(client, sid).rich_at == t
     rich_t = t
 
     # Heartbeats only again after rich ages out of stuck window (120s)
@@ -382,17 +443,15 @@ def test_bg_activity_phase_stuck_and_auto_clear() -> None:
     assert client.bg_activity_phase_for(sid, now=t) == "idle"
 
 
-def test_clear_bg_activity_wipes_all_maps() -> None:
+def test_clear_bg_activity_wipes_all_stamps() -> None:
     client = _client()
     sid = "bg-clear-sid"
     client.note_bg_activity(sid, kind="subagent_spawned", now=10.0)
     assert sid in client.live_bg_activity_sessions(now=10.0)
-    assert sid in client._bg_activity_rich_at
+    assert _bg(client, sid).rich_at is not None
     client.clear_bg_activity()
-    assert client._bg_activity_at == {}
-    assert client._bg_activity_started_at == {}
-    assert client._bg_activity_kind == {}
-    assert client._bg_activity_rich_at == {}
+    assert _bg(client, sid) is None
+    assert all(rt.background is None for _, rt in client.runtimes.items())
 
 
 def test_track_update_auto_compact_still_notes_activity() -> None:

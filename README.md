@@ -153,6 +153,8 @@ http://127.0.0.1:8787          # this PC only
 
 ## Use from your phone
 
+**Recommended (HTTPS + notifications, ADR-028):** enable HTTPS certificates in the Tailscale admin console, run `tailscale serve --bg 8787` once on the PC, then on the desktop hub click **Set up phone** and scan the QR code. On the phone: open the address in Safari, Share, **Add to Home Screen**, open it from the icon and turn on notifications in the sidebar footer. Requests through Tailscale Serve are trusted by your own Tailscale login, so no token is needed there; approvals, agent questions and long turns then buzz the phone even when the app is closed. The steps below (IP address + token) still work as a fallback.
+
 1. Install **Tailscale** on the PC and phone (same account / tailnet).
 2. Start the hub on the PC. Confirm it prints `Hub is up` and health checks show `OK`.
 3. **Once, as Administrator**, open the firewall:
@@ -186,10 +188,10 @@ Without Tailscale the hub binds **localhost only** and the UI shows **Local only
 
 ## Security
 
-**This hub auto-approves agent tools** (`grok agent --always-approve serve`). Treat network access like handing someone your keyboard.
+**This hub auto-approves agent tools** (`grok agent --always-approve serve`). Treat network access like handing someone your keyboard. Anyone who can open your hub URL with a valid token can drive shell, files, and network on the host.
 
 1. Prefer **Tailscale only** (default never binds `0.0.0.0`).
-2. Set optional **`hub_token`** in `config.toml`:
+2. Set **`hub_token`** in `config.toml` (required when any bind host is non-loopback):
 
    ```toml
    [hub]
@@ -200,7 +202,11 @@ Without Tailscale the hub binds **localhost only** and the UI shows **Local only
 
 3. Agent listens on **`127.0.0.1` only**; secret file `data/agent.secret` is gitignored.
 
-Full policy: **[SECURITY.md](SECURITY.md)**.
+**Phone approvals (ADR-027):** risky steps pause and show an Allow / Deny card on every connected browser: pushes and history rewrites, recursive deletes, package installs, network transfers, system changes, and file writes outside the session folder. No answer within 5 minutes means deny. Each session has a Balanced (default) / Strict / Trusted switch; "Allow similar" rules are saved per project in `data/approval-rules.json`, which you can edit. Built-in web search runs on xAI's side and is not gated. After upgrading, restart once with `.\restart-hub.ps1 -KillAgent` so the agent loads the gate.
+
+**Desktop handoff:** continue a hub session in stock CLI with `grok --resume <session-id>` (copy id from the UI). Default topology does not dual-live CLI + hub on the same serve process.
+
+Full policy: **[SECURITY.md](SECURITY.md)** · ADR-023.
 
 ---
 
@@ -214,6 +220,8 @@ Full policy: **[SECURITY.md](SECURITY.md)**.
 | `hub.projects_root` | `~/Projects` | Project folders for New Session |
 | `hub.sessions_root` | `~/.grok/sessions` | On-disk session index |
 | `agent.bind` / `port` | `127.0.0.1:2419` | Local `grok agent serve` |
+| `hub.approval_mode` | `balanced` | Default phone-approval mode for sessions: `balanced`, `strict` or `trusted` (ADR-027) |
+| `agent.backend` | `serve` | **`serve` (default)** or experimental `leader` (shared leader + stdio ACP). Enabling leader means shared outage with CLI `grok --leader` clients; default keep serve so normal CLI stays independent. See [docs/exp-leader-lab.md](docs/exp-leader-lab.md). |
 
 Copy `config.example.toml` → `config.toml` for local overrides.
 
