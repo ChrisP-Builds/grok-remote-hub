@@ -1,6 +1,6 @@
 # ADR-026: Guard Host and Origin, and serve previews as sandboxed capability URLs
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-10-31, 2026-11-01)
 - **Date:** 2026-10-31
 - **Deciders:** project owner, Grok Remote Hub session
 - **Tags:** security, auth, websocket, preview, csrf
@@ -106,3 +106,21 @@ to every browser. `_emit_acp` now sends `redact_for_browser(msg)`: values in
 `env` / `headers` name-value lists and string fields with secret-like names
 become `[redacted]`. Numbers pass, so token counts for the usage bars survive.
 Validation: `tests/test_harden_policy.py` redaction tests.
+
+## Amendment (2026-11-01): referrer, raw allowlist, proxy-aware empty token
+
+A branch review found the token could still reach previewed HTML: the SPA URL
+keeps `?token=`, and the same-origin preview iframe received it as
+`document.referrer` under `Referrer-Policy: same-origin`.
+
+1. Responses send `Referrer-Policy: no-referrer` (supersedes decision 7's
+   value), and the preview iframe sets `referrerpolicy="no-referrer"`.
+2. Raw file responses are sandboxed unless the type is known to be inert
+   (images other than SVG, audio, video, PDF, plain text). This replaces
+   decision 6's list of script-capable types, which missed RSS, Atom and
+   other `+xml` types the Windows registry can map.
+3. An empty `hub_token` is refused at startup when `hub.allowed_hosts`
+   names a non-loopback host, because Tailscale Serve forwards tailnet
+   requests from loopback and a loopback bind is then not private.
+4. Redaction also covers dict-form `env` and `headers`, secret flags in
+   `args`, and URL credentials or secret-looking query values.
