@@ -1691,6 +1691,8 @@ def test_stop_is_not_reported_as_a_stall() -> None:
 
     src = (Path(__file__).resolve().parents[1] / "hub" / "server.py").read_text(encoding="utf-8")
     body = src[src.index("    async def _execute_prompt("):src.index("    async def _drain_prompt_queues(")]
+    resync = src[src.index("    async def _status_resync_loop("):src.index("    async def _maybe_heal_acp(")]
+    assert "not is_user_cancel_error(reason)" in resync
     handler = body[body.index("user_stop = is_user_cancel_error(exc)"):]
     assert handler.index("if not user_stop:") < handler.index("log.exception(")
     assert handler.index("if user_stop:") < handler.index('"force-cleared" in str(exc).lower()')

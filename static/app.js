@@ -12469,7 +12469,7 @@
       if (!state.selectedId) return;
       const sid = state.livePromptSessionId || state.selectedId;
       sendWs({ type: "cancel", sessionId: sid });
-      // Fallback if hub/agent cancel leaves turn stuck (older hubs without force-clear).
+      // Last resort only: the hub already waits about 2s for the agent, then force-clears.
       setTimeout(async () => {
         if (!state.turnRunning) return;
         if (state.selectedId !== sid && state.livePromptSessionId !== sid) return;
@@ -12490,7 +12490,7 @@
         } catch (err) {
           toast("Stop fallback failed: " + err, "danger");
         }
-      }, 1500);
+      }, 4000);
     });
 
     els.transcript.addEventListener("scroll", () => {

@@ -48,10 +48,11 @@ a new ADR.
 | 021 | Flag-gated leader multi-client experiment | Proposed / Experimental | 2026-07-30 |
 | 022 | Private agent serve remains default; stock CLI stays independent | Accepted | 2026-08-08 |
 | 023 | Always-approve remote risk and CLI resume handoff | Accepted (risk reduced by 027) | 2026-08-08 |
-| 024 | Stop cancels the turn then clears hub bg activity honesty | Accepted | 2026-08-08 |
+| 024 | Stop cancels the turn then clears hub bg activity honesty | Accepted (cancel mechanics amended by 031) | 2026-08-08 |
 | 025 | Mobile plan copy/mermaid and session search/recap continuity | Accepted | 2026-08-08 |
 | 026 | Guard Host and Origin, and serve previews as sandboxed capability URLs | Accepted | 2026-10-31 |
 | 027 | Approve risky agent actions from the phone via a hub-owned Grok hook | Accepted | 2026-10-31 |
 | 028 | Serve over Tailscale HTTPS, trust the Tailscale login, and send web push | Accepted | 2026-11-01 |
 | 029 | Sequence session events and resume reconnects from an in-memory log | Accepted | 2026-11-01 |
 | 030 | Keep per-session runtime state in one object per session | Accepted | 2026-11-01 |
+| 031 | Stop sends the ACP cancel notification and ends the command the agent waits on | Accepted | 2026-11-01 |

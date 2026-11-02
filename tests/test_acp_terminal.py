@@ -136,6 +136,33 @@ def test_create_passes_session_id_and_fires_on_output() -> None:
     asyncio.run(_run())
 
 
+def test_kill_awaited_stops_only_the_commands_the_agent_waits_on() -> None:
+    """Stop must end a command blocking the turn, but a background server keeps running."""
+    sleeper = {"command": sys.executable, "args": ["-c", "import time; time.sleep(60)"]}
+
+    async def run() -> None:
+        mgr = TerminalManager()
+        blocking = (await mgr.create({**sleeper, "sessionId": "s-stop"}))["terminalId"]
+        background = (await mgr.create({**sleeper, "sessionId": "s-stop"}))["terminalId"]
+        other = (await mgr.create({**sleeper, "sessionId": "s-other"}))["terminalId"]
+        other_wait = asyncio.create_task(mgr.wait_for_exit(other))
+        waiting = asyncio.create_task(mgr.wait_for_exit(blocking))
+        await asyncio.sleep(0.2)
+        try:
+            assert await mgr.kill_awaited("s-stop") == 1
+            exit_info = await asyncio.wait_for(waiting, timeout=10.0)
+            assert exit_info["exitCode"] != 0 or exit_info["signal"]
+            assert mgr.get(background).process.returncode is None
+            assert mgr.get(other).process.returncode is None
+        finally:
+            other_wait.cancel()
+            procs = [mgr.get(t).process for t in (blocking, background, other)]
+            await mgr.close_all()
+            await asyncio.gather(*(p.wait() for p in procs))
+
+    asyncio.run(run())
+
+
 def test_js_handles_terminal_out() -> None:
     js = (STATIC / "app.js").read_text(encoding="utf-8")
     assert 'type === "terminal_out"' in js

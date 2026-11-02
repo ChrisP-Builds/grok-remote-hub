@@ -1,6 +1,6 @@
 # ADR-024: Stop cancels the turn then clears hub bg activity honesty
 
-- **Status:** Accepted
+- **Status:** Accepted; cancel mechanics (decision 1) amended by ADR-031
 - **Date:** 2026-08-08
 - **Deciders:** project owner, Grok Remote Hub session
 - **Tags:** stop, cancel, end_turn, background, subagent, honesty

@@ -106,6 +106,7 @@ class ManagedTerminal:
         self._done = asyncio.Event()
         self._pump_task: asyncio.Task | None = None
         self._decode_carry = bytearray()
+        self.exit_waiters = 0
 
     def start_pump(self) -> None:
         self._pump_task = asyncio.create_task(self._pump(), name=f"term-pump-{self.terminal_id[:8]}")
@@ -201,6 +202,7 @@ class ManagedTerminal:
         }
 
     async def wait_for_exit(self, timeout: float = WAIT_EXIT_CAP_SECONDS) -> dict[str, Any]:
+        self.exit_waiters += 1
         try:
             await asyncio.wait_for(self._done.wait(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -209,6 +211,8 @@ class ManagedTerminal:
                 await asyncio.wait_for(self._done.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 pass
+        finally:
+            self.exit_waiters -= 1
         return {
             "exitCode": self._exit_code,
             "signal": self._signal,
@@ -368,6 +372,15 @@ class TerminalManager:
     async def kill(self, terminal_id: str) -> dict[str, Any]:
         await self.get(terminal_id).kill()
         return {}
+
+    async def kill_awaited(self, session_id: str) -> int:
+        """Kill the session's commands the agent is blocked on; background ones keep running."""
+        blocking = [
+            t for t in self._terms.values() if t.session_id == session_id and t.exit_waiters
+        ]
+        for term in blocking:
+            await term.kill()
+        return len(blocking)
 
     async def release(self, terminal_id: str) -> dict[str, Any]:
         term = self._terms.pop(terminal_id, None)

@@ -1939,7 +1939,11 @@ class Hub:
                 if reason and reason != self._last_broadcast_force_clear:
                     sid = self.acp.last_force_clear_session
                     self._last_broadcast_force_clear = reason
-                    if sid and not self.acp.is_session_active(sid):
+                    if (
+                        sid
+                        and not self.acp.is_session_active(sid)
+                        and not is_user_cancel_error(reason)
+                    ):
                         err = MID_TURN_STALL_USER_MSG
                         low = reason.lower()
                         if "max turn" in low:

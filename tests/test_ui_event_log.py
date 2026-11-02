@@ -31,7 +31,7 @@ def _seq_block(js: str) -> str:
 
 def test_cache_bust_bumped_for_app_js() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
-    assert "/app.js?v=20261101d" in html
+    assert "/app.js?v=20261101e" in html
 
 
 def test_pane_tracks_last_seq_and_replay_mark() -> None:

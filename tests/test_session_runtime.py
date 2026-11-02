@@ -263,7 +263,7 @@ def test_end_turn_leaves_no_runtime_for_the_session() -> None:
         client._register_active_turn(sid)
         client.note_bg_activity(sid, kind="subagent_progress", now=100.0)
         client.notify_agent_cancel = AsyncMock(return_value=True)  # type: ignore[method-assign]
-        result = await client.end_turn(sid, "user cancel")
+        result = await client.end_turn(sid, "user cancel", cancel_timeout=0.05)
         assert result["cleared"] is True
         assert client.runtimes.get(sid) is None
         again = await client.end_turn(sid, "again")

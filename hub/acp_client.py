@@ -258,8 +258,6 @@ class AcpClient:
         self.runtimes = runtimes if runtimes is not None else SessionRuntimes()
         self._active_turns = turn_map(self.runtimes)
         self._end_all_turns_lock = asyncio.Lock()
-        # Last cancel RPC method that succeeded (tried first next time).
-        self._cancel_method: str | None = None
         # Last watchdog/admin force-clear (Hub may broadcast idle from these).
         self.last_force_clear_reason: str | None = None
         self.last_force_clear_session: str | None = None
@@ -1139,8 +1137,6 @@ class AcpClient:
             if inflight is not None and not inflight.done():
                 inflight.set_exception(ConnectionError("ACP disconnected"))
             self.runtimes.prune(sid)
-        # Cancel method may no longer apply after reconnect.
-        self._cancel_method = None
         if (
             self.active_turns
             or self._pending
@@ -2221,49 +2217,46 @@ class AcpClient:
             self._clear_active_turn(session_id)
 
     async def notify_agent_cancel(self, session_id: str) -> bool:
-        """Tell the agent to abort its in-flight turn. Does not force_clear locally.
+        """Send the ACP session/cancel notification; True once it is on the wire.
 
-        Prefers the last successful cancel method; short per-method timeout so
-        shotgun cancel stays bounded (~2s total with end_turn). Returns True if
-        any method succeeded. Logs a warning if all fail.
+        The agent acknowledges by answering the open session/prompt with stopReason
+        cancelled, so the caller waits for the turn to end, not for a reply.
         """
-        methods: list[str] = [
-            "session/cancel",
-            "session/prompt/cancel",
-            "x.ai/session/cancel",
-            "_x.ai/session/cancel",
-        ]
-        cached = self._cancel_method
-        if cached and cached in methods:
-            methods = [cached] + [m for m in methods if m != cached]
-        last_exc: Exception | None = None
-        # Short per-method timeout: total cancel budget stays ~2s under end_turn.
-        per_method_timeout = 1.5
-        for method in methods:
-            try:
-                await self.request(
-                    method,
-                    {"sessionId": session_id},
-                    timeout=per_method_timeout,
-                    session_id=session_id,
-                )
-                self._cancel_method = method
-                log.info(
-                    "Agent cancel ok via %s session=%s", method, session_id[:12]
-                )
-                return True
-            except Exception as exc:
-                last_exc = exc
-                if cached and method == cached:
-                    # Cached method failed; stop preferring it until one succeeds.
-                    self._cancel_method = None
-                log.debug("Cancel via %s failed: %s", method, exc)
-        log.warning(
-            "Agent cancel unsupported/failed session=%s: %s",
-            session_id,
-            last_exc or "no method succeeded",
-        )
-        return False
+        try:
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/cancel",
+                    "params": {"sessionId": session_id},
+                }
+            )
+        except Exception as exc:
+            log.warning("Agent cancel not sent session=%s: %s", session_id[:12], exc)
+            return False
+        return True
+
+    async def _cancel_and_await_turn_end(self, session_id: str, timeout: float) -> bool:
+        """True when the agent ends the session's turn within timeout of the cancel."""
+        rt = self.runtimes.get(session_id)
+        waiters = rt.turn_end_waiters if rt is not None and rt.turn is not None else None
+        ended = asyncio.get_running_loop().create_future()
+        if waiters is not None:
+            waiters.append(ended)
+        try:
+            sent = await self.notify_agent_cancel(session_id)
+            # Grok keeps waiting on terminal/wait_for_exit through a cancel.
+            killed = await self._terminals.kill_awaited(session_id)
+            if killed:
+                log.info("cancel killed %d running command(s) session=%s", killed, session_id[:12])
+            if not sent or waiters is None:
+                return sent
+            done, _ = await asyncio.wait({ended}, timeout=float(timeout))
+            return bool(done)
+        finally:
+            if not ended.done():
+                ended.cancel()
+            if waiters is not None and ended in waiters:
+                waiters.remove(ended)
 
     async def end_turn(
         self,
@@ -2272,18 +2265,10 @@ class AcpClient:
         *,
         cancel_timeout: float = 2.0,
     ) -> dict:
-        """Cancel agent then force-clear local turn. Single-flight per session.
+        """Cancel the agent's turn, wait up to cancel_timeout for it to end, force-clear what is left.
 
-        Order is always cancel-before-clear so the agent releases the old prompt
-        before the hub unlocks. Cancel is bounded by cancel_timeout; clear runs
-        even if cancel fails (WS dead, unsupported method, etc.).
-
-        After clear, drops bg activity stamps for the session (or all when
-        session_id is None) so Working/Stuck status does not lie after Stop.
-
-        Residual: agent cancel targets the parent sessionId only. Nested
-        subagent sessions depend on agent ACP to cancel children; hub cannot
-        guarantee nested stop without agent support.
+        Single-flight per session; also drops bg activity stamps. Cancel names the parent
+        session only, so stopping nested subagent sessions is up to the agent.
         """
         if session_id is None:
             lock = self._end_all_turns_lock
@@ -2310,27 +2295,9 @@ class AcpClient:
     ) -> dict:
         cancelled = False
         if session_id is not None:
-            try:
-                cancelled = bool(
-                    await asyncio.wait_for(
-                        self.notify_agent_cancel(str(session_id)),
-                        timeout=float(cancel_timeout),
-                    )
-                )
-            except asyncio.TimeoutError:
-                log.warning(
-                    "end_turn: cancel timed out session=%s reason=%s",
-                    str(session_id)[:12],
-                    reason,
-                )
-                cancelled = False
-            except Exception as exc:
-                log.warning(
-                    "end_turn: cancel failed session=%s: %s",
-                    str(session_id)[:12],
-                    exc,
-                )
-                cancelled = False
+            cancelled = await self._cancel_and_await_turn_end(
+                str(session_id), cancel_timeout
+            )
         else:
             # All sessions: best-effort cancel each active id within budget.
             sids = list(self.active_turns.keys())

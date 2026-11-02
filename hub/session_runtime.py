@@ -51,6 +51,7 @@ class CompactState:
 class SessionRuntime:
     session_id: str
     turn: dict[str, Any] | None = None
+    turn_end_waiters: list[asyncio.Future] = field(default_factory=list)
     stall_watchdog: asyncio.Task | None = None
     end_turn_lock: asyncio.Lock | None = None
     background: BackgroundActivity | None = None
@@ -190,7 +191,13 @@ class RuntimeFieldMap(MutableMapping[str, _V]):
 
 def turn_map(runtimes: SessionRuntimes) -> RuntimeFieldMap[dict[str, Any]]:
     def _write(rt: SessionRuntime, meta: dict[str, Any] | None) -> None:
+        ended = rt.turn is not None and rt.turn is not meta
         rt.turn = meta
+        if ended:
+            waiters, rt.turn_end_waiters = rt.turn_end_waiters, []
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.set_result(None)
 
     return RuntimeFieldMap(runtimes, read=lambda rt: rt.turn, write=_write)
 

@@ -27,10 +27,14 @@ def test_end_turn_pops_bg_activity_for_session() -> None:
         assert _bg(client, sid) is not None
         assert client.bg_activity_phase_for(sid, now=100.0) in ("working", "stuck")
 
-        client.notify_agent_cancel = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        async def agent_ends_turn(session_id: str) -> bool:
+            client._clear_active_turn(session_id)
+            return True
+
+        client.notify_agent_cancel = agent_ends_turn  # type: ignore[method-assign]
         result = await client.end_turn(sid, "user cancel")
         assert result["cancelled"] is True
-        assert result["cleared"] is True
+        assert result["cleared"] is False
         assert _bg(client, sid) is None
         assert client.bg_activity_phase_for(sid, now=101.0) == "idle"
         assert sid not in client.active_turns
