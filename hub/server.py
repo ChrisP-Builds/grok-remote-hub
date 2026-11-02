@@ -53,7 +53,7 @@ from hub.site_preview import (
     build_preview_plan,
     serve_preview,
 )
-from hub.history import load_session_history
+from hub.history import history_etag, load_session_history
 from hub.plan_view import PlanViewError, apply_plan_action, read_session_plan
 from hub.recap_view import build_session_recap_from_disk
 from hub.session_search import session_matches_query
@@ -2802,13 +2802,17 @@ class Hub:
         session_id = request.match_info["id"]
         session = find_session(self.config.sessions_root, session_id)
         path = session.path if session else None
+        cap = self.config.max_history_messages
+        headers = {"Cache-Control": "private, no-cache"}
+        etag = history_etag(self.config.sessions_root, session_id, path, cap)
+        if etag:
+            headers["ETag"] = etag
+            if etag in (request.headers.get("If-None-Match") or ""):
+                return web.Response(status=304, headers=headers)
         messages = load_session_history(
-            self.config.sessions_root,
-            session_id,
-            session_path=path,
-            max_messages=self.config.max_history_messages,
+            self.config.sessions_root, session_id, session_path=path, max_messages=cap
         )
-        return web.json_response({"sessionId": session_id, "messages": messages})
+        return web.json_response({"sessionId": session_id, "messages": messages}, headers=headers)
 
     async def handle_session_recap(self, request: web.Request) -> web.Response:
         """Bounded last user+assistant catch-up for mobile resume."""

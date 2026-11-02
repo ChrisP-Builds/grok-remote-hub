@@ -338,3 +338,36 @@ def test_history_etag_changes_with_file_and_format(tmp_path: Path) -> None:
         f.write(_line("agent_message_chunk", content={"type": "text", "text": "more"}) + "\n")
     assert history_etag(tmp_path / "sessions", "s1", session, 800) != first
     assert history_etag(tmp_path / "sessions", "missing", None, 800) is None
+
+def test_history_endpoint_answers_304_when_unchanged(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from tests.test_ws_resume import _hub
+
+    session = tmp_path / "sessions" / "s-etag"
+    session.mkdir(parents=True)
+    (session / "summary.json").write_text("{}", encoding="utf-8")
+    updates = session / "updates.jsonl"
+    updates.write_text(_line("agent_message_chunk", content={"type": "text", "text": "hi"}) + "\n", encoding="utf-8")
+    _, app = _hub(tmp_path, monkeypatch)
+
+    async def run() -> None:
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            first = await client.get("/api/sessions/s-etag/history")
+            etag = first.headers.get("ETag")
+            assert first.status == 200 and etag
+            assert "no-cache" in first.headers.get("Cache-Control", "")
+            again = await client.get("/api/sessions/s-etag/history", headers={"If-None-Match": etag})
+            assert again.status == 304
+            with updates.open("a", encoding="utf-8") as f:
+                f.write(_line("agent_message_chunk", content={"type": "text", "text": "more"}) + "\n")
+            changed = await client.get("/api/sessions/s-etag/history", headers={"If-None-Match": etag})
+            assert changed.status == 200 and changed.headers.get("ETag") != etag
+        finally:
+            await client.close()
+
+    asyncio.run(run())
