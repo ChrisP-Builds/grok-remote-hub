@@ -31,7 +31,7 @@ def _seq_block(js: str) -> str:
 
 def test_cache_bust_bumped_for_app_js() -> None:
     html = (STATIC / "index.html").read_text(encoding="utf-8")
-    assert "/app.js?v=20261101b" in html
+    assert "/app.js?v=20261101c" in html
 
 
 def test_pane_tracks_last_seq_and_replay_mark() -> None:
@@ -162,3 +162,16 @@ def test_new_code_has_no_em_dashes_or_html_sinks() -> None:
     assert EM_DASH not in block
     for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
         assert sink not in block
+
+
+def test_connect_ws_keeps_a_single_live_socket() -> None:
+    """Deep-link startup opened a second socket while the first was connecting, so every event arrived twice."""
+    body = _body(_js(), "connectWs")
+    assert "WebSocket.CONNECTING" in body and "WebSocket.OPEN" in body, "must not open a second socket"
+    assert "force" in body, "dead-hub recovery still needs a forced reconnect"
+    assert body.count("if (state.ws !== ws) return;") >= 3, "stale socket events must be ignored"
+    assert re.search(r"prev\.close\(\)", body), "a forced reconnect closes the previous socket"
+
+
+def test_dead_hub_recovery_forces_reconnect() -> None:
+    assert "connectWs({ force: true })" in _body(_js(), "maybeHardRecoverFromDeadHub")

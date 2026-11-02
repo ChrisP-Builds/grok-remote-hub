@@ -6956,7 +6956,7 @@
           clearTimeout(state.reconnectTimer);
           state.reconnectTimer = null;
         }
-        connectWs();
+        connectWs({ force: true });
       }
     }
   }
@@ -7405,7 +7405,12 @@
     finish();
   }
 
-  function connectWs() {
+  function connectWs(opts) {
+    const force = !!(opts && opts.force);
+    const prev = state.ws;
+    const prevLive =
+      prev && (prev.readyState === WebSocket.CONNECTING || prev.readyState === WebSocket.OPEN);
+    if (prevLive && !force) return;
     if (state.reconnectTimer) {
       clearTimeout(state.reconnectTimer);
       state.reconnectTimer = null;
@@ -7415,8 +7420,14 @@
 
     const ws = new WebSocket(wsUrl());
     state.ws = ws;
+    if (prevLive) {
+      try {
+        prev.close();
+      } catch (_) {}
+    }
 
     ws.addEventListener("open", () => {
+      if (state.ws !== ws) return;
       const wasReconnect =
         state.reconnectAttempt > 0 || state.wsState === "reconnecting";
       state.wsState = "open";
@@ -7429,6 +7440,7 @@
     });
 
     ws.addEventListener("message", (ev) => {
+      if (state.ws !== ws) return;
       let msg;
       try {
         msg = JSON.parse(ev.data);
@@ -7439,6 +7451,7 @@
     });
 
     ws.addEventListener("close", () => {
+      if (state.ws !== ws) return;
       state.wsState = "reconnecting";
       if (state.subscribedSessions) state.subscribedSessions.clear();
       resetSocketResumeState();

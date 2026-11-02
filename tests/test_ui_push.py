@@ -101,8 +101,8 @@ def test_html_home_screen_tags_and_cache_bust() -> None:
     assert 'name="apple-mobile-web-app-capable" content="yes"' in html
     assert 'name="apple-mobile-web-app-title" content="Grok Hub"' in html
     assert 'name="theme-color" content="#0a0c10"' in html
-    assert "/app.css?v=20261101b" in html
-    assert "/app.js?v=20261101b" in html
+    assert "/app.css?v=20261101c" in html
+    assert "/app.js?v=20261101c" in html
 
 
 def test_service_worker_push_only_no_caching() -> None:
