@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
+
+import pytest
 from types import SimpleNamespace
 from typing import Any
 
@@ -168,3 +171,22 @@ def test_css_terminal_tool_body() -> None:
     idx = css.find("[data-terminal=")
     chunk = css[idx : idx + 180]
     assert "pre-wrap" in chunk
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows shell selection")
+def test_windows_shell_commands_run_in_powershell_like_grok(tmp_path) -> None:
+    """Grok's own Shell tool runs PowerShell on Windows; cmd.exe rejects agent cmdlets."""
+    (tmp_path / "keepme").mkdir()
+
+    async def run() -> tuple[dict, str]:
+        tm = TerminalManager()
+        tid = (await tm.create({"command": "Remove-Item -Recurse -Force .\\keepme; Get-Date -Format yyyy", "cwd": str(tmp_path)}))["terminalId"]
+        exit_info = await tm.wait_for_exit(tid)
+        out = (await tm.output(tid)).get("output", "")
+        await tm.close_all()
+        return exit_info, out
+
+    exit_info, out = asyncio.run(run())
+    assert exit_info["exitCode"] == 0, out
+    assert not (tmp_path / "keepme").exists()
+    assert out.strip()[-4:].isdigit()

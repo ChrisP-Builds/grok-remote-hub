@@ -31,6 +31,7 @@ This file is the **public narrative**. Session chat context is not required to u
 - **Compact status bar** — slim `#compact-status-bar` while compacting (pulse track + elapsed seconds); CTX segment subtle pulse via `usage-seg-compacting`.
 
 ### Fixed
+- **Agent shell commands run in PowerShell on Windows**, like Grok's own Shell tool (pwsh if installed, else Windows PowerShell, `-ExecutionPolicy Bypass`, no console window, UTF-8 output). The hub used cmd.exe, so cmdlets such as `Remove-Item` failed with "not recognized" in hub sessions.
 - **Compact honesty when signals lag** — hub stashes agent compact tokens under the hub gate, merges them into `/compact` outcome, and reports `agent_reduced_signals_stale` (completed, not “already minimal”) when the agent shrank but `signals.json` is still flat; CTX bar remains signals SoT.
 - **Agent recycle → ACP reconnect reliability** — restart-agent no longer treats TCP port-up as success; multi-attempt reconnect with `reset_maintain=True` cancels maintain backoff sleep after kill; success only when process up **and** ACP chat-connected; heal budget left at 0 after partial recycle so auto-heal remains usable (ADR-014).
 

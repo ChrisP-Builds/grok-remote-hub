@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
+import sys
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -13,6 +15,23 @@ log = logging.getLogger("hub.acp.terminal")
 
 DEFAULT_OUTPUT_BYTE_LIMIT = 1_000_000
 WAIT_EXIT_CAP_SECONDS = 120.0
+_CREATE_NO_WINDOW = 0x08000000
+_UTF8_OUTPUT = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+
+
+def _windows_shell_argv(command: str) -> list[str]:
+    """Same shell as Grok's own Shell tool on Windows: pwsh if on PATH, else Windows PowerShell."""
+    exe = shutil.which("pwsh") or shutil.which("powershell") or "powershell.exe"
+    return [exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-Command", _UTF8_OUTPUT + command]
+
+
+async def _spawn_shell(command: str, **kwargs: Any) -> asyncio.subprocess.Process:
+    if sys.platform == "win32":
+        return await asyncio.create_subprocess_exec(
+            *_windows_shell_argv(command), creationflags=_CREATE_NO_WINDOW, **kwargs
+        )
+    return await asyncio.create_subprocess_shell(command, **kwargs)
 
 # (terminal_id, delta_text, session_id | None) — sync or async ok
 OutputCallback = Callable[[str, str, str | None], Any]
@@ -290,7 +309,7 @@ class TerminalManager:
             or (" " in command and not os.path.isfile(command))
         )
         if use_shell:
-            proc = await asyncio.create_subprocess_shell(
+            proc = await _spawn_shell(
                 command,
                 cwd=cwd,
                 env=env,
@@ -310,9 +329,9 @@ class TerminalManager:
                     stdin=asyncio.subprocess.DEVNULL,
                 )
             except FileNotFoundError:
-                # Windows often needs shell for bare commands like `dir`
+                # Bare shell commands (`dir`, `Get-Date`) are not executables.
                 shell_cmd = command if not args else " ".join([command, *args])
-                proc = await asyncio.create_subprocess_shell(
+                proc = await _spawn_shell(
                     shell_cmd,
                     cwd=cwd,
                     env=env,
