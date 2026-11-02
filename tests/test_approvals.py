@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 from aiohttp import web
@@ -142,6 +143,87 @@ def test_hub_state_is_protected_whatever_the_session_root(tmp_path: Path) -> Non
     event = {"sessionId": SID, "cwd": str(hub), "toolName": "run_terminal_command",
              "toolInput": {"command": "Set-Content config.toml x"}}
     assert asyncio.run(quick.decide(event))["decision"] == "deny"
+
+
+def test_publish_timeout_lets_resolved_go_out_when_request_publish_hangs(tmp_path: Path) -> None:
+    published: list = []
+    never = asyncio.Event()
+
+    async def publish(payload: dict) -> None:
+        if payload["type"] == "approval_request":
+            await never.wait()
+        published.append(payload)
+
+    broker = ApprovalBroker(
+        tmp_path / "rules.json", publish, session_root_for=lambda sid: ROOT, timeout=0.01, publish_timeout=0.05,
+    )
+
+    async def run() -> dict:
+        reply = await broker.decide(_event())
+        await asyncio.wait_for(broker.flush_emits(), 2.0)
+        return reply
+
+    assert asyncio.run(run())["decision"] == "deny"
+    assert [p["type"] for p in published] == ["approval_resolved"]
+
+
+def test_deadline_is_anchored_to_arrival_not_to_the_end_of_classification(tmp_path: Path) -> None:
+    """A stall between arrival and the wait must shorten the wait, never extend it past arrival + 300 s."""
+    published: list = []
+    now = [1000.0]
+
+    async def publish(payload: dict) -> None:
+        published.append(payload)
+
+    def stalled_root_lookup(_sid: str) -> str:
+        now[0] += 400.0
+        return ROOT
+
+    broker = ApprovalBroker(
+        tmp_path / "rules.json", publish, session_root_for=stalled_root_lookup, clock=lambda: now[0], timeout=300.0,
+    )
+
+    async def run() -> dict:
+        reply = await asyncio.wait_for(broker.decide(_event()), 2.0)
+        await broker.flush_emits()
+        return reply
+
+    reply = asyncio.run(run())
+    assert reply["decision"] == "deny" and "no answer" in reply["reason"].lower()
+    assert (published[0]["createdAt"], published[0]["expiresAt"]) == (1000.0, 1300.0)
+
+
+def test_program_wide_launcher_rules_are_neither_saved_nor_honoured(tmp_path: Path) -> None:
+    broker = _broker(tmp_path, [])
+    (tmp_path / "rules.json").write_text(
+        json.dumps({"projects": {ROOT: ["powershell *", "git push *"]}}), encoding="utf-8"
+    )
+    assert broker.grants_for(ROOT) == ["git push *"]
+    broker._add_grant(ROOT, "powershell *")
+    saved = json.loads((tmp_path / "rules.json").read_text(encoding="utf-8"))
+    assert saved == {"projects": {ROOT: ["powershell *", "git push *"]}}
+
+
+def test_backstop_refuses_overlong_commands(tmp_path: Path) -> None:
+    broker = _broker(tmp_path, [])
+    assert broker.exec_refusal("shell", SID, "git status " + "x" * 5000) is not None
+    assert broker.exec_refusal("shell", SID, "git status") is None
+
+
+def test_hard_link_to_the_rules_file_is_still_protected(tmp_path: Path) -> None:
+    hub = tmp_path / "hub"
+    rules = hub / "data" / "approval-rules.json"
+    rules.parent.mkdir(parents=True)
+    rules.write_text("{}", encoding="utf-8")
+    alias = hub / "alias.json"
+    os.link(rules, alias)
+
+    async def publish(payload: dict) -> None:
+        pass
+
+    broker = ApprovalBroker(rules, publish, session_root_for=lambda sid: str(hub))
+    assert broker.exec_refusal("file", SID, str(alias)) is not None
+    assert broker.exec_refusal("file", SID, str(hub / "other.json")) is None
 
 
 def test_protected_paths_can_be_given_explicitly(tmp_path: Path) -> None:

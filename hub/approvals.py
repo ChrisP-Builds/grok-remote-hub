@@ -35,6 +35,7 @@ log = logging.getLogger("hub.approvals")
 DECISION_TIMEOUT_S = 300.0
 HOOK_TIMEOUT_S = 330
 APPROVAL_MEMORY_S = 600.0
+PUBLISH_TIMEOUT_S = 10.0
 
 _NO_RETRY = "Do not retry it; continue without it or ask the user."
 _REASONS = {
@@ -92,6 +93,7 @@ class ApprovalBroker:
         timeout: float = DECISION_TIMEOUT_S,
         clock: Callable[[], float] = time.time,
         protected_paths: Sequence[Path] | None = None,
+        publish_timeout: float = PUBLISH_TIMEOUT_S,
     ) -> None:
         self._rules_path = Path(rules_path)
         self._publish = publish
@@ -101,8 +103,9 @@ class ApprovalBroker:
         self._clock = clock
         data_dir = self._rules_path.parent
         if protected_paths is None:
-            protected_paths = (data_dir, data_dir.parent / "config.toml")
+            protected_paths = (data_dir, self._rules_path, data_dir.parent / "config.toml")
         self._protected = [str(p) for p in protected_paths]
+        self._publish_timeout = publish_timeout
         self._pending: dict[str, _Pending] = {}
         self._modes: dict[str, str] = {}
         self._event_roots: dict[str, str] = {}
@@ -167,7 +170,9 @@ class ApprovalBroker:
         if after is not None:
             await asyncio.wait({after})
         try:
-            await self._publish(payload)
+            await asyncio.wait_for(self._publish(payload), self._publish_timeout)
+        except asyncio.TimeoutError:
+            log.warning("approval publish of %s gave up after %.0fs", payload.get("type"), self._publish_timeout)
         except Exception:
             log.exception("approval publish failed")
 

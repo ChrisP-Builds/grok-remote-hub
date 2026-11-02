@@ -151,3 +151,73 @@ Balanced `python script.py` and `python -c` still run; variable-fed deletes
 (`Remove-Item $files`) and `cd x; Set-Content config.toml` across segments are
 not resolved; the user profile root is recognised by path shape
 (`<drive>:\Users\<name>`, `/home/<name>`), not by the environment.
+
+## Amendment 2 (2026-11-02): a lexer, and fail closed where it stops
+
+An adversarial review of the first amendment showed that a classifier which
+re-splits text with regular expressions always has one more gap (comments,
+Unicode quotes, a lone CR, here-strings, assignments, redirections). The policy
+now lexes PowerShell once (`_Lexer` in `hub/approval_policy.py`) and classifies
+tokens. Two properties replace grammar chasing:
+
+1. **Model what agents really emit.** `#` and `<# #>` comments, `@' '@` and
+   `@" "@` here-strings (the latter expands `$( )`), U+2018 to U+201B as `'`
+   and U+201C to U+201E as `"`, a lone CR as a newline, backtick-newline as a
+   continuation, backticks inside words dropped (``g`it`` is `git`), quoted
+   fragments joined (`pu"sh"` is `push`), U+2013 to U+2015 as `-`, `-Name:value`
+   split, `n>&m` merges and `n>` redirections (a `>` glued to the end of an
+   argument is literal, as PowerShell treats it), and leading `$x =`, `$x +=`,
+   `[type]$x =` and glued `$x=` assignments demoted so the real program is seen.
+2. **Fail closed on what is not modelled, as DYNAMIC, in both modes:** `--%`,
+   unterminated strings, groups, here-strings and comments, cmd bodies holding
+   `^`, `%` or `!` (and a `%var%` program), POSIX `-c` bodies holding a
+   backtick, a backslash or `$'`, nested `-Command` bodies holding a `"` (5.1
+   passes embedded quotes to the child unescaped), `-Command -` (stdin), more
+   than four nested shells, and anything over `MAX_COMMAND_CHARS` (4096) or
+   eight nested groups, which both report TRUNCATED. The executor backstop uses
+   the same path, so it is bounded too.
+3. **Strict is an allowlist by syntax first.** A statement is routine only if
+   its program is a bare name (no path, `.\`, `&`, dot-source or `$var`), it has
+   no file redirection (`2>&1` merges are fine), no groups, escapes or
+   here-strings, no call operator, and the program is on the list. The
+   `--version`/`--help` shortcut needs a bare name too. A concrete risk found
+   anywhere in the command is reported ahead of UNLISTED.
+4. **Rules cover less.** A saved rule covers a statement only when it is plain
+   (no groups, escapes, here-strings or redirection) and, if the rule names a
+   bare program, only bare invocations. Groups are scanned first and always.
+   Program-wide rules (`<prog> *` with nothing but flags before the `*`) are
+   invalid for shells, launchers, deleters, `iex`, `.` and `$`-programs; no rule
+   is offered for a pipe-fed delete, a `$var` program, a dot-source, or a
+   statement that a rule could never cover.
+5. **Protected paths resolve more spellings.** `\\?\`, `\\.\`, `\\?\UNC\` and
+   the local admin share (`\\localhost\D$`) reduce to the drive form before
+   comparison; redirection targets and `-Name:value` values resolve like
+   arguments; nested shell bodies are checked too. When the target exists,
+   `os.path.samefile` against each protected entry (the rules file is now one)
+   catches hard links and spellings normalisation misses. This and the
+   existing `realpath` are the module's only filesystem calls, both guarded by
+   the host path module.
+6. **git and package managers.** `--upload-pack`, `--receive-pack`, `--exec`,
+   `grep -O`/`--open-files-in-pager`, `clone -c/-u/--config`, and every
+   `git config` write (reads such as `--get`, `-l`, `get`, `list` and a single
+   key stay routine) are DYNAMIC; valued global flags (`--git-dir x`) no longer
+   hide the subcommand; `-m` is a rename only for `branch`. Package manager
+   subcommands are found past leading flags (`pnpm --filter web add`). In
+   Strict, writes under `<root>\.git\` ask (GITDIR).
+7. **File tools.** `to`, `from`, `dst`, `paths`, `files` and `uri` (with
+   `file://` decoded) are path keys; `copy`, `append`, `save`, `apply_diff`,
+   `mkdir`, `touch` and `unlink` are file words; a file-word tool with no
+   recognisable target asks (NO_TARGET) rather than running.
+8. **Broker.** Each broadcast is bounded by `publish_timeout` (10 s) so a hung
+   `approval_request` publish cannot hold back `approval_resolved`; the
+   arrival-anchored deadline is pinned by a fake-clock test.
+
+Known limits recorded for the next reviewer: wildcards, 8.3 short names and
+`$var` paths in shell mentions of gate files are not resolved (the file-write
+backstop still catches the write itself); the hub's own source (`hub\*.py`,
+`.venv`) is not protected when the session root is the hub repo; POSIX
+`/bin/sh` semantics beyond the fail-closed marks are not modelled; a delete
+fed from a group or variable (`Remove-Item (gci -r x)`, `Remove-Item $files`)
+is not DELETE; `cd x; Set-Content config.toml` across statements is not
+resolved. A tool whose name holds a file word but carries no path (a hypothetical
+`todo_write`) now asks every time; if Grok gains such a tool, exempt it by name.
