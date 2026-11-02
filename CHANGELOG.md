@@ -32,11 +32,16 @@ This file is the **public narrative**. Session chat context is not required to u
 - **Compact status bar** — slim `#compact-status-bar` while compacting (pulse track + elapsed seconds); CTX segment subtle pulse via `usage-seg-compacting`.
 
 ### Fixed
+- **Stop now stops the agent (ADR-031)**. The hub sent `session/cancel` as a request, which Grok rejects, so the agent kept working after Stop while the hub only cleared its own state. Stop now sends the ACP notification, kills the command the agent is waiting on (background commands keep running), and waits up to 2 s for the agent to end the turn before force-clearing. Stop also no longer shows "Agent stalled mid-turn".
+- **One WebSocket per page**: opening a session link no longer starts a second socket that doubled every live event.
+- **Full tool output after a turn ends**: the end-of-turn history reload kept only a 120-character snippet of each tool's output; it now keeps up to 4,000 characters (the tail, with a count of omitted lines).
 - **Agent shell commands run in PowerShell on Windows**, like Grok's own Shell tool (pwsh if installed, else Windows PowerShell, `-ExecutionPolicy Bypass`, no console window, UTF-8 output). The hub used cmd.exe, so cmdlets such as `Remove-Item` failed with "not recognized" in hub sessions.
 - **Compact honesty when signals lag** — hub stashes agent compact tokens under the hub gate, merges them into `/compact` outcome, and reports `agent_reduced_signals_stale` (completed, not “already minimal”) when the agent shrank but `signals.json` is still flat; CTX bar remains signals SoT.
 - **Agent recycle → ACP reconnect reliability** — restart-agent no longer treats TCP port-up as success; multi-attempt reconnect with `reset_maintain=True` cancels maintain backoff sleep after kill; success only when process up **and** ACP chat-connected; heal budget left at 0 after partial recycle so auto-heal remains usable (ADR-014).
 
 ### Changed
+- **History revalidates instead of refetching**: `GET /api/sessions/{id}/history` sends an `ETag` and answers `304` while the session log is unchanged, so idle polling costs a few hundred bytes instead of the full transcript.
+- **Per-session runtime state in one object (ADR-030)**: internal refactor; turn, load, warm, stall and background bookkeeping now live on one `SessionRuntime` per session.
 - **SPA static assets exempt from hub_token** — GET/HEAD for `/`, `/app.js`, `/app.css`, `/vendor/*`, favicons, and similar static extensions load without token so remote UI works after `?token=` navigation; API/WS/preview remain protected (`is_public_unauthenticated_path`).
 - **Long-lived silent health watchdog** — primary external watchdog is `python -m hub.watchdog` via `pythonw` (logon task `GrokRemoteHubWatch` + `watchdog-hidden.vbs`), not every-2-minute PowerShell. Same `logs/watch-hub-state.json` keys and `restart-hub.ps1 -KeepAgent` policy; `start-hub.ps1` ensures the daemon is running; full `stop-hub` stops the watchdog so the hub stays down, while `-KeepAgent` (restart path) leaves it running. Optional `watch-hub.ps1` is a thin `--once` wrapper (ADR-019 amendment).
 - **`stop-hub.ps1` bind_port** — listener kill uses `bind_port` from `config.toml` (default 8787), not a hardcoded sole path.
