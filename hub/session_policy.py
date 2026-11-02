@@ -459,6 +459,11 @@ def is_turn_stuck_for_new_prompt(
     )
 
 
+def is_user_cancel_error(msg: str | BaseException | None) -> bool:
+    """True when a turn ended because the user pressed Stop (not a stall or failure)."""
+    return "user cancel" in str(msg or "").lower()
+
+
 def is_no_output_error_message(msg: str | BaseException | None) -> bool:
     """True when an exception/message is the zero-ACP-update hang (force-clear)."""
     text = str(msg or "").lower()

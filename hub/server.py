@@ -116,6 +116,7 @@ from hub.session_policy import (
     is_live_hot_path,
     is_no_output_error_message,
     is_permanent_session_load_failure,
+    is_user_cancel_error,
     load_hub_session_ids,
     load_remote_sessions,
     next_ensure_after_load_fail,
@@ -4412,7 +4413,11 @@ class Hub:
                 session_id, "idle", None, also_session_id=view_session_id
             )
         except Exception as exc:
-            log.exception("prompt failed session=%s", session_id)
+            user_stop = is_user_cancel_error(exc)
+            if not user_stop:
+                log.exception("prompt failed session=%s", session_id)
+            else:
+                log.info("prompt stopped by user session=%s", session_id)
             try:
                 self.ops.inc("prompt_error")
                 self.ops.emit(
@@ -4427,8 +4432,12 @@ class Hub:
                     session_id, f"prompt exception: {exc}"
                 )
 
+            if user_stop:
+                await self._broadcast_turn(
+                    session_id, "idle", None, also_session_id=view_session_id
+                )
             # Hang with zero output: heal + auto-retry once on same session.
-            if should_auto_retry_no_output(exc, already_retried=not _auto_retry):
+            elif should_auto_retry_no_output(exc, already_retried=not _auto_retry):
                 await self._no_output_auto_retry(
                     session_id=session_id,
                     view_session_id=view_session_id,

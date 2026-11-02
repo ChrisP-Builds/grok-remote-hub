@@ -1674,3 +1674,23 @@ def test_forget_warm_session() -> None:
     assert client.loaded_session_id == "sess-b"
     client.forget_warm_session("")
     assert warm("sess-b")
+
+
+def test_is_user_cancel_error() -> None:
+    from hub.session_policy import is_user_cancel_error
+
+    assert is_user_cancel_error(TimeoutError("Turn force-cleared: user cancel"))
+    assert is_user_cancel_error("Turn force-cleared: user cancel fallback: boom")
+    assert not is_user_cancel_error(TimeoutError("Turn force-cleared: mid-turn stall 600s"))
+    assert not is_user_cancel_error(None)
+
+
+def test_stop_is_not_reported_as_a_stall() -> None:
+    """Stop force-clears the turn; the prompt task must end idle without the stall error or a traceback."""
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "hub" / "server.py").read_text(encoding="utf-8")
+    body = src[src.index("    async def _execute_prompt("):src.index("    async def _drain_prompt_queues(")]
+    handler = body[body.index("user_stop = is_user_cancel_error(exc)"):]
+    assert handler.index("if not user_stop:") < handler.index("log.exception(")
+    assert handler.index("if user_stop:") < handler.index('"force-cleared" in str(exc).lower()')
