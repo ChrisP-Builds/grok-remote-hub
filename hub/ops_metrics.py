@@ -40,6 +40,11 @@ DEFAULT_COUNTERS: tuple[str, ...] = (
     "bg_activity_stuck",
     "bg_activity_cleared",
     "session_switch",
+    "ws_resume_replay",
+    "ws_resume_fallback",
+    "ws_resume_fallback_boot",
+    "ws_resume_fallback_gap",
+    "ws_resume_fallback_none",
 )
 
 

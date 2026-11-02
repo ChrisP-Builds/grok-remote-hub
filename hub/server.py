@@ -34,6 +34,7 @@ from hub.http_guard import (
     request_has_token,
 )
 from hub.ops_metrics import OpsMetrics
+from hub.event_log import SEQUENCED_TYPES, EventLog, decide_resume, replay_frame
 from hub.fs_browser import (
     RAW_MAX_BYTES,
     FsBrowserError,
@@ -307,6 +308,7 @@ class Hub:
         self._last_acp_quality: str | None = None
         self._last_heal_skip_reason: str | None = None
         self._acp_dedupe = EventDedupe(maxlen=2000)
+        self.event_log = EventLog()
         self.tailer = SessionTailer(
             config.sessions_root,
             on_event=self._on_disk_event,
@@ -1192,7 +1194,11 @@ class Hub:
         return None
 
     async def broadcast(self, payload: dict[str, Any], session_id: str | None = None) -> None:
-        data = json.dumps(payload, default=str)
+        # Logged before any send and even with no subscriber: reconnecting clients replay from it.
+        if session_id and payload.get("type") in SEQUENCED_TYPES:
+            data = self.event_log.append(session_id, payload).text
+        else:
+            data = json.dumps(payload, default=str)
         dead: list[web.WebSocketResponse] = []
         always = (
             "status",
@@ -3413,45 +3419,7 @@ class Hub:
             await ws.send_str(json.dumps(self.status_payload()))
             return
         if typ == "subscribe":
-            sid = str(payload.get("sessionId") or "")
-            if sid:
-                self.subscriptions.setdefault(ws, set()).add(sid)
-                session = find_session(self.config.sessions_root, sid)
-                path = Path(session.path) if session else None
-                # Push history to this socket first, then start/resume tail (atomic catch-up).
-                messages = load_session_history(
-                    self.config.sessions_root,
-                    sid,
-                    session_path=path,
-                    max_messages=self.config.max_history_messages,
-                )
-                try:
-                    await ws.send_str(
-                        json.dumps(
-                            {"type": "history", "sessionId": sid, "messages": messages},
-                            default=str,
-                        )
-                    )
-                except Exception:
-                    log.debug("failed to send history on subscribe session=%s", sid, exc_info=True)
-                if self.acp.available_commands:
-                    try:
-                        await ws.send_str(
-                            json.dumps(
-                                {
-                                    "type": "commands",
-                                    "sessionId": sid,
-                                    "commands": self.acp.available_commands,
-                                }
-                            )
-                        )
-                    except Exception:
-                        log.debug(
-                            "failed to send commands on subscribe session=%s",
-                            sid,
-                            exc_info=True,
-                        )
-                await self.tailer.ensure_watching(sid, path)
+            await self._ws_subscribe(ws, payload)
             return
         if typ == "unsubscribe":
             sid = str(payload.get("sessionId") or "")
@@ -3504,6 +3472,48 @@ class Hub:
                 await self.broadcast(self.status_payload())
             return
         await self._emit_error(f"unknown type: {typ}", ws=ws)
+
+    async def _ws_subscribe(self, ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
+        sid = str(payload.get("sessionId") or "")
+        if not sid:
+            return
+        decision = decide_resume(
+            self.event_log, sid, payload.get("sinceSeq"), payload.get("bootId"), self.boot_id
+        )
+        # No await between the decision and the first send: a broadcast in that window
+        # would be neither replayed nor delivered live to this socket (ADR-029).
+        self.subscriptions.setdefault(ws, set()).add(sid)
+        session = find_session(self.config.sessions_root, sid)
+        path = Path(session.path) if session else None
+        if decision.replay:
+            self.ops.inc("ws_resume_replay")
+            await self._ws_send(ws, replay_frame(sid, decision.since_seq, decision.events), "replay", sid)
+        else:
+            self.ops.inc("ws_resume_fallback")
+            self.ops.inc("ws_resume_fallback_" + decision.reason)
+            await self._ws_send(ws, self._history_snapshot_text(sid, path), "history", sid)
+        if self.acp.available_commands:
+            commands = {"type": "commands", "sessionId": sid, "commands": self.acp.available_commands}
+            await self._ws_send(ws, json.dumps(commands), "commands", sid)
+        await self.tailer.ensure_watching(sid, path)
+
+    def _history_snapshot_text(self, sid: str, path: Path | None) -> str:
+        head = self.event_log.head(sid)
+        messages = load_session_history(
+            self.config.sessions_root,
+            sid,
+            session_path=path,
+            max_messages=self.config.max_history_messages,
+        )
+        return json.dumps(
+            {"type": "history", "sessionId": sid, "seq": head, "messages": messages}, default=str
+        )
+
+    async def _ws_send(self, ws: web.WebSocketResponse, text: str, what: str, sid: str) -> None:
+        try:
+            await ws.send_str(text)
+        except Exception:
+            log.debug("failed to send %s on subscribe session=%s", what, sid, exc_info=True)
 
     async def _ws_prompt_safe(self, ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
         try:
@@ -3742,7 +3752,6 @@ class Hub:
                 "queueLength": queue_length,
             }
         )
-        # Unscoped echo: view id may differ from live selection; all clients get it.
         await self.broadcast(
             {
                 "type": "acp",
@@ -3757,7 +3766,8 @@ class Hub:
                         },
                     },
                 },
-            }
+            },
+            session_id=view_session_id,
         )
         await self.broadcast(self.status_payload())
 

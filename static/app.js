@@ -4710,6 +4710,8 @@
         stickToBottom: true,
         historyFingerprint: null,
         historyLoaded: false,
+        lastSeq: 0,
+        replayed: false,
         streamBuffers: emptyStreamBuffers(),
         lastToolTitle: "",
         lastActivityLine: "",
@@ -4832,6 +4834,7 @@
       state.streamBuffers = v.streamBuffers;
       v.historyFingerprint = null;
       v.historyLoaded = false;
+      v.lastSeq = 0;
     } else {
       state.streamBuffers = emptyStreamBuffers();
     }
@@ -6475,7 +6478,14 @@
       seen.add(id);
       if (!force && state.subscribedSessions.has(id)) continue;
       state.subscribedSessions.add(id);
-      sendWs({ type: "subscribe", sessionId: id });
+      const msg = { type: "subscribe", sessionId: id };
+      const resume = resumeParamsFor(id);
+      if (resume) {
+        msg.sinceSeq = resume.sinceSeq;
+        msg.bootId = resume.bootId;
+        registerResumeWaiter(id);
+      }
+      sendWs(msg);
     }
   }
 
@@ -6884,6 +6894,7 @@
         const snap = snapshotLiveClientForRestart();
         state._pendingRestartInterrupt = snapshotHadLive(snap);
         clearLiveClientStateAfterProcessRestart("bootId changed");
+        resetSequenceTracking();
         state._hubProcessRestarted = true;
         state._resumeAfterReconnect = true;
         // One hard reload so phone/desktop never mix old JS with new Python.
@@ -7048,6 +7059,7 @@
       beginHistoryBatch();
       try {
         v.pane.innerHTML = "";
+        v.lastSeq = 0;
         if (!list.length) {
           appendMessage({
             role: "system",
@@ -7284,10 +7296,14 @@
     setComposerEnabled(true);
     forceComposerUnlocked();
 
+    // Replayed panes are already complete; only the rest reload from disk (ADR-029).
+    const replayed = await awaitReplayedSessions(resumeIds, RESUME_ANSWER_TIMEOUT_MS);
+
     const hydrates = [];
     let selectedMidTurn = false;
     for (let i = 0; i < resumeIds.length; i++) {
       const sid = resumeIds[i];
+      if (replayed.has(sid)) continue;
       const isSelected = sid === state.selectedId;
       // After process-restart clear, flags are idle — do not treat as mid-turn.
       const st = sessionLiveStatus(sid);
@@ -7321,9 +7337,9 @@
           state._reconnectScrollFreeze = false;
           state._suppressStickyScroll = false;
           state._resumeAfterReconnect = false;
-          // Always force-refresh selected history after freeze lifts so completed
-          // disk messages appear even if the live stream was incomplete / zombie.
-          if (state.selectedId) {
+          // Force-refresh selected history after the freeze lifts so completed disk
+          // messages appear even if the live stream was incomplete, unless replay completed it.
+          if (state.selectedId && !replayed.has(state.selectedId)) {
             refreshHistory(state.selectedId, { force: true });
           }
         });
@@ -7408,6 +7424,7 @@
       sendWs({ type: "hello" });
       sendPresence({ force: true });
       if (!state.push.loaded) loadPushState();
+      resetSocketResumeState();
       resumeAfterReconnect({ wasReconnect });
     });
 
@@ -7418,12 +7435,13 @@
       } catch {
         return;
       }
-      onHubMessage(msg);
+      receiveHubMessage(msg);
     });
 
     ws.addEventListener("close", () => {
       state.wsState = "reconnecting";
       if (state.subscribedSessions) state.subscribedSessions.clear();
+      resetSocketResumeState();
       releaseApprovalAnswers();
       startHealthProbe();
       updateStatusPill();
@@ -7448,6 +7466,115 @@
     const delay = Math.min(1000 * Math.pow(1.6, state.reconnectAttempt), 12000);
     state.reconnectTimer = setTimeout(connectWs, delay);
   }
+
+  // Sequenced events and resume (ADR-029)
+  const SEQUENCED_TYPES = new Set(["acp", "turn", "system", "terminal_out", "compact", "usage", "commands"]);
+  const RESUME_ANSWER_TIMEOUT_MS = 1500;
+
+  /** Drop a stamped event the pane already holds; a session without a pane is never gated. */
+  function admitSequenced(msg) {
+    if (!SEQUENCED_TYPES.has(msg.type) || !msg.sessionId) return true;
+    const seq = Number(msg.seq);
+    if (!(seq > 0)) return true;
+    const v = state.sessionViews.get(msg.sessionId);
+    return !(v && seq <= (v.lastSeq || 0));
+  }
+
+  function noteSequenced(msg) {
+    if (!SEQUENCED_TYPES.has(msg.type) || !msg.sessionId) return;
+    const seq = Number(msg.seq);
+    const v = seq > 0 ? state.sessionViews.get(msg.sessionId) : null;
+    if (v && seq > (v.lastSeq || 0)) v.lastSeq = seq;
+  }
+
+  function receiveHubMessage(msg) {
+    if (!msg || typeof msg !== "object" || !admitSequenced(msg)) return;
+    try {
+      onHubMessage(msg);
+    } finally {
+      noteSequenced(msg);
+    }
+  }
+
+  function noteSnapshotSeq(sessionId, seq) {
+    const v = sessionId ? state.sessionViews.get(sessionId) : null;
+    const n = Number(seq);
+    if (v && n > (v.lastSeq || 0)) v.lastSeq = n;
+  }
+
+  /** Resume only from a pane that holds a snapshot plus every event since it. */
+  function resumeParamsFor(sessionId) {
+    const v = state.sessionViews.get(sessionId);
+    if (!v || !v.historyLoaded || !(v.lastSeq > 0) || !state.bootId) return null;
+    return { sinceSeq: v.lastSeq, bootId: state.bootId };
+  }
+
+  function paneReplayed(sessionId) {
+    const v = sessionId ? state.sessionViews.get(sessionId) : null;
+    return !!(v && v.replayed);
+  }
+
+  function registerResumeWaiter(sessionId) {
+    if (!state.resumeWaiters) state.resumeWaiters = new Map();
+    if (state.resumeWaiters.has(sessionId)) return;
+    const waiter = {};
+    waiter.promise = new Promise((resolve) => {
+      waiter.resolve = resolve;
+    });
+    state.resumeWaiters.set(sessionId, waiter);
+  }
+
+  function settleResumeWaiter(sessionId, outcome) {
+    const waiter = sessionId && state.resumeWaiters ? state.resumeWaiters.get(sessionId) : null;
+    if (!waiter) return;
+    state.resumeWaiters.delete(sessionId);
+    waiter.resolve(outcome);
+  }
+
+  function settleAllResumeWaiters(outcome) {
+    if (!state.resumeWaiters) return;
+    for (const sid of [...state.resumeWaiters.keys()]) settleResumeWaiter(sid, outcome);
+  }
+
+  /** Bounded wait for the hub's answer to each resume request; returns the ids it replayed. */
+  async function awaitReplayedSessions(ids, timeoutMs) {
+    const pending = [];
+    for (const sid of ids) {
+      const waiter = state.resumeWaiters && state.resumeWaiters.get(sid);
+      if (!waiter) continue;
+      const timeout = new Promise((resolve) => setTimeout(() => resolve("timeout"), timeoutMs));
+      pending.push(Promise.race([waiter.promise, timeout]));
+    }
+    await Promise.all(pending);
+    const replayed = new Set();
+    for (const sid of ids) {
+      const v = state.sessionViews.get(sid);
+      if (v && v.replayed) replayed.add(sid);
+    }
+    return replayed;
+  }
+
+  function onReplay(msg) {
+    const sid = msg.sessionId || null;
+    const events = Array.isArray(msg.events) ? msg.events : [];
+    for (let i = 0; i < events.length; i++) receiveHubMessage(events[i]);
+    const v = sid ? state.sessionViews.get(sid) : null;
+    if (v) v.replayed = true;
+    settleResumeWaiter(sid, "replay");
+  }
+
+  function resetSocketResumeState() {
+    for (const v of state.sessionViews.values()) v.replayed = false;
+    settleAllResumeWaiters("reset");
+  }
+
+  function resetSequenceTracking() {
+    for (const v of state.sessionViews.values()) {
+      v.lastSeq = 0;
+      v.replayed = false;
+    }
+  }
+  // End sequenced events
 
   function onHubMessage(msg) {
     const type = msg.type;
@@ -7683,15 +7810,22 @@
       return;
     }
     if (type === "history") {
+      settleResumeWaiter(msg.sessionId, "history");
       if (msg.sessionId === state.selectedId) {
         // Never wipe a live stream with a disk dump mid-turn.
         if (turnRunningOnSelected()) return;
         const histMsgs = msg.messages || [];
         applyHistoryMessages(histMsgs, { jump: false });
         rehydrateGoalFromHistory(msg.sessionId, histMsgs);
+        noteSnapshotSeq(msg.sessionId, msg.seq);
       } else if (msg.sessionId) {
         hydrateSessionPane(msg.sessionId, msg.messages || []);
+        noteSnapshotSeq(msg.sessionId, msg.seq);
       }
+      return;
+    }
+    if (type === "replay") {
+      onReplay(msg);
       return;
     }
     if (type === "acp") {
@@ -12427,7 +12561,7 @@
     state._reconnectScrollFreeze = true;
     try {
       await reconcileTurnAfterWake(reason);
-      if (state.selectedId) {
+      if (state.selectedId && !paneReplayed(state.selectedId)) {
         await refreshHistory(state.selectedId, {
           force: true,
           visibilityOnly: true,
