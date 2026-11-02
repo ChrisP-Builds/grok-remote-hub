@@ -21,6 +21,11 @@ A second gap showed up live: when Stop lands while the agent waits on
 `terminal/wait_for_exit`, Grok does not kill the command, so the turn cannot end
 until the command does.
 
+Correction (2026-11-02): with `wait_for_exit` served off the receive loop
+(decision 5), Grok answers the cancel at once even mid-command. The turn stalled
+because the hub was not reading the reply. The kill in decision 3 is still what
+stops the command itself; Grok left it running.
+
 A correctness review of the first version found four more problems that the
 amendment fixes:
 
