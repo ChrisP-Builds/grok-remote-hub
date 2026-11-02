@@ -10,10 +10,11 @@ import os
 import re
 import secrets
 import time
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from aiohttp import web
 
@@ -25,7 +26,9 @@ from hub.approval_policy import (
     file_verdict,
     normalize_mode,
     path_key,
+    valid_rule,
 )
+from hub.harden_policy import is_loopback_host
 
 log = logging.getLogger("hub.approvals")
 
@@ -88,6 +91,7 @@ class ApprovalBroker:
         default_mode: str = "balanced",
         timeout: float = DECISION_TIMEOUT_S,
         clock: Callable[[], float] = time.time,
+        protected_paths: Sequence[Path] | None = None,
     ) -> None:
         self._rules_path = Path(rules_path)
         self._publish = publish
@@ -95,10 +99,15 @@ class ApprovalBroker:
         self.default_mode = normalize_mode(default_mode)
         self._timeout = timeout
         self._clock = clock
+        data_dir = self._rules_path.parent
+        if protected_paths is None:
+            protected_paths = (data_dir, data_dir.parent / "config.toml")
+        self._protected = [str(p) for p in protected_paths]
         self._pending: dict[str, _Pending] = {}
         self._modes: dict[str, str] = {}
         self._event_roots: dict[str, str] = {}
         self._approved: dict[tuple[str, str, str], float] = {}
+        self._emits: set[asyncio.Task] = set()
 
     def mode_for(self, session_id: str) -> str:
         return self._modes.get(session_id, self.default_mode)
@@ -123,7 +132,10 @@ class ApprovalBroker:
         except (OSError, ValueError):
             return {}
         projects = data.get("projects") if isinstance(data, dict) else None
-        return {str(k): [str(r) for r in v] for k, v in (projects or {}).items() if isinstance(v, list)}
+        return {
+            str(k): [str(r) for r in v if valid_rule(str(r))]
+            for k, v in (projects or {}).items() if isinstance(v, list)
+        }
 
     def grants_for(self, root: str | None) -> list[str]:
         if not root:
@@ -132,6 +144,9 @@ class ApprovalBroker:
         return [r for k, rules in self._read_rules().items() if path_key(k) == want for r in rules]
 
     def _add_grant(self, root: str, rule: str) -> None:
+        if not valid_rule(rule):
+            log.warning("refusing to save all-matching approval rule %r", rule)
+            return
         projects = self._read_rules()
         key = next((k for k in projects if path_key(k) == path_key(root)), root)
         if rule not in projects.setdefault(key, []):
@@ -141,18 +156,33 @@ class ApprovalBroker:
         tmp.write_text(json.dumps({"projects": projects}, indent=2) + "\n", encoding="utf-8")
         os.replace(tmp, self._rules_path)
 
-    async def _emit(self, payload: dict[str, Any]) -> None:
+    def _emit(self, payload: dict[str, Any], after: asyncio.Task | None = None) -> asyncio.Task:
+        """Publish in the background so a stalled client socket can never delay a decision."""
+        task = asyncio.ensure_future(self._publish_in_order(payload, after))
+        self._emits.add(task)
+        task.add_done_callback(self._emits.discard)
+        return task
+
+    async def _publish_in_order(self, payload: dict[str, Any], after: asyncio.Task | None) -> None:
+        if after is not None:
+            await asyncio.wait({after})
         try:
             await self._publish(payload)
         except Exception:
             log.exception("approval publish failed")
 
+    async def flush_emits(self) -> None:
+        while self._emits:
+            await asyncio.wait(list(self._emits))
+
     async def decide(self, event: dict[str, Any]) -> dict[str, str]:
         """Answer one Grok PreToolUse event: defer, allow, or deny with a reason."""
+        arrived = self._clock()
         sid = str(event.get("sessionId") or event.get("session_id") or "")
         if sid and event.get("cwd"):
             self._event_roots.setdefault(sid, str(event["cwd"]))
-        root = self._root(sid)
+        known_root = self._known_root(sid)
+        root = known_root or self._event_roots.get(sid)
         tool = str(event.get("toolName") or event.get("tool_name") or "")
         verdict = classify(
             tool,
@@ -161,31 +191,34 @@ class ApprovalBroker:
             session_root=root,
             grants=self.grants_for(root),
             truncated=bool(event.get("toolInputTruncated")),
+            protected=self._protected,
         )
         if verdict.action == ALLOW:
             return {"decision": "defer"}
-        now = self._clock()
+        if not known_root:
+            verdict = replace(verdict, similar_rule=None)
         pending = _Pending(
-            secrets.token_hex(6), sid, verdict, root, tool, now, now + self._timeout,
+            secrets.token_hex(6), sid, verdict, root, tool, arrived, arrived + self._timeout,
             asyncio.get_running_loop().create_future(),
         )
         self._pending[pending.id] = pending
-        await self._emit({"type": "approval_request", **pending.payload(self._clock())})
+        requested = self._emit({"type": "approval_request", **pending.payload(self._clock())})
         try:
-            decision, scope, by = await asyncio.wait_for(pending.future, self._timeout)
+            remaining = max(0.0, pending.expires_at - self._clock())
+            decision, scope, by = await asyncio.wait_for(pending.future, remaining)
         except asyncio.TimeoutError:
             decision, scope, by = "deny", None, "timeout"
         finally:
             self._pending.pop(pending.id, None)
-        await self._emit({
+        self._emit({
             "type": "approval_resolved", "id": pending.id, "sessionId": sid or None,
             "decision": decision, "by": by, "scope": scope,
-        })
+        }, after=requested)
         if decision != "allow":
             return {"decision": "deny", "reason": _REASONS[by].format(category=verdict.category.lower())}
         self._remember_approval(sid, verdict)
-        if scope == "project" and root and verdict.similar_rule:
-            self._add_grant(root, verdict.similar_rule)
+        if scope == "project" and known_root and verdict.similar_rule:
+            self._add_grant(known_root, verdict.similar_rule)
         return {"decision": "allow"}
 
     def answer(self, approval_id: str, decision: str, scope: str | None = "once") -> bool:
@@ -220,9 +253,9 @@ class ApprovalBroker:
         root = self._root(session_id)
         mode, grants = self.mode_for(session_id), self.grants_for(root)
         if kind == "shell":
-            verdict = command_verdict(value, mode, grants)
+            verdict = command_verdict(value, mode, grants, protected=self._protected, session_root=root)
         else:
-            verdict = file_verdict(value, mode, root, grants)
+            verdict = file_verdict(value, mode, root, grants, protected=self._protected)
         if verdict.action == ALLOW:
             return None
         expires = self._approved.get((session_id, kind, self._approval_key(kind, value)), 0.0)
@@ -241,9 +274,25 @@ def is_loopback_peer(remote: str | None) -> bool:
         return False
 
 
+_PROXY_HEADER_PREFIXES = ("tailscale-user-", "x-forwarded-")
+
+
+def is_direct_loopback_request(request: web.Request) -> bool:
+    """Tailscale Serve forwards tailnet traffic from 127.0.0.1, so the peer address alone proves nothing."""
+    if not is_loopback_peer(request.remote):
+        return False
+    try:
+        host = urlsplit("//" + (request.headers.get("Host") or "")).hostname
+    except ValueError:
+        return False
+    if not host or not is_loopback_host(host):
+        return False
+    return not any(name.lower().startswith(_PROXY_HEADER_PREFIXES) for name in request.headers)
+
+
 def make_pre_tool_use_handler(broker: ApprovalBroker, key: str):
     async def handler(request: web.Request) -> web.Response:
-        if not is_loopback_peer(request.remote) or not secrets.compare_digest(
+        if not is_direct_loopback_request(request) or not secrets.compare_digest(
             (request.query.get("key") or "").encode(), key.encode()
         ):
             return web.json_response({"error": "forbidden"}, status=403)

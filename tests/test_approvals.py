@@ -57,7 +57,9 @@ def test_risky_call_asks_and_allow_once_permits_execution(tmp_path: Path) -> Non
     async def run() -> dict:
         task = asyncio.create_task(broker.decide(_event()))
         await _answer_when_requested(broker, published, "allow")
-        return await task
+        reply = await task
+        await broker.flush_emits()
+        return reply
 
     assert asyncio.run(run()) == {"decision": "allow"}
     req, resolved = published
@@ -79,6 +81,7 @@ def test_allow_similar_saves_editable_project_rule(tmp_path: Path) -> None:
         task = asyncio.create_task(broker.decide(_event()))
         await _answer_when_requested(broker, published, "allow", "project")
         await task
+        await broker.flush_emits()
 
     asyncio.run(run())
     saved = json.loads((tmp_path / "rules.json").read_text(encoding="utf-8"))
@@ -86,6 +89,71 @@ def test_allow_similar_saves_editable_project_rule(tmp_path: Path) -> None:
     published.clear()
     assert asyncio.run(broker.decide(_event("git push origin other"))) == {"decision": "defer"}
     assert published == []
+
+
+def test_allow_similar_for_a_flag_led_command_saves_the_exact_command(tmp_path: Path) -> None:
+    published: list = []
+    broker = _broker(tmp_path, published)
+
+    async def run() -> None:
+        task = asyncio.create_task(broker.decide(_event('powershell -Command "git push"')))
+        await _answer_when_requested(broker, published, "allow", "project")
+        await task
+        await broker.flush_emits()
+
+    asyncio.run(run())
+    assert published[0]["similarRule"] == 'powershell -Command "git push"'
+    saved = json.loads((tmp_path / "rules.json").read_text(encoding="utf-8"))
+    assert saved == {"projects": {ROOT: ['powershell -Command "git push"']}}
+    assert broker.exec_refusal("shell", SID, 'powershell -Command "git push"') is None
+    assert broker.exec_refusal("shell", SID, 'powershell -Command "git reset --hard"') is not None
+
+
+def test_all_matching_rules_are_neither_saved_nor_honoured(tmp_path: Path) -> None:
+    broker = _broker(tmp_path, [])
+    (tmp_path / "rules.json").write_text(
+        json.dumps({"projects": {ROOT: ["*", "file *", "git push *"]}}), encoding="utf-8"
+    )
+    assert broker.grants_for(ROOT) == ["git push *"]
+    assert broker.exec_refusal("shell", SID, "rm -rf x") is not None
+    assert broker.exec_refusal("file", SID, r"C:\Windows\x.ini") is not None
+    broker._add_grant(ROOT, "*")
+    broker._add_grant(ROOT, "file *")
+    saved = json.loads((tmp_path / "rules.json").read_text(encoding="utf-8"))
+    assert saved == {"projects": {ROOT: ["*", "file *", "git push *"]}}, "hand-written junk left as is, nothing added"
+
+
+def test_hub_state_is_protected_whatever_the_session_root(tmp_path: Path) -> None:
+    hub = tmp_path / "hub"
+    rules = hub / "data" / "approval-rules.json"
+
+    async def publish(payload: dict) -> None:
+        pass
+
+    broker = ApprovalBroker(rules, publish, session_root_for=lambda sid: str(hub))
+    for path in (rules, hub / "data" / "hook.secret", hub / "data" / "grok-approval-gate" / "hooks" / "hooks.json",
+                 hub / "config.toml"):
+        assert broker.exec_refusal("file", SID, str(path)) is not None, path
+    assert broker.exec_refusal("file", SID, str(hub / "hub" / "x.py")) is None
+    assert broker.exec_refusal("shell", SID, "Set-Content config.toml x") is not None
+    assert broker.exec_refusal("shell", SID, r"Copy-Item x data\approval-rules.json") is not None
+    assert broker.exec_refusal("shell", SID, "git status") is None
+    quick = ApprovalBroker(rules, publish, session_root_for=lambda sid: str(hub), timeout=0.01)
+    event = {"sessionId": SID, "cwd": str(hub), "toolName": "run_terminal_command",
+             "toolInput": {"command": "Set-Content config.toml x"}}
+    assert asyncio.run(quick.decide(event))["decision"] == "deny"
+
+
+def test_protected_paths_can_be_given_explicitly(tmp_path: Path) -> None:
+    async def publish(payload: dict) -> None:
+        pass
+
+    broker = ApprovalBroker(
+        tmp_path / "rules.json", publish, session_root_for=lambda sid: ROOT,
+        protected_paths=[Path(ROOT) / "secrets"],
+    )
+    assert broker.exec_refusal("file", SID, ROOT + r"\secrets\k.pem") is not None
+    assert broker.exec_refusal("file", SID, ROOT + r"\src\a.py") is None
 
 
 def test_hand_edited_rules_file_is_picked_up(tmp_path: Path) -> None:
@@ -98,10 +166,52 @@ def test_hand_edited_rules_file_is_picked_up(tmp_path: Path) -> None:
 def test_no_answer_denies_before_hook_timeout(tmp_path: Path) -> None:
     published: list = []
     broker = _broker(tmp_path, published, timeout=0.05)
-    reply = asyncio.run(broker.decide(_event()))
+
+    async def run() -> dict:
+        reply = await broker.decide(_event())
+        await broker.flush_emits()
+        return reply
+
+    reply = asyncio.run(run())
     assert reply["decision"] == "deny"
     assert "no answer" in reply["reason"].lower()
     assert published[-1]["by"] == "timeout"
+
+
+def test_stalled_broadcast_cannot_delay_the_decision(tmp_path: Path) -> None:
+    """One stuck socket must not push the hub past Grok's 330 s hook timeout (which fails open)."""
+    never = asyncio.Event()
+
+    async def stalled_publish(payload: dict) -> None:
+        await never.wait()
+
+    broker = ApprovalBroker(tmp_path / "rules.json", stalled_publish, session_root_for=lambda sid: ROOT, timeout=0.05)
+
+    async def run() -> dict:
+        return await asyncio.wait_for(broker.decide(_event()), 2.0)
+
+    reply = asyncio.run(run())
+    assert reply["decision"] == "deny" and "no answer" in reply["reason"].lower()
+
+
+def test_slow_broadcast_still_delivers_request_before_resolved(tmp_path: Path) -> None:
+    published: list = []
+
+    async def slow_publish(payload: dict) -> None:
+        await asyncio.sleep(0.02)
+        published.append(payload)
+
+    broker = ApprovalBroker(tmp_path / "rules.json", slow_publish, session_root_for=lambda sid: ROOT, timeout=0.01)
+
+    async def run() -> dict:
+        reply = await broker.decide(_event())
+        assert published == [], "the decision did not wait for the broadcast"
+        await broker.flush_emits()
+        return reply
+
+    assert asyncio.run(run())["decision"] == "deny"
+    assert [p["type"] for p in published] == ["approval_request", "approval_resolved"]
+    assert published[1]["id"] == published[0]["id"]
 
 
 def test_deny_and_cancel_tell_the_model_not_to_retry(tmp_path: Path) -> None:
@@ -112,6 +222,7 @@ def test_deny_and_cancel_tell_the_model_not_to_retry(tmp_path: Path) -> None:
         t1 = asyncio.create_task(broker.decide(_event()))
         await _answer_when_requested(broker, published, "deny")
         first = await t1
+        await broker.flush_emits()
         published.clear()
         t2 = asyncio.create_task(broker.decide(_event("rm -rf build")))
         for _ in range(200):
@@ -119,7 +230,9 @@ def test_deny_and_cancel_tell_the_model_not_to_retry(tmp_path: Path) -> None:
                 break
             await asyncio.sleep(0.005)
         assert broker.cancel_session(SID) == 1
-        return first, await t2
+        second = await t2
+        await broker.flush_emits()
+        return first, second
 
     denied, cancelled = asyncio.run(run())
     assert denied["decision"] == cancelled["decision"] == "deny"
@@ -167,6 +280,58 @@ def test_hook_endpoint_requires_key_and_returns_decision(tmp_path: Path) -> None
             await client.close()
 
     asyncio.run(run())
+
+
+def test_hook_endpoint_rejects_requests_proxied_by_tailscale_serve(tmp_path: Path) -> None:
+    """Serve forwards tailnet requests from 127.0.0.1, so the peer check alone proves nothing."""
+    broker = _broker(tmp_path, [])
+    url = "/internal/pre-tool-use?key=k3y"
+
+    async def run() -> None:
+        app = web.Application()
+        app.router.add_post("/internal/pre-tool-use", make_pre_tool_use_handler(broker, "k3y"))
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            for headers in (
+                {"Host": "hub.tail1234.ts.net"},
+                {"Host": "hub.tail1234.ts.net:443"},
+                {"Host": "192.168.1.5:8787"},
+                {"Tailscale-User-Login": "me@example.com"},
+                {"tailscale-user-name": "Me"},
+                {"X-Forwarded-For": "100.64.1.2"},
+            ):
+                r = await client.post(url, json=_event("git status"), headers=headers)
+                assert r.status == 403, headers
+            for host in ("127.0.0.1:8787", "localhost:8787", "[::1]:8787", "127.5.5.5"):
+                r = await client.post(url, json=_event("git status"), headers={"Host": host})
+                assert r.status == 200, host
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_event_only_root_applies_saved_rules_but_never_offers_a_project_grant(tmp_path: Path) -> None:
+    published: list = []
+
+    async def publish(payload: dict) -> None:
+        published.append(payload)
+
+    broker = ApprovalBroker(tmp_path / "rules.json", publish, session_root_for=lambda sid: None)
+
+    async def run() -> dict:
+        task = asyncio.create_task(broker.decide(_event()))
+        await _answer_when_requested(broker, published, "allow", "project")
+        reply = await task
+        await broker.flush_emits()
+        return reply
+
+    assert asyncio.run(run()) == {"decision": "allow"}
+    assert published[0]["cwd"] == ROOT and published[0]["similarRule"] is None
+    assert not (tmp_path / "rules.json").exists()
+    (tmp_path / "rules.json").write_text(json.dumps({"projects": {ROOT: ["git push *"]}}), encoding="utf-8")
+    assert asyncio.run(broker.decide(_event("git push origin other"))) == {"decision": "defer"}
 
 
 def test_write_gate_plugin(tmp_path: Path) -> None:
@@ -282,6 +447,7 @@ def test_payload_marks_invisible_unicode_and_carries_server_clock(tmp_path: Path
             await asyncio.sleep(0.005)
         await _answer_when_requested(broker, published, "deny")
         await task
+        await broker.flush_emits()
 
     asyncio.run(run())
     req = published[0]
