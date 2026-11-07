@@ -52,7 +52,7 @@ a new ADR.
 | 025 | Mobile plan copy/mermaid and session search/recap continuity | Accepted | 2026-08-08 |
 | 026 | Guard Host and Origin, and serve previews as sandboxed capability URLs | Accepted (amended 2026-11-01) | 2026-10-31 |
 | 027 | Approve risky agent actions from the phone via a hub-owned Grok hook | Accepted (amended 2026-11-02) | 2026-10-31 |
-| 028 | Serve over Tailscale HTTPS, trust the Tailscale login, and send web push | Accepted | 2026-11-01 |
+| 028 | Serve over Tailscale HTTPS, trust the Tailscale login, and send web push | Accepted (amended 2026-11-07) | 2026-11-01 |
 | 029 | Sequence session events and resume reconnects from an in-memory log | Accepted (amended 2026-11-02) | 2026-11-01 |
 | 030 | Keep per-session runtime state in one object per session | Accepted | 2026-11-01 |
 | 031 | Stop sends the ACP cancel notification and ends the command the agent waits on | Accepted (amended 2026-11-02) | 2026-11-01 |

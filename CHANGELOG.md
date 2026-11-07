@@ -36,6 +36,7 @@ This file is the **public narrative**. Session chat context is not required to u
 - **Compact status bar** — slim `#compact-status-bar` while compacting (pulse track + elapsed seconds); CTX segment subtle pulse via `usage-seg-compacting`.
 
 ### Fixed
+- **Phone app works after a reboot**: if the hub starts before Tailscale connects, it now picks Tailscale up within about 15 s instead of answering the Tailscale address with 403 until restarted. Tailscale CLI calls no longer open a console window.
 - **Stop now stops the agent (ADR-031)**. The hub sent `session/cancel` as a request, which Grok rejects, so the agent kept working after Stop while the hub only cleared its own state. Stop now sends the ACP notification, kills the command the agent is waiting on (background commands keep running), and waits up to 2 s for the agent to end the turn before force-clearing. Stop also no longer shows "Agent stalled mid-turn".
 - **Stop ends the whole command and keeps other sessions live (ADR-031 amendment)**: Stop kills the command's process tree (`npm test`, `pytest` and other shell-wrapped commands, not just the PowerShell wrapper), `terminal/wait_for_exit` no longer blocks the ACP receive loop (one session's long command froze every other session's stream), and a stall the agent honours shows the stall or no-output message and auto-retries again instead of ending silently.
 - **Phones signed in by Tailscale login get the full `/health`**, so waking the phone no longer clears a running turn's view.

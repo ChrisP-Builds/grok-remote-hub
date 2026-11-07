@@ -1,6 +1,6 @@
 # ADR-028: Serve over Tailscale HTTPS, trust the Tailscale login, and send web push
 
-- **Status:** Accepted
+- **Status:** Accepted (amended 2026-11-07)
 - **Date:** 2026-11-01
 - **Deciders:** project owner, Grok Remote Hub session
 - **Tags:** auth, tailscale, https, pwa, push, mobile
@@ -80,3 +80,16 @@ re-posted on every load, endpoints are limited to the known push services
 with redirects off, and token-created subscriptions are dropped when the
 token changes. The VAPID `sub` claim carries `https://<machine>.<tailnet>.ts.net`,
 so the push services also see the machine name (already public via CT logs).
+
+## Amendment (2026-11-07): adopt Tailscale when it connects after the hub
+
+After a reboot the hub can start before Tailscale connects. It then found no
+Tailscale IP or Serve name, bound loopback only, and answered every request
+through the Serve address with 403 until someone restarted it.
+
+Now a hub in auto bind mode that starts local-only checks again every 15 s.
+Once Tailscale is up it binds the Tailscale IP and applies the same Host
+allowlist and Serve login trust as a normal start, with no restart. The
+token gate still applies: with an empty `hub_token` it stays local. All
+`tailscale` CLI calls run without a console window, since the hub runs
+under pythonw. Validation: `tests/test_tailscale_late.py`.

@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -200,44 +201,46 @@ def tailscale_self_dns_names(status: Any) -> list[str]:
     return [str(name)] if name else []
 
 
-def tailscale_dns_names() -> list[str]:
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+
+def tailscale_cli(*args: str) -> str | None:
+    """Stdout of the first `tailscale <args>` that succeeds; windowless, since the hub runs under pythonw."""
     for exe in (str(TAILSCALE_EXE), "tailscale"):
         try:
             proc = subprocess.run(
-                [exe, "status", "--json"],
+                [exe, *args],
                 capture_output=True,
                 text=True,
                 timeout=5,
                 check=False,
+                creationflags=_NO_WINDOW,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
         if proc.returncode == 0:
-            try:
-                return tailscale_self_dns_names(json.loads(proc.stdout))
-            except ValueError:
-                return []
-    return []
+            return proc.stdout
+    return None
+
+
+def tailscale_status() -> dict[str, Any] | None:
+    out = tailscale_cli("status", "--json")
+    try:
+        status = json.loads(out.lstrip("﻿")) if out else None
+    except ValueError:
+        return None
+    return status if isinstance(status, dict) else None
+
+
+def tailscale_dns_names() -> list[str]:
+    status = tailscale_status()
+    return tailscale_self_dns_names(status) if status else []
 
 
 def _tailscale_ip() -> str | None:
-    candidates = [str(TAILSCALE_EXE), "tailscale"]
-    for exe in candidates:
-        try:
-            proc = subprocess.run(
-                [exe, "ip", "-4"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-            if proc.returncode == 0 and proc.stdout.strip():
-                line = proc.stdout.strip().splitlines()[0].strip()
-                if re.match(r"^\d+\.\d+\.\d+\.\d+$", line):
-                    return line
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            continue
-    return None
+    out = (tailscale_cli("ip", "-4") or "").strip()
+    line = out.splitlines()[0].strip() if out else ""
+    return line if re.match(r"^\d+\.\d+\.\d+\.\d+$", line) else None
 
 
 class Hub:
